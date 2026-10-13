@@ -172,6 +172,83 @@ describe("FoldStore: flush serialisation", () => {
 		expect(saveData).not.toHaveBeenCalled();
 	});
 
+	it("a rejecting saveData leaves the store dirty so the next flush retries with the newest state (R2)", async () => {
+		const writes: unknown[] = [];
+		let calls = 0;
+		const saveData = vi.fn(async (data: unknown) => {
+			calls++;
+			if (calls === 1) throw new Error("disk full");
+			writes.push(data);
+		});
+		const store = new FoldStore({ loadData: async () => null, saveData });
+		await store.load();
+
+		store.set("Tasks.md", record("v1"));
+		await expect(store.flush()).rejects.toThrow("disk full");
+
+		// The failed write must not have left the store "clean" (dirty = false) with nothing on
+		// disk: a later flush (e.g. the next lifecycle hook) must retry and actually succeed.
+		await store.flush();
+		expect(saveData).toHaveBeenCalledTimes(2);
+		expect(writes).toHaveLength(1);
+		const written = writes[0] as { files: Record<string, FileFoldRecord> };
+		expect(written.files["Tasks.md"].contentHash).toBe("v1");
+	});
+
+	it("a change that lands while a failed flush is in flight is not lost, and isn't double-counted (R2)", async () => {
+		const writes: unknown[] = [];
+		let calls = 0;
+		let rejectFirst: ((err: Error) => void) | undefined;
+		const saveData = vi.fn((data: unknown) => {
+			calls++;
+			if (calls === 1) {
+				return new Promise<void>((_resolve, reject) => {
+					rejectFirst = reject;
+				});
+			}
+			writes.push(data);
+			return Promise.resolve();
+		});
+		const store = new FoldStore({ loadData: async () => null, saveData });
+		await store.load();
+
+		store.set("Tasks.md", record("v1"));
+		const flush1 = store.flush();
+
+		// A newer change lands while the first write is still in flight.
+		store.set("Tasks.md", record("v2"));
+		const flush2 = store.flush();
+
+		await vi.waitFor(() => expect(saveData).toHaveBeenCalledTimes(1));
+		rejectFirst?.(new Error("disk full"));
+		await expect(flush1).rejects.toThrow("disk full");
+		await flush2;
+
+		expect(writes).toHaveLength(1);
+		const written = writes[0] as { files: Record<string, FileFoldRecord> };
+		expect(written.files["Tasks.md"].contentHash).toBe("v2");
+	});
+
+	it("forget() with a rejecting saveData does not throw, and a later flush retries (R2)", async () => {
+		let calls = 0;
+		const saveData = vi.fn(async (_data: unknown) => {
+			calls++;
+			if (calls === 2) throw new Error("disk full");
+		});
+		const store = new FoldStore({ loadData: async () => null, saveData });
+		await store.load();
+		store.set("Tasks.md", record("v1"));
+		await store.flush();
+
+		expect(() => store.forget("Tasks.md")).not.toThrow();
+		await vi.waitFor(() => expect(saveData).toHaveBeenCalledTimes(2));
+
+		await store.flush();
+		expect(saveData).toHaveBeenCalledTimes(3);
+		const written = saveData.mock.calls.at(-1)?.[0] as { files: Record<string, unknown> };
+		expect(written.files).toEqual({});
+	});
+
 	it("forget during a pending debounced flush writes the post-forget state, never the stale one", async () => {
 		vi.useFakeTimers();
 		try {

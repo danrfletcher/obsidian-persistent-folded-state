@@ -132,3 +132,41 @@ describe("lifecycle: disable then re-enable keeps the map (E7)", () => {
 		expect(second.store.get("Tasks.md")).toEqual({ contentHash: "abc", folds: [{ kind: "heading" }], dormant: [] });
 	});
 });
+
+/** E8/R3: `onload()` itself (not just `FoldStore.load()`/`sanitizeStoreData()` in isolation) must
+ * survive an absent, corrupt, rejecting or wrong-shape `loadData()` — resolving without throwing,
+ * and still registering the command and the settings tab, so the plugin stays usable even when
+ * `data.json` can't be read. */
+describe("onload resilience: absent, corrupt, rejecting or wrong-shape loadData (E8/R3)", () => {
+	const cases: { label: string; loadData: () => Promise<unknown> }[] = [
+		{ label: "absent (loadData resolves null, the Obsidian convention)", loadData: async () => null },
+		{
+			label: "non-JSON on disk / a rejecting loadData()",
+			loadData: async () => {
+				throw new SyntaxError("Unexpected end of JSON input");
+			},
+		},
+		{ label: "wrong shape: top-level array", loadData: async () => [] },
+		{ label: "wrong shape: top-level string", loadData: async () => "not an object" },
+		{ label: "wrong shape: files is not an object", loadData: async () => ({ version: 1, files: "nope" }) },
+		{
+			label: "wrong shape: one record missing contentHash",
+			loadData: async () => ({ version: 1, files: { "Bad.md": { folds: [], dormant: [] } } }),
+		},
+	];
+
+	for (const { label, loadData } of cases) {
+		it(`${label}: onload resolves, and the command and settings tab are still registered`, async () => {
+			const plugin = makePlugin();
+			plugin.loadData = loadData;
+			const addCommand = vi.spyOn(plugin, "addCommand");
+			const addSettingTab = vi.spyOn(plugin, "addSettingTab");
+
+			await expect(plugin.onload()).resolves.toBeUndefined();
+
+			expect(addCommand).toHaveBeenCalledTimes(1);
+			expect(addCommand.mock.calls[0][0].id).toBe(FORGET_NOTE_FOLDS_COMMAND_ID);
+			expect(addSettingTab).toHaveBeenCalledTimes(1);
+		});
+	}
+});
