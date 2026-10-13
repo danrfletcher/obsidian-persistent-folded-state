@@ -134,6 +134,41 @@ export class Notice {
 
 export class Scope {}
 
+/** Real Obsidian's `Events` base class (used by `Vault`/`Workspace`/`MetadataCache`): `on`
+ * registers a listener and returns a ref `off`/`offref` can later remove; `trigger` calls every
+ * listener for that name, in registration order, catching nothing itself (a throwing listener
+ * propagates, same as real Obsidian's documented "executing all the listeners in order even if
+ * some of them throw" — this mock keeps that simple rather than exactly replicating the
+ * async-rethrow wording, which no test here depends on). R3 (`src/main.ts`) is this PR's only
+ * user: the "settled non-user change" subscription point. */
+export interface EventRef {
+	name: string;
+	callback: (...data: unknown[]) => unknown;
+}
+
+export class Events {
+	private listeners = new Map<string, Set<(...data: unknown[]) => unknown>>();
+
+	on(name: string, callback: (...data: unknown[]) => unknown): EventRef {
+		let set = this.listeners.get(name);
+		if (!set) {
+			set = new Set();
+			this.listeners.set(name, set);
+		}
+		set.add(callback);
+		return { name, callback };
+	}
+	off(name: string, callback: (...data: unknown[]) => unknown): void {
+		this.listeners.get(name)?.delete(callback);
+	}
+	offref(ref: EventRef): void {
+		this.off(ref.name, ref.callback);
+	}
+	trigger(name: string, ...data: unknown[]): void {
+		for (const callback of this.listeners.get(name) ?? []) callback(...data);
+	}
+}
+
 /** Base `Modal`: a real jsdom DOM, closing on Escape and on a backdrop click, same as real
  * Obsidian — so every subclass (just `ForgetAllFoldsModal` in this PR) gets that for free. */
 export class Modal {

@@ -9,15 +9,27 @@
  * store (G1) and classifies every other transaction as a user or non-user document change (E9).
  * It never dispatches anything itself (observe-only) and never touches the vault — restore lands
  * in PR-5.
+ *
+ * R3: deliverable (1), the "settled non-user change" event, needs a subscription point a later
+ * PR (and the real-Obsidian E10 probe) can actually observe from outside the editor watcher.
+ * `events` is a plain Obsidian `Events` instance — the same base class `Vault`/`Workspace`/
+ * `MetadataCache` already use — rather than a bespoke emitter, so `plugin.events.on(...)` behaves
+ * exactly like every other Obsidian event. No command and no UI are added for it (F10); it is
+ * wired to the editor watcher's `onSettledNonUserChange` callback below and nowhere else.
  */
-import { Plugin } from "obsidian";
+import { Events, Plugin } from "obsidian";
 import { FoldStore } from "./fold-store";
 import { registerForgetNoteFoldsCommand } from "./commands";
 import { PersistentFoldedStateSettingTab } from "./settings-tab";
 import { createEditorWatcher } from "./editor-watcher";
 
+/** Event name for the "settled non-user change" deliverable (E9/E10), triggered on
+ * `PersistentFoldedStatePlugin.events` with `(path: string, text: string)`. */
+export const SETTLED_NON_USER_CHANGE_EVENT = "settled-non-user-change";
+
 export default class PersistentFoldedStatePlugin extends Plugin {
 	store!: FoldStore;
+	readonly events = new Events();
 
 	async onload(): Promise<void> {
 		this.store = new FoldStore({
@@ -28,7 +40,12 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 
 		registerForgetNoteFoldsCommand(this);
 		this.addSettingTab(new PersistentFoldedStateSettingTab(this.app, this));
-		this.registerEditorExtension(createEditorWatcher({ store: this.store }));
+		this.registerEditorExtension(
+			createEditorWatcher({
+				store: this.store,
+				onSettledNonUserChange: (path, text) => this.events.trigger(SETTLED_NON_USER_CHANGE_EVENT, path, text),
+			})
+		);
 
 		// E12: a mobile app kill, backgrounding the app or switching tabs can all end a session
 		// without `onunload` ever running — flush at once (not after the 150ms debounce) on each.
