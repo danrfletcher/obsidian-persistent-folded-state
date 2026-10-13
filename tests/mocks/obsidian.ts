@@ -11,6 +11,22 @@
  *   `tests/integration/data-json.test.ts` points them at real files instead.
  */
 
+// --- CM6 interop (Obsidian's own StateFields, real @codemirror/state) ----------------------------
+import { StateField } from "@codemirror/state";
+
+/** Real obsidian exports `editorInfoField: StateField<MarkdownFileInfo>`; this mock defines the
+ * exact same kind of field (a plain passthrough `StateField`, backed by the real
+ * `@codemirror/state` package the editor watcher is also built against) so a test can set a
+ * file for a given `EditorState` with `editorInfoField.init(() => ({ file }))`, the same way
+ * real Obsidian wires a `MarkdownView`'s file into its CM6 state. */
+export interface MockMarkdownFileInfo {
+	file: { path: string; extension: string } | null;
+}
+export const editorInfoField = StateField.define<MockMarkdownFileInfo>({
+	create: () => ({ file: null }),
+	update: (value) => value,
+});
+
 // --- DOM helpers (Obsidian's HTMLElement extensions) ---------------------------------------------
 interface CreateOpts {
 	text?: string;
@@ -341,6 +357,12 @@ export class Plugin {
 		el.addEventListener(type, cb);
 		this.domListeners.push({ el, type, cb });
 	}
+
+	/** Real Obsidian applies the extension to every open (and later-opened) CM6 editor and tears
+	 * it back out on unload; this mock only needs to not throw when `onload()` calls it — the
+	 * editor-watcher's own CM6-level tests exercise the extension directly against a real
+	 * `EditorState`/`EditorView`, which is where its actual attach/detach behaviour is proven. */
+	registerEditorExtension(_extension: unknown): void {}
 
 	/** Real Obsidian's own `Component.unload()`: called when the plugin is disabled. Runs
 	 * `onunload()`, then detaches every `registerDomEvent` listener (E7/E12: "gone after
