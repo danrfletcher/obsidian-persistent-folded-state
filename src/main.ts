@@ -24,13 +24,22 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 
 		// E12: a mobile app kill, backgrounding the app or switching tabs can all end a session
 		// without `onunload` ever running — flush at once (not after the 150ms debounce) on each.
+		// `flushAtOnce` logs rather than throwing on a rejection (e.g. a full disk): the store has
+		// already re-marked itself dirty so a later flush retries, and these call sites have
+		// nowhere to propagate a rejection to (a DOM event handler, `onunload`).
 		this.registerDomEvent(document, "visibilitychange", () => {
-			if (document.visibilityState === "hidden") void this.store.flush();
+			if (document.visibilityState === "hidden") this.flushAtOnce();
 		});
-		this.registerDomEvent(window, "pagehide", () => void this.store.flush());
+		this.registerDomEvent(window, "pagehide", () => this.flushAtOnce());
 	}
 
 	onunload(): void {
-		void this.store.flush();
+		this.flushAtOnce();
+	}
+
+	private flushAtOnce(): void {
+		this.store.flush().catch((err: unknown) => {
+			console.error("persistent-folded-state: flush failed", err);
+		});
 	}
 }

@@ -1,8 +1,9 @@
 /**
  * The persistence layer every later PR sits on: an in-memory map of per-file fold records,
  * flushed to Obsidian's own `data.json` (via injected `loadData`/`saveData`, never anything
- * else — F2/F8). Deliberately has no dependency on "obsidian" so it's trivial to unit test and
- * so a later PR can reuse it from a worker if it ever needs to (E6).
+ * else — F2/F8). Deliberately has no dependency on the "obsidian" package so it's trivial to
+ * unit test; it does use `window.setTimeout`/`window.clearTimeout` for the debounce timer
+ * (obsidianmd/prefer-window-timers), so it still needs a DOM/`window` to run in.
  *
  * Flush timing (E12): an ordinary change (`set`) is debounced 150ms after the last change, so a
  * burst of edits costs one write, not many. A user-triggered forget (`forget`/`forgetAll`) and
@@ -84,7 +85,7 @@ export function hashText(text: string): string {
 export class FoldStore {
 	private files = new Map<string, FileFoldRecord>();
 	private dirty = false;
-	private flushTimer: ReturnType<typeof setTimeout> | null = null;
+	private flushTimer: number | null = null;
 	/** Serialises every flush (scheduled or immediate) so overlapping calls never race: each
 	 * write only takes its snapshot once earlier writes have finished, so it always reflects the
 	 * freshest in-memory state rather than whatever was current when it was *called*. */
@@ -100,7 +101,15 @@ export class FoldStore {
 	}
 
 	/** E8: populates the in-memory map from `loadData()`, sanitising whatever comes back and
-	 * never throwing out of `onload` — a rejecting `loadData()` is caught here too. */
+	 * never throwing out of `onload` — a rejecting `loadData()` is caught here too.
+	 *
+	 * R7 (reviewed, not fixed here): a *rejecting* `loadData()` could mean the underlying file
+	 * is just transiently unreadable, not actually corrupt — but this starts empty the same as a
+	 * genuinely corrupt file, and the next `set()` then overwrites `data.json`, discarding
+	 * whatever was there if the read failure was transient. The spec (E8) mandates "start empty"
+	 * for exactly this case, so this is spec-compliant as written. A later PR could reduce the
+	 * blast radius by copying the unreadable file aside (e.g. `data.json.corrupt`) before the
+	 * first overwrite, so a transient read failure stays recoverable; out of scope for PR-1. */
 	async load(): Promise<void> {
 		let raw: unknown;
 		try {
@@ -126,10 +135,10 @@ export class FoldStore {
 	/** Replaces the whole record for `path`. Schedules a debounced flush (E9/E12) — this is the
 	 * hot path for ordinary fold recording in a later PR, so it never writes synchronously.
 	 *
-	 * Uses the global `setTimeout`/`clearTimeout`, not `window.setTimeout`/`window.clearTimeout`:
-	 * this file is deliberately obsidian- and DOM-free (see the file comment) so it stays usable
-	 * from a worker if a later PR needs that; it has no `window` to call through to in the first
-	 * place, and nothing it does is tied to a particular popout window. */
+	 * Uses `window.setTimeout`/`window.clearTimeout` rather than the bare globals, so a timer
+	 * started in one popout window is tracked against that window rather than Obsidian's main
+	 * one (obsidianmd/prefer-window-timers). This file otherwise still has no dependency on the
+	 * `obsidian` package itself (see the file comment); only this timer call needs `window`. */
 	set(path: string, record: FileFoldRecord): void {
 		this.files.set(path, record);
 		this.scheduleDebouncedFlush();
@@ -141,7 +150,7 @@ export class FoldStore {
 	forget(path: string): boolean {
 		if (!this.files.delete(path)) return false;
 		this.dirty = true;
-		void this.flush();
+		this.flushAndLog();
 		return true;
 	}
 
@@ -153,7 +162,7 @@ export class FoldStore {
 		if (count === 0) return 0;
 		this.files.clear();
 		this.dirty = true;
-		void this.flush();
+		this.flushAndLog();
 		return count;
 	}
 
@@ -168,7 +177,18 @@ export class FoldStore {
 				files: Object.fromEntries(this.files),
 			};
 			this.dirty = false;
-			await this.saveDataFn(snapshot);
+			try {
+				await this.saveDataFn(snapshot);
+			} catch (err) {
+				// The write never reached disk: put the store back in a dirty state so the next
+				// flush (a lifecycle hook, or a later debounced one) retries it, instead of
+				// silently staying "clean" with nothing actually saved (E12). If a newer
+				// set()/forget() already re-dirtied the store while this write was in flight,
+				// this is a no-op — that newer flush's snapshot already covers this one too,
+				// since it reads straight off the same in-memory map.
+				this.dirty = true;
+				throw err;
+			}
 		});
 		// Keep the chain alive even if this write rejects, so a later flush still gets its turn;
 		// the caller's own promise (`task`) still rejects, so the failure isn't swallowed.
@@ -179,16 +199,26 @@ export class FoldStore {
 	private scheduleDebouncedFlush(): void {
 		this.dirty = true;
 		this.cancelScheduledFlush();
-		this.flushTimer = setTimeout(() => {
+		this.flushTimer = window.setTimeout(() => {
 			this.flushTimer = null;
-			void this.flush();
+			this.flushAndLog();
 		}, this.flushDelayMs);
 	}
 
 	private cancelScheduledFlush(): void {
 		if (this.flushTimer !== null) {
-			clearTimeout(this.flushTimer);
+			window.clearTimeout(this.flushTimer);
 			this.flushTimer = null;
 		}
+	}
+
+	/** `flush()`, but for call sites that can't await it (a user action, a lifecycle hook) and
+	 * would otherwise leave a rejected `flush()` as an unhandled promise rejection. `flush()`
+	 * itself has already re-dirtied the store on failure (see above), so the only thing left to
+	 * do here is make the failure visible instead of silent. */
+	private flushAndLog(): void {
+		this.flush().catch((err: unknown) => {
+			console.error("persistent-folded-state: flush failed", err);
+		});
 	}
 }
