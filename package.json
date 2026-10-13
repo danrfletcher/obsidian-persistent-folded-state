@@ -1,0 +1,38 @@
+{
+	"name": "persistent-folded-state",
+	"version": "0.1.0",
+	"description": "Preserve block and task fold states in an open note across external file modifications (AI agents, sync, git pulls).",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"lint": "eslint src",
+		"test": "vitest run",
+		"version": "node version-bump.mjs && git add manifest.json versions.json"
+	},
+	"keywords": [
+		"obsidian-plugin",
+		"folds",
+		"persistence"
+	],
+	"author": "Dan Fletcher",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/danrfletcher/obsidian-persistent-folded-state.git"
+	},
+	"devDependencies": {
+		"@types/node": "^24.19.2",
+		"@typescript-eslint/eslint-plugin": "^8.70.0",
+		"@typescript-eslint/parser": "^8.70.0",
+		"builtin-modules": "^5.0.0",
+		"esbuild": "^0.28.2",
+		"eslint": "^9.39.5",
+		"eslint-plugin-obsidianmd": "^0.4.2",
+		"jsdom": "^26.1.0",
+		"obsidian": "^1.13.1",
+		"tslib": "^2.6.0",
+		"typescript": "^5.9.3",
+		"vitest": "^5.0.4"
+	}
+}
