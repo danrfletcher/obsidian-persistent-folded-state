@@ -13,7 +13,17 @@ const context = await esbuild.context({
 	banner: { js: banner },
 	entryPoints: ["src/main.ts"],
 	bundle: true,
-	external: ["obsidian", "electron", ...builtinModules],
+	// "@codemirror/state"/"@codemirror/view" are Obsidian's own declared peer dependencies
+	// (see node_modules/obsidian/package.json); "@codemirror/language" isn't declared the same
+	// way but is bundled and shared the same way in practice (it's where foldEffect/
+	// unfoldEffect/foldState/foldedRanges live — there is no "obsidian" re-export of them).
+	// All three MUST stay external, not bundled: Obsidian's Electron process pre-registers them
+	// in the module cache, so `require("@codemirror/language")` from this plugin's bundle
+	// resolves to the exact same module instance Obsidian's own editor uses. Bundling a second,
+	// separate copy would still type-check and run, but every `effect.is(foldEffect)` check
+	// would silently fail against Obsidian's real fold effects (different StateEffectType
+	// object identity), so the recorder would never see the user's own folds.
+	external: ["obsidian", "electron", "@codemirror/state", "@codemirror/view", "@codemirror/language", ...builtinModules],
 	format: "cjs",
 	target: "es2020",
 	logLevel: "info",
