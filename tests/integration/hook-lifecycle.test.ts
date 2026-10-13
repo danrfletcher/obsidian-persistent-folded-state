@@ -10,7 +10,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { foldEffect } from "@codemirror/language";
+import { codeFolding, foldEffect } from "@codemirror/language";
 import { editorInfoField } from "../mocks/obsidian";
 import { FoldStore } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
@@ -28,7 +28,9 @@ function makeStore(): FoldStore {
 function stateFor(file: { path: string; extension: string } | null, extraExtensions: unknown[] = []) {
 	return EditorState.create({
 		doc: "# Heading\nbody text",
-		extensions: [editorInfoField.init(() => ({ file })), ...(extraExtensions as never[])],
+		// `codeFolding()` mirrors what real Obsidian always has registered in its own editor
+		// extensions; the watcher reads the live `foldState` it provides (R4/R5).
+		extensions: [codeFolding(), editorInfoField.init(() => ({ file })), ...(extraExtensions as never[])],
 	});
 }
 
@@ -42,7 +44,7 @@ describe("editor watcher lifecycle (CM6 ViewPlugin attach/detach)", () => {
 		const watcher = createEditorWatcher({ store });
 		const state = EditorState.create({
 			doc: "# Heading\nbody",
-			extensions: [watcher, editorInfoField.init(() => ({ file: { path: "Open.md", extension: "md" } }))],
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: "Open.md", extension: "md" } }))],
 		});
 		const view = new EditorView({ state, parent: document.body });
 
@@ -60,7 +62,7 @@ describe("editor watcher lifecycle (CM6 ViewPlugin attach/detach)", () => {
 		const firstView = new EditorView({
 			state: EditorState.create({
 				doc: "# A\nbody",
-				extensions: [watcher, editorInfoField.init(() => ({ file: { path: "First.md", extension: "md" } }))],
+				extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: "First.md", extension: "md" } }))],
 			}),
 			parent: document.body,
 		});
@@ -68,7 +70,7 @@ describe("editor watcher lifecycle (CM6 ViewPlugin attach/detach)", () => {
 		const secondView = new EditorView({
 			state: EditorState.create({
 				doc: "# B\nbody",
-				extensions: [watcher, editorInfoField.init(() => ({ file: { path: "Second.md", extension: "md" } }))],
+				extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: "Second.md", extension: "md" } }))],
 			}),
 			parent: document.body,
 		});

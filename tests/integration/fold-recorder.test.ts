@@ -10,7 +10,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
+import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { editorInfoField } from "../../tests/mocks/obsidian";
 import { FoldStore } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
@@ -38,7 +38,10 @@ function makeView(store: FoldStore, onSettledNonUserChange?: (path: string, text
 	const watcher = createEditorWatcher({ store, onSettledNonUserChange, window });
 	const state = EditorState.create({
 		doc: FIXTURE_TEXT,
-		extensions: [watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		// `codeFolding()` mirrors what real Obsidian always has registered in its own editor
+		// extensions (core fold-gutter support) — this plugin's own extension never supplies
+		// it; it only reads the live `foldState` such an extension provides (R4/R5).
+		extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
 	});
 	return new EditorView({ state, parent: document.body });
 }
@@ -184,6 +187,76 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 			view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
 
 			expect(store.get(NOTE_PATH)?.folds).toHaveLength(1);
+		});
+	});
+
+	describe("R4: de-duplication and position-based unfold matching", () => {
+		it("a double fold of the same block, then a single unfold, leaves zero entries", () => {
+			const { store } = makeStore();
+			const view = makeView(store);
+			const from = lineStart(view, LINES.heading);
+
+			// Two fold effects over the identical range (e.g. a native restore racing a user
+			// fold, or any other double-dispatch) must never produce two stored entries.
+			view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+			view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+			expect(store.get(NOTE_PATH)?.folds).toHaveLength(1);
+
+			view.dispatch({ effects: [unfoldEffect.of({ from, to: from + 1 })] });
+			expect(store.get(NOTE_PATH)?.folds).toHaveLength(0);
+		});
+
+		it("editing a folded line's text, then unfolding, leaves zero entries (no stale entry survives)", () => {
+			const { store } = makeStore();
+			const view = makeView(store);
+			const from = lineStart(view, LINES.heading);
+
+			view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+			expect(store.get(NOTE_PATH)?.folds).toHaveLength(1);
+
+			// Rewrite the folded heading's own text while it's folded (e.g. the user typing in
+			// it, or an external agent rewriting "## Tuesday" -> "## Tuesday v2") — no fold or
+			// unfold effect in this transaction, so the stored record isn't touched by it. The
+			// edit is an insertion at the line's end rather than a replace of the fold's own
+			// anchor span: CM6 itself drops a fold whose exact range was replaced outright
+			// (correctly — that content no longer exists), which is a different, unrelated
+			// case from the one R4 is about (the fold's range survives; only the line's text
+			// changed), so this is the faithful way to reproduce it.
+			const headingLine = view.state.doc.line(10);
+			view.dispatch({ changes: { from: headingLine.to, to: headingLine.to, insert: " v2" } });
+
+			// The live CM6 fold range is unaffected by the text edit (it still covers the same
+			// mapped position); unfolding it must still remove the one stored entry, not leave
+			// a stale copy of the pre-edit text behind for a later PR to re-fold.
+			const liveFolded: { from: number; to: number }[] = [];
+			foldedRanges(view.state).between(0, view.state.doc.length, (rangeFrom, rangeTo) => {
+				liveFolded.push({ from: rangeFrom, to: rangeTo });
+			});
+			expect(liveFolded).toHaveLength(1);
+			view.dispatch({ effects: [unfoldEffect.of(liveFolded[0])] });
+
+			expect(store.get(NOTE_PATH)?.folds).toHaveLength(0);
+		});
+	});
+
+	describe("R5: fold effects are described in the transaction's post-change coordinates", () => {
+		it("a transaction that both inserts text and folds a range describes the post-insert line, not the pre-insert one", () => {
+			const { store } = makeStore();
+			const view = makeView(store);
+
+			// Mirrors the exact scenario from the review finding: insert a new first line, and
+			// in the same transaction fold a range that (only after the insert) falls inside it.
+			// Against `tr.startState` this would describe the wrong block (or throw past the
+			// old document's end); against `tr.state` (R5's fix) it must describe "NEW LINE".
+			const insert = "NEW LINE\n";
+			view.dispatch({
+				changes: { from: 0, to: 0, insert },
+				effects: [foldEffect.of({ from: 2, to: insert.length - 1 })],
+			});
+
+			const record = store.get(NOTE_PATH);
+			expect(record?.folds).toHaveLength(1);
+			expect((record?.folds[0] as { text: string }).text).toBe("NEW LINE");
 		});
 	});
 });
