@@ -92,6 +92,19 @@ describe("classifyTransaction: E11 table", () => {
 		expect(classifyTransaction(tr)).toBe("user");
 	});
 
+	it("a userEvent of \"set\" (Obsidian's external-reload/setValue annotation) is a non-user change", () => {
+		// R10/T1: live-confirmed against real Obsidian 1.14.4 (docs/reload-shape.md) — an
+		// external write to the open note's underlying file is not a bare, un-annotated change,
+		// it is a transaction annotated userEvent:"set". Without this case the settled-non-user-
+		// change event (E9/E10) never fires on a real external reload at all.
+		const state = baseState();
+		const tr = state.update({
+			changes: { from: 0, to: 13, insert: "rewritten entirely" },
+			annotations: Transaction.userEvent.of("set"),
+		});
+		expect(classifyTransaction(tr)).toBe("non-user");
+	});
+
 	it("annotation edge case: other annotations present but no userEvent is still non-user", () => {
 		const addInfo = Annotation.define<string>();
 		const state = baseState();
