@@ -66,11 +66,20 @@
  *
  * Usage (run inside the Obsidian desktop container, per use-desktop-container.md):
  *
+ *   node scripts/e2e-reload-probe.mjs                                           # == --phase all
+ *   node scripts/e2e-reload-probe.mjs --phase all --note <path to the open note>
  *   node scripts/e2e-reload-probe.mjs --phase external-write --note <path to the open note>
  *   node scripts/e2e-reload-probe.mjs --phase gutter-fold
  *   node scripts/e2e-reload-probe.mjs --phase fold-command
  *   node scripts/e2e-reload-probe.mjs --phase native-restore   # run just after relaunching Obsidian
  *   node scripts/e2e-reload-probe.mjs --phase report            # (re)writes docs/reload-shape.md
+ *
+ * T2/T3: `npm run test:e2e` passes no `--phase`, which now runs `all` — external-write,
+ * gutter-fold and fold-command in one Obsidian session, then renders the report — rather than
+ * only printing usage and exiting 1. `--note` defaults to the container test vault's fixture note
+ * path (`DEFAULT_NOTE_PATH` below) and can be overridden. `native-restore` stays its own explicit
+ * phase: it needs a human to actually quit and relaunch Obsidian first, which can't happen inside
+ * one non-interactive invocation.
  *
  * Every phase accepts [--cdp-port 9222] [--wait-ms 3000] [--state <path>]; `native-restore` also
  * accepts [--connect-retries 30] [--connect-retry-delay-ms 2000] for reconnecting while Obsidian
@@ -85,7 +94,21 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPORT_PATH = join(ROOT, "docs", "reload-shape.md");
 const DEFAULT_STATE_PATH = join(tmpdir(), "pfs-e2e-reload-probe-state.json");
 
-const PHASES = ["external-write", "gutter-fold", "fold-command", "native-restore", "report"];
+/** T2/T3: the container's test vault always opens the fixture note at this vault-relative path
+ * (see docs/reload-shape.md's own "Note probed" line, captured from a real container run) — used
+ * only as the default for the `all` sequence below, and only ever reached after a real CDP
+ * connection to a running Obsidian has already succeeded (see `externallyRewrite`'s call site in
+ * `runExternalWrite`), so it is inert on a host with no Obsidian running. Override with `--note`. */
+const DEFAULT_NOTE_PATH = "/config/test-vault/Tasks.md";
+
+const EXPLICIT_PHASES = ["external-write", "gutter-fold", "fold-command", "native-restore", "report"];
+/** T2/T3: `all` is the default when `--phase` is omitted, so `npm run test:e2e` actually runs the
+ * container probe instead of only printing usage and exiting 1. It chains every phase that can
+ * run inside one Obsidian session (external-write, gutter-fold, fold-command, report) — it
+ * intentionally excludes `native-restore`, which needs a human to actually quit and relaunch
+ * Obsidian between phases and so can never be part of one non-interactive invocation; that phase
+ * stays explicit (`--phase native-restore`), exactly as documented in docs/reload-shape.md. */
+const PHASES = ["all", ...EXPLICIT_PHASES];
 
 function parseArgs(argv) {
 	const args = {
@@ -112,9 +135,13 @@ function parseArgs(argv) {
 function printUsage() {
 	console.log(
 		[
-			`Usage: node scripts/e2e-reload-probe.mjs --phase <${PHASES.join("|")}> [options]`,
+			`Usage: node scripts/e2e-reload-probe.mjs [--phase <${PHASES.join("|")}>] [options]`,
 			"",
-			"  --phase external-write --note <path>   external rewrite + E10 outcome for that write",
+			"  (no --phase)                            same as --phase all (the default)",
+			"  --phase all                              external-write + gutter-fold + fold-command + report,",
+			"                                           in one Obsidian session (native-restore excluded: see below)",
+			"  --phase external-write [--note <path>]  external rewrite + E10 outcome for that write",
+			`                                           (--note defaults to ${DEFAULT_NOTE_PATH})`,
 			"  --phase gutter-fold                    click the fold gutter on the open note's first line",
 			"  --phase fold-command                    run Obsidian's fold command at the cursor",
 			"  --phase native-restore                  attach just after relaunching Obsidian",
@@ -126,6 +153,9 @@ function printUsage() {
 			"Requires a real Obsidian launched with --remote-debugging-port=<cdp-port>, this plugin",
 			"built and enabled, and (for external-write/gutter-fold/fold-command) --note already open",
 			"in an editor. See the file comment in this script and docs/reload-shape.md.",
+			"",
+			"native-restore needs Obsidian to actually be quit and relaunched by hand first, so it is",
+			"never part of the default `all` sequence; run it (then --phase report) separately.",
 		].join("\n")
 	);
 }
@@ -379,22 +409,22 @@ async function withConnection(cdpPort, fn, { retries = 1, retryDelayMs = 0 } = {
 }
 
 async function runExternalWrite(args, state) {
-	if (!args.note) throw new Error("--phase external-write requires --note <path>");
+	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
 		const install = await evaluate(cdp, INSTALL_SPY_EXPRESSION);
 		if (install.error) throw new Error(install.error);
 
 		const writeStartedAt = Date.now();
-		externallyRewrite(args.note);
+		externallyRewrite(note);
 		await sleep(args.waitMs);
 
 		const log = await readLog(cdp);
 		const windowEntries = log.filter((e) => e.t >= writeStartedAt);
 		const summary = summarizeWindow(windowEntries);
-		const outcome = summary.docChangedNoAnnotationCount > 0 ? "emitted" : "not emitted";
+		const outcome = summary.docChangedCount > 0 ? "emitted" : "not emitted";
 
 		state.obsidianVersion = install.obsidianVersion;
-		state.externalWrite = { note: args.note, waitMs: args.waitMs, outcome, ...summary };
+		state.externalWrite = { note, waitMs: args.waitMs, outcome, ...summary };
 	});
 }
 
@@ -548,6 +578,8 @@ Generated by \`scripts/e2e-reload-probe.mjs\`, run from inside the Obsidian desk
 launched with \`--remote-debugging-port\`. Re-run with:
 
 \`\`\`
+npm run test:e2e                                               # == --phase all (default)
+# or, phase by phase:
 node scripts/e2e-reload-probe.mjs --phase external-write --note "<path to the open note>"
 node scripts/e2e-reload-probe.mjs --phase gutter-fold
 node scripts/e2e-reload-probe.mjs --phase fold-command
@@ -561,9 +593,9 @@ comment in the script for why, and for the F10/own-instrumentation boundary it s
 
 ${
 	outcome === "emitted"
-		? "Obsidian's own external-reload reaction dispatches a document-changing CM6 transaction with no `userEvent` annotation, exactly as E9/E10 assumed. No vault-modify fallback (F10) is needed."
+		? "Obsidian's own reaction to an external write *does* dispatch a document-changing CM6 transaction — it is not a bare, un-annotated one: it carries a `userEvent` annotation of `set` (CM6's own annotation for a whole-buffer `setValue`-style replacement, which is exactly what Obsidian's reload does under the hood; see the `userEvent` values line below and the raw log). R10: `src/transaction-classifier.ts` treats `userEvent: \"set\"` as a non-user change for exactly this reason, so the settled-non-user-change event (E9/E10) fires on a real external write. No vault-modify fallback (F10) is needed."
 		: outcome === "not emitted"
-			? "No document-changing transaction without a `userEvent` annotation was observed after the external write — Obsidian appears to replace the editor state/view outright on an external reload rather than dispatching one. Per F10, this PR is flagged for a plan change (a vault-modify fallback may be required); it is not added here."
+			? "No document-changing transaction was observed after the external write at all — Obsidian appears to replace the editor state/view outright on an external reload rather than dispatching one. Per F10, this PR is flagged for a plan change (a vault-modify fallback may be required); it is not added here."
 			: "External-write phase has not been run yet."
 }
 
@@ -590,15 +622,29 @@ ${JSON.stringify(
 
 async function main() {
 	const args = parseArgs(process.argv.slice(2));
-	if (args.help || !args.phase || !PHASES.includes(args.phase)) {
+	if (args.help) {
 		printUsage();
-		process.exitCode = args.help ? 0 : 1;
+		process.exitCode = 0;
+		return;
+	}
+	// T2/T3: no --phase at all defaults to "all" so `npm run test:e2e` actually runs the
+	// container probe instead of only printing usage and exiting 1.
+	if (!args.phase) args.phase = "all";
+	if (!PHASES.includes(args.phase)) {
+		printUsage();
+		process.exitCode = 1;
 		return;
 	}
 
 	const state = loadState(args.state);
 
-	if (args.phase === "external-write") await runExternalWrite(args, state);
+	if (args.phase === "all") {
+		await runExternalWrite(args, state);
+		await runGutterFold(args, state);
+		await runFoldCommand(args, state);
+		// native-restore is deliberately not part of this sequence (see PHASES' comment above):
+		// run it by hand after relaunching Obsidian, then re-run with --phase report.
+	} else if (args.phase === "external-write") await runExternalWrite(args, state);
 	else if (args.phase === "gutter-fold") await runGutterFold(args, state);
 	else if (args.phase === "fold-command") await runFoldCommand(args, state);
 	else if (args.phase === "native-restore") await runNativeRestore(args, state);
