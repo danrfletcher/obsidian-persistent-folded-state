@@ -1,0 +1,16 @@
+
+> persistent-folded-state@0.1.0 test
+> vitest run
+
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `"type": "module"` in the closest package.json
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+
+ RUN  v5.0.4 /Users/danfletcher/.local/share/vector/tmp/worktrees/warkworth-1
+
+
+ Test Files  22 passed (22)
+      Tests  397 passed (397)
+   Start at  16:52:57
+   Duration  1.27s (environment 73%, tests 13%, transform 10%, import 3%)
+
