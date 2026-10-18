@@ -152,3 +152,85 @@ interface PendingAnchor {
 	/** Candidate indices eligible for this anchor's scope (before any tier-specific filter). */
 	pool: number[];
 }
+
+/** Tier 1 (G4 exact, E1 duplicates): groups unresolved stored anchors and unconsumed candidates
+ * sharing one (scope, normalized text, kind) and pairs them by order — the nth stored duplicate
+ * (in `stored` order) takes the nth candidate duplicate (in `candidates` order). A stored anchor
+ * past the end of its group's candidates (E1: "fewer duplicates now") is left pending here,
+ * never remapped onto a different duplicate and never marked ambiguous — duplicates are E1
+ * pairing, not an E2 tie (C20). No `similarity()` call: exact text is plain string equality. */
+function runExactTier(
+	pending: PendingAnchor[],
+	stored: Anchor[],
+	candidates: Anchor[],
+	consumed: boolean[],
+	results: MatchResult[],
+): PendingAnchor[] {
+	const groups = new Map<string, { storedIdxs: number[]; candidateIdxs: number[] }>();
+
+	for (const p of pending) {
+		const anchor = stored[p.index];
+		const groupKey = `${chainKey(anchor)}\u0000${anchor.kind}\u0000${anchor.text}`;
+		const group = groups.get(groupKey) ?? { storedIdxs: [], candidateIdxs: [] };
+		group.storedIdxs.push(p.index);
+		if (!groups.has(groupKey)) {
+			// Every member of a group shares the same (chainKey, kind, text), so any member's
+			// own scope pool finds the same candidate set — computed once per group.
+			for (const c of p.pool) {
+				if (consumed[c]) continue;
+				const candidate = candidates[c];
+				if (candidate.kind === anchor.kind && candidate.text === anchor.text) {
+					group.candidateIdxs.push(c);
+				}
+			}
+		}
+		groups.set(groupKey, group);
+	}
+
+	const resolvedStoredIdx = new Set<number>();
+	for (const group of groups.values()) {
+		const n = Math.min(group.storedIdxs.length, group.candidateIdxs.length);
+		for (let i = 0; i < n; i++) {
+			const storedIdx = group.storedIdxs[i];
+			const candidateIdx = group.candidateIdxs[i];
+			consumed[candidateIdx] = true;
+			results[storedIdx] = { tier: "exact", target: candidateIdx };
+			resolvedStoredIdx.add(storedIdx);
+		}
+	}
+
+	return pending.filter((p) => !resolvedStoredIdx.has(p.index));
+}
+
+/** Memoized, capped, chunk-yielding source of `similarity()` scores for tiers 2 and 3. Memoized
+ * by `(anchorIdx, candidateIdx)` so a pair re-examined across several deferred-acceptance passes
+ * (see `runScoredTier`) is never re-counted — the cap and the spy both see one call per pair.
+ * Returns `null` once the cap is reached and the pair has never been scored before; callers must
+ * stop offering further candidates to that anchor once they see `null`. */
+class ComparisonBudget {
+	private readonly memo = new Map<string, number>();
+	private count = 0;
+	exhausted: boolean;
+
+	constructor(
+		private readonly max: number,
+		private readonly chunkSize: number,
+		private readonly yieldToHost: () => Promise<void> | void,
+	) {
+		this.exhausted = max <= 0;
+	}
+
+	async score(anchorIdx: number, candidateIdx: number, textA: string, textB: string): Promise<number | null> {
+		const key = `${anchorIdx}:${candidateIdx}`;
+		const cached = this.memo.get(key);
+		if (cached !== undefined) return cached;
+		if (this.exhausted) return null;
+
+		const value = similarityModule.similarity(textA, textB);
+		this.memo.set(key, value);
+		this.count++;
+		if (this.count >= this.max) this.exhausted = true;
+		if (this.count % this.chunkSize === 0) await this.yieldToHost();
+		return value;
+	}
+}
