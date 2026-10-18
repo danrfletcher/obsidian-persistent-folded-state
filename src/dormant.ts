@@ -23,7 +23,7 @@
  * when the store is flushed".
  */
 import { anchorKey, parseAnchor, type Anchor } from "./anchors";
-import { matchAnchors, type MatcherOptions } from "./matcher";
+import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
 import type { StoredAnchor } from "./types";
 
 /** G6: a dormant anchor this old (or older) is forgotten outright — never retried again, and
@@ -99,35 +99,62 @@ export interface DormantRetryResult {
 	stillDormant: StoredAnchor[];
 }
 
-/** G6: retries every still-fresh anchor in `dormant` against `candidates` (the same candidates
- * the active-fold restore pass already built for this reload — src/fold-restorer.ts passes one
- * `buildAnchors(text)` result to both). Never throws on an empty `dormant`/`candidates`. */
-export async function retryDormant(
-	dormant: readonly StoredAnchor[],
-	candidates: Anchor[],
-	now: number,
-	options?: MatcherOptions,
-): Promise<DormantRetryResult> {
-	const survivors: { raw: StoredAnchor; anchor: DormantAnchor }[] = [];
+/** One still-fresh (non-expired, well-formed) dormant entry, paired with its parsed anchor. */
+export interface DormantSurvivor {
+	raw: StoredAnchor;
+	anchor: DormantAnchor;
+}
+
+/** G6/E8: every entry in `dormant` that is still well-formed and younger than
+ * `MAX_DORMANT_AGE_MS` — an already-expired or malformed entry is forgotten outright, never
+ * attempted, never returned. Pure and `now`-driven, same discipline as `expireDormant`. Split
+ * out of `retryDormant` (R1) so a caller (src/fold-restorer.ts) can fold these survivors' anchors
+ * into the *same* `matchAnchors` call as the active-fold pass, rather than running a second,
+ * independent call that doesn't know which candidates the active pass already claimed. */
+export function freshDormantAnchors(dormant: readonly StoredAnchor[], now: number): DormantSurvivor[] {
+	const survivors: DormantSurvivor[] = [];
 	for (const raw of dormant) {
 		const parsed = parseDormantAnchor(raw);
 		if (parsed === null) continue; // E8
 		if (now - parsed.dormantSince >= MAX_DORMANT_AGE_MS) continue; // G6: aged out before even trying
 		survivors.push({ raw, anchor: parsed });
 	}
-	if (survivors.length === 0) return { matched: [], stillDormant: [] };
+	return survivors;
+}
 
-	const results = await matchAnchors(survivors.map((s) => s.anchor), candidates, options);
-
+/** Splits `survivors` into matched/still-dormant given `results` (one `MatchResult` per
+ * survivor, in the same order) — the second half of `retryDormant`, usable on its own (R1) when
+ * `results` came from a combined `matchAnchors` call rather than one scoped to `survivors` alone. */
+export function splitDormantResults(
+	survivors: readonly DormantSurvivor[],
+	results: readonly MatchResult[],
+): DormantRetryResult {
 	const matched: DormantMatch[] = [];
 	const stillDormant: StoredAnchor[] = [];
 	for (let i = 0; i < survivors.length; i++) {
 		const result = results[i];
-		if (result.tier === "none") {
+		if (!result || result.tier === "none") {
 			stillDormant.push(survivors[i].raw); // original dormantSince preserved verbatim
 		} else {
 			matched.push({ anchor: survivors[i].anchor, candidateIndex: result.target });
 		}
 	}
 	return { matched, stillDormant };
+}
+
+/** G6: retries every still-fresh anchor in `dormant` against `candidates`, in its own
+ * `matchAnchors` call. Never throws on an empty `dormant`/`candidates`. Standalone convenience
+ * for a caller (and test) that only has dormant anchors to match — src/fold-restorer.ts no
+ * longer uses this directly (R1): it needs dormant and active anchors to share one `matchAnchors`
+ * call's candidate-claiming, so it calls `freshDormantAnchors`/`splitDormantResults` instead. */
+export async function retryDormant(
+	dormant: readonly StoredAnchor[],
+	candidates: Anchor[],
+	now: number,
+	options?: MatcherOptions,
+): Promise<DormantRetryResult> {
+	const survivors = freshDormantAnchors(dormant, now);
+	if (survivors.length === 0) return { matched: [], stillDormant: [] };
+	const results = await matchAnchors(survivors.map((s) => s.anchor), candidates, options);
+	return splitDormantResults(survivors, results);
 }

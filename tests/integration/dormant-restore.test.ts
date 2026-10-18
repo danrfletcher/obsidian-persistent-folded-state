@@ -40,10 +40,10 @@ async function makeStore(seed: Record<string, FileFoldRecord>, now: () => number
 	return store;
 }
 
-function makeView(store: FoldStore, now: () => number): EditorView {
+function makeView(store: FoldStore, now: () => number, doc: string = TEXT_WITH_TUESDAY): EditorView {
 	const watcher = createEditorWatcher({ store, window, now });
 	const state = EditorState.create({
-		doc: TEXT_WITH_TUESDAY,
+		doc,
 		selection: { anchor: 0 }, // line 1 ("Notes"), never inside any anchor's fold range (G13)
 		extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
 	});
@@ -157,4 +157,62 @@ describe("dormant folds (G6)", () => {
 		expect(after?.dormant).toEqual([]); // forgotten, not retried, not carried forward
 		expect(after?.folds).toEqual([]);
 	});
+
+	it(
+		"R1: an active anchor's exact match claims its candidate before a competing dormant " +
+			"retry can — the block folds exactly once, only the active anchor is stored, and the " +
+			"dormant anchor stays dormant rather than being promoted alongside it",
+		async () => {
+			const TEXT_ALPHA = "Notes\n\n- [ ] Draft proposal for client alpha\n  - [ ] Sub task\n";
+			const TEXT_ALPHA_REWRITTEN =
+				"Notes\n\nSomething else entirely, unrelated to the task below.\n\n" +
+				"- [ ] Draft proposal for client alpha\n  - [ ] Sub task\n";
+			const TEXT_BRAVO = "Notes\n\n- [ ] Draft proposal for client bravo\n  - [ ] Sub task\n";
+
+			const alpha = findOneBlock(buildAnchors(TEXT_ALPHA), (a) => a.kind === "task" && a.text.includes("alpha")).anchor;
+			const bravo = findOneBlock(buildAnchors(TEXT_BRAVO), (a) => a.kind === "task" && a.text.includes("bravo")).anchor;
+
+			let clock = 0;
+			const store = await makeStore(
+				{
+					[NOTE_PATH]: {
+						contentHash: hashText(TEXT_ALPHA),
+						folds: [alpha] as unknown as Record<string, unknown>[],
+						dormant: [{ ...bravo, dormantSince: 0 }] as unknown as Record<string, unknown>[],
+					},
+				},
+				() => clock,
+			);
+
+			// Neither block is folded live yet (the previous session's CM6 fold state is gone —
+			// the usual reason a restore pass runs at all), so `alreadyFolded` starts empty and
+			// both the active and dormant passes would, before R1's fix, independently decide to
+			// fold the same block.
+			const view = makeView(store, () => clock, TEXT_ALPHA);
+
+			view.dispatch({
+				changes: { from: 0, to: view.state.doc.length, insert: TEXT_ALPHA_REWRITTEN },
+				annotations: Transaction.userEvent.of("set"),
+			});
+			await settle();
+
+			const alphaAgain = findOneBlock(
+				buildAnchors(TEXT_ALPHA_REWRITTEN),
+				(a) => a.kind === "task" && a.text.includes("alpha"),
+			);
+
+			// Folded exactly once — never the duplicate [[from,to],[from,to]] the bug produced.
+			expect(liveFoldedLineRanges(view)).toEqual([alphaAgain.range]);
+
+			const after = store.get(NOTE_PATH);
+			expect(after?.folds).toHaveLength(1); // one anchor per block (never-break rule 4)
+			expect(anchorKey(after!.folds[0] as unknown as Anchor)).toBe(anchorKey(alpha));
+			// The dormant "bravo" anchor never claimed the candidate the active "alpha" anchor
+			// already matched exactly — it stays dormant (with its original dormantSince),
+			// rather than being wrongly promoted into `folds` alongside alpha.
+			expect(after?.dormant).toHaveLength(1);
+			expect(anchorKey(after!.dormant[0] as unknown as Anchor)).toBe(anchorKey(bravo));
+			expect((after!.dormant[0] as unknown as { dormantSince: number }).dormantSince).toBe(0);
+		},
+	);
 });

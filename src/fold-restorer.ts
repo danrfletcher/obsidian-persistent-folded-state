@@ -53,15 +53,24 @@
  *    the content hash, dispatch nothing. The active-fold/dormant machinery below never runs for
  *    this call.
  *  - An entry exists: the stored anchors are matched exactly as before, *and* the file's
- *    `dormant` list is retried (`retryDormant`, src/dormant.ts) against the very same
- *    `buildAnchors(text)` candidates. A dormant anchor that matches folds through the same
- *    `planRestore`/`dispatchFoldTargets` path as an active one (a second `planRestore` call,
- *    with `liveAnchorKeys: null` since dormant membership was already decided by `retryDormant`,
- *    not by `src/restore-plan.ts`'s own E3 check) and is promoted back into `folds`; a
- *    previously-active anchor the matcher now reports "no match" for is demoted into `dormant`
- *    via `addDormant` instead of just being dropped. Both bookkeeping steps are applied as a
- *    delta against a *fresh* read of the store (R4-style, not the stale top-of-function
- *    snapshot), so a fold or unfold the user made during the match is never clobbered (E3).
+ *    `dormant` list (still-fresh survivors only — src/dormant.ts's `freshDormantAnchors`) is
+ *    folded into the *same* `matchAnchors` call as the active anchors (R1) — not a second,
+ *    independent call, which is what let a dormant retry claim a candidate the active pass had
+ *    already matched this round, folding one block twice and storing two anchors for it.
+ *    Sharing one call's `consumed` tracking means a dormant anchor can only ever win a
+ *    candidate the active pass didn't already take (never-break rule 4, enforced the same way
+ *    it already is between two active anchors). A dormant anchor that matches folds through the
+ *    same `planRestore`/`dispatchFoldTargets` path as an active one (a second `planRestore`
+ *    call, with `liveAnchorKeys: null` since dormant membership was already decided by the
+ *    shared match above, not by `src/restore-plan.ts`'s own E3 check) and is promoted back into
+ *    `folds` — but only if `planRestore` actually acted on it (folded it now, or deferred it for
+ *    G13); a match whose target is already folded live (the user folded the same block
+ *    meanwhile) is dropped outright rather than promoted or kept dormant (G6's "one fold only"
+ *    edge case). A previously-active anchor the matcher now reports "no match" for is demoted
+ *    into `dormant` via `addDormant` instead of just being dropped. Both bookkeeping steps are
+ *    applied as a delta against a *fresh* read of the store (R4-style, not the stale
+ *    top-of-function snapshot), so a fold or unfold the user made during the match is never
+ *    clobbered (E3).
  */
 import { foldEffect, foldedRanges } from "@codemirror/language";
 import { Text, type ChangeDesc, type ChangeSet } from "@codemirror/state";
@@ -71,7 +80,7 @@ import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
 import { planRestore, type FoldTarget } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
 import { hashText, type FoldStore } from "./fold-store";
-import { addDormant, retryDormant } from "./dormant";
+import { addDormant, freshDormantAnchors, splitDormantResults } from "./dormant";
 import { buildBaseline } from "./baseline";
 import type { StoredAnchor } from "./types";
 
@@ -266,14 +275,20 @@ export async function restoreSettledChange(
 	const win = deps.window ?? window;
 	const matcherOptions: MatcherOptions = { yieldToHost: defaultYieldToHost(win), ...deps.matcherOptions };
 
-	const matches: MatchResult[] =
-		storedAnchors.length > 0 ? await matchAnchors(storedAnchors, candidateAnchors, matcherOptions) : [];
-
-	// G6: the same reload that re-matches the active folds also retries whatever's dormant for
-	// this file, against the very same candidates — one retry per settled change (E9), not one
-	// per write, since this whole function only ever runs once per settle.
+	// G6/R1: the same reload that re-matches the active folds also retries whatever's dormant
+	// for this file — against the very same candidates, and in the very same `matchAnchors`
+	// call as the active anchors (not a second, independent call), so a dormant retry can never
+	// be handed a candidate the active pass already claimed this round (never-break rule 4).
+	// Two independent calls — the original bug — each ran their own `consumed` tracking and
+	// could both confidently claim the same block, folding it twice and promoting two anchors
+	// for one block.
 	const now = deps.now?.() ?? Date.now();
-	const dormantResult = await retryDormant(snapshot.dormant, candidateAnchors, now, matcherOptions);
+	const dormantSurvivors = freshDormantAnchors(snapshot.dormant, now);
+	const combinedStored = [...storedAnchors, ...dormantSurvivors.map((s) => s.anchor)];
+	const combinedMatches: MatchResult[] =
+		combinedStored.length > 0 ? await matchAnchors(combinedStored, candidateAnchors, matcherOptions) : [];
+	const matches = combinedMatches.slice(0, storedAnchors.length);
+	const dormantResult = splitDormantResults(dormantSurvivors, combinedMatches.slice(storedAnchors.length));
 
 	if (!view.dom.isConnected) return []; // the pane/view was destroyed while matching ran
 	if (deps.getActivePath(view) !== path) return []; // switched to a different file meanwhile
@@ -300,8 +315,8 @@ export async function restoreSettledChange(
 	// G6: a dormant anchor that matched this retry folds through the same tagged-effect path as
 	// an active match, re-using `planRestore` for its idempotent/G13-cursor handling — but with
 	// `liveAnchorKeys: null`, since "is this dormant match still live" was already decided by
-	// `retryDormant` above (dormant membership, not the active `folds` list `liveAnchorKeySet`
-	// reads) rather than `restore-plan.ts`'s own E3 check.
+	// the shared `matchAnchors` call above (dormant membership, and never-break rule 4 against
+	// the active anchors, not by `restore-plan.ts`'s own E3 check).
 	const dormantMatchedAnchors = dormantResult.matched.map((m) => m.anchor);
 	const dormantPlan = planRestore({
 		stored: dormantMatchedAnchors,
@@ -334,8 +349,27 @@ export async function restoreSettledChange(
 			activeFolds.delete(key);
 			dormantList = addDormant(dormantList, storedAnchors[i], now);
 		}
-		for (const match of dormantResult.matched) {
-			activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+
+		// R1/G6: a dormant match the plan actually acted on (folding it now, or deferring it for
+		// G13) is promoted to the active list — the "successful retry" the matcher found. A
+		// match the plan left out because its target block is already folded live right now
+		// (the user folded that same block in the meantime, independent of this anchor) is G6's
+		// "one fold only" edge case: dropped outright, neither promoted into `folds` nor kept
+		// dormant for a future retry. A match left out for any other reason (e.g. its matched
+		// block collapsed to a single line and is no longer foldable) stays dormant with its
+		// original `dormantSince` instead of being silently lost.
+		const actedDormantIdx = new Set<number>([...dormantPlan.toFold, ...dormantPlan.deferred].map((t) => t.anchorIndex));
+		for (let i = 0; i < dormantResult.matched.length; i++) {
+			const match = dormantResult.matched[i];
+			if (actedDormantIdx.has(i)) {
+				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				continue;
+			}
+			const candidate = liveCandidates[match.candidateIndex];
+			const alreadyLive =
+				candidate !== undefined &&
+				alreadyFolded.some((r) => r.startLine === candidate.range.startLine && r.endLine === candidate.range.endLine);
+			if (!alreadyLive) dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
 		}
 
 		deps.store.set(path, {
