@@ -52,6 +52,18 @@
  * "md") are ignored entirely: neither the settle timer, the fold recorder nor the restore ever
  * runs for them (F3: no fold is ever applied outside a Markdown editor).
  *
+ * PR-6 (E5/G15, first-open baseline): a brand-new pane's `EditorView` already has its full
+ * initial `EditorState` — including whatever CM6 fold state that state was constructed with —
+ * before this plugin's `update()` ever runs for it (CM6 builds a `ViewPlugin`'s initial value in
+ * the view's constructor, with no transaction involved). So the constructor below checks once,
+ * synchronously, for "a Markdown file with no store entry at all" and adopts a baseline
+ * (`src/baseline.ts`) right there if so — dispatching nothing, same as the settled-change path's
+ * own no-entry branch (`src/fold-restorer.ts`) handles the other real-world trigger for the same
+ * case: navigating to a never-before-opened file in a pane Obsidian reuses (no new `ViewPlugin`,
+ * but a "set"-annotated transaction the settle path already treats as a reload). Both paths
+ * share the same "store has no entry" guard, so whichever runs first wins and the other is a
+ * no-op.
+ *
  * "Added": a thrown error inside the classifier, recorder or deferred-fold recheck is caught and
  * logged per-update, so one bad transaction can never block the rest of the batch, and a bug
  * here can never stop typing or folding in the editor itself. The restore pass itself is async
@@ -72,8 +84,10 @@ import {
 	mapDeferredTargets,
 	type DeferredFoldTarget,
 } from "./fold-restorer";
+import { buildBaseline } from "./baseline";
 import type { MatcherOptions } from "./matcher";
 import type { FoldStore } from "./fold-store";
+import type { StoredAnchor } from "./types";
 
 export interface EditorWatcherDeps {
 	store: FoldStore;
@@ -88,6 +102,9 @@ export interface EditorWatcherDeps {
 	/** Passed through to the matcher for the restore pass (PR-5); overridable only for tests
 	 * (e.g. to shrink the caps/thresholds, or to spy on `yieldToHost`). */
 	matcherOptions?: MatcherOptions;
+	/** PR-6 (G6): clock passed through to `restoreSettledChange`'s dormant handling. Defaults to
+	 * `Date.now`; overridable so a test can drive dormancy/expiry with a fake clock. */
+	now?: () => number;
 }
 
 function activeMarkdownPath(view: EditorView): string | null {
@@ -131,6 +148,24 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				deps.flushDelayMs ?? 150,
 				deps.window ?? window
 			);
+
+			// E5/G15: a brand-new pane for a Markdown file the store has never seen — adopt
+			// Obsidian's current fold state as the baseline, synchronously, before any
+			// transaction runs. See the file comment for why this is only one of the two
+			// places this same "no entry" case is handled.
+			try {
+				const path = activeMarkdownPath(view);
+				if (path && !deps.store.get(path)) {
+					const baseline = buildBaseline(view.state, view.state.doc.toString());
+					deps.store.set(path, {
+						contentHash: baseline.contentHash,
+						folds: baseline.anchors as unknown as StoredAnchor[],
+						dormant: [],
+					});
+				}
+			} catch (err) {
+				console.error("persistent-folded-state: first-open baseline failed", err);
+			}
 		}
 
 		private runRestore(path: string, text: string): void {
@@ -142,6 +177,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				getActivePath: activeMarkdownPath,
 				isSuperseded: () => this.generation !== startGeneration,
 				getChangesSinceSnapshot: () => this.changesSinceSnapshot ?? ChangeSet.empty(this.view.state.doc.length),
+				now: deps.now,
 			})
 				.then((deferred) => {
 					if (this.destroyed) return;

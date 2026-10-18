@@ -148,14 +148,18 @@ describe("editor watcher lifecycle (CM6 ViewPlugin attach/detach)", () => {
 
 	it("a thrown error inside the recorder is caught and logged; later transactions still work", () => {
 		const store = makeStore();
-		vi.spyOn(store, "get").mockImplementationOnce(() => {
-			throw new Error("boom");
-		});
 		const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
 		const watcher = createEditorWatcher({ store });
 		const view = new EditorView({
 			state: stateFor({ path: "Tasks.md", extension: "md" }, [watcher]),
 			parent: document.body,
+		});
+
+		// The constructor's own first-open baseline check (PR-6) already made its one
+		// `store.get()` call by this point; spying only now ensures the throw below lands on
+		// the recorder's own call inside `update()`, which is what this test is about.
+		vi.spyOn(store, "get").mockImplementationOnce(() => {
+			throw new Error("boom");
 		});
 
 		const from = view.state.doc.line(1).from;
@@ -168,6 +172,31 @@ describe("editor watcher lifecycle (CM6 ViewPlugin attach/detach)", () => {
 		expect(() => view.dispatch({ changes: { from: 0, to: 0, insert: "more text " } })).not.toThrow();
 		const from2 = view.state.doc.line(1).from;
 		view.dispatch({ effects: [foldEffect.of({ from: from2, to: from2 + 1 })] });
+		expect(store.get("Tasks.md")?.folds.length).toBeGreaterThan(0);
+
+		consoleError.mockRestore();
+		view.destroy();
+	});
+
+	it("a thrown error inside the first-open baseline check (PR-6) is caught and logged; the view and later transactions still work", () => {
+		const store = makeStore();
+		vi.spyOn(store, "get").mockImplementationOnce(() => {
+			throw new Error("boom");
+		});
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+		const watcher = createEditorWatcher({ store });
+
+		let view!: EditorView;
+		expect(() => {
+			view = new EditorView({
+				state: stateFor({ path: "Tasks.md", extension: "md" }, [watcher]),
+				parent: document.body,
+			});
+		}).not.toThrow();
+		expect(consoleError).toHaveBeenCalledWith("persistent-folded-state: first-open baseline failed", expect.any(Error));
+
+		const from = view.state.doc.line(1).from;
+		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
 		expect(store.get("Tasks.md")?.folds.length).toBeGreaterThan(0);
 
 		consoleError.mockRestore();
