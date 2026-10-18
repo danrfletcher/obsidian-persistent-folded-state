@@ -11,9 +11,14 @@
  * once instead, since those are exactly the moments a mobile app kill or a disable could otherwise
  * lose the latest state. Overlapping flushes are serialised on a promise chain so the last write
  * always carries the newest state, and a flush with nothing pending never calls `saveData`.
+ *
+ * PR-6 (G6/E7): a dormant anchor old enough is forgotten "at plugin load, or when the store is
+ * flushed" — both pruned here via `expireDormant` (src/dormant.ts), using the injectable `now`
+ * option so this stays testable with a fake clock rather than `Date.now()`.
  */
 import type { FileFoldRecord, StoreData } from "./types";
 import { parseAnchor } from "./anchors";
+import { expireDormant, parseDormantAnchor } from "./dormant";
 
 /** Bumped only if a later PR needs to migrate an incompatible on-disk shape. An unrecognised
  * version is treated the same as a corrupt file (E8): start empty rather than guess. */
@@ -27,6 +32,9 @@ export interface FoldStoreOptions {
 	saveData: (data: unknown) => Promise<void>;
 	/** Debounce window for `set()`. Defaults to 150ms (E12); overridable only for tests. */
 	flushDelayMs?: number;
+	/** PR-6 (G6): clock used to prune expired dormant anchors at load and at flush. Defaults to
+	 * `Date.now`; overridable so a test can drive dormant expiry with a fake clock. */
+	now?: () => number;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -49,6 +57,21 @@ function sanitizeAnchorArray(value: unknown): StoredAnchorArray {
 	return result;
 }
 
+/** PR-6: like `sanitizeAnchorArray`, but for the `dormant` list — each entry must be a
+ * well-formed `Anchor` *and* carry a finite, non-negative `dormantSince` (E8: "a dormant entry
+ * with a missing or non-numeric dormantSince ... drop that entry, never throw"). Uses
+ * `parseDormantAnchor` (src/dormant.ts) so `dormantSince` round-trips rather than being dropped
+ * as an "unknown field" the way `parseAnchor` would. */
+function sanitizeDormantArray(value: unknown): StoredAnchorArray {
+	if (!Array.isArray(value)) return [];
+	const result: StoredAnchorArray = [];
+	for (const entry of value) {
+		const anchor = parseDormantAnchor(entry);
+		if (anchor !== null) result.push(anchor as unknown as Record<string, unknown>);
+	}
+	return result;
+}
+
 type StoredAnchorArray = Record<string, unknown>[];
 
 /** Pure sanitiser for whatever `loadData()` resolved to (E8). Never throws: anything that isn't
@@ -56,8 +79,11 @@ type StoredAnchorArray = Record<string, unknown>[];
  * isn't an object — yields an empty store. Inside `files`, each record is checked on its own: a
  * record missing `contentHash` or whose `folds` isn't an array is dropped, but its neighbours
  * survive (so one bad entry never costs the whole store). `dormant` defaults to `[]` if missing
- * or malformed, since it isn't populated until a later PR; both `folds` and `dormant` keep only
- * the entries inside them that are real, valid `Anchor`s (PR-5; see `sanitizeAnchorArray`). */
+ * or malformed; both `folds` and `dormant` keep only the entries inside them that are real,
+ * valid `Anchor`s (PR-5; see `sanitizeAnchorArray`), and `dormant` additionally requires a
+ * well-formed `dormantSince` on each entry (PR-6; see `sanitizeDormantArray`). This does not
+ * prune a dormant entry for being *expired* — that's `FoldStore.load()`'s job (G6), driven by an
+ * injectable clock rather than baked into this otherwise clock-free, pure sanitiser. */
 export function sanitizeStoreData(raw: unknown): StoreData {
 	const empty: StoreData = { version: STORE_VERSION, files: {} };
 	if (!isPlainObject(raw)) return empty;
@@ -72,7 +98,7 @@ export function sanitizeStoreData(raw: unknown): StoreData {
 		files[path] = {
 			contentHash: value.contentHash,
 			folds: sanitizeAnchorArray(value.folds),
-			dormant: sanitizeAnchorArray(value.dormant),
+			dormant: sanitizeDormantArray(value.dormant),
 		};
 	}
 	return { version: STORE_VERSION, files };
@@ -106,11 +132,13 @@ export class FoldStore {
 	private readonly loadDataFn: () => Promise<unknown>;
 	private readonly saveDataFn: (data: unknown) => Promise<void>;
 	private readonly flushDelayMs: number;
+	private readonly nowFn: () => number;
 
 	constructor(options: FoldStoreOptions) {
 		this.loadDataFn = options.loadData;
 		this.saveDataFn = options.saveData;
 		this.flushDelayMs = options.flushDelayMs ?? 150;
+		this.nowFn = options.now ?? Date.now;
 	}
 
 	/** E8: populates the in-memory map from `loadData()`, sanitising whatever comes back and
@@ -131,7 +159,15 @@ export class FoldStore {
 			raw = undefined;
 		}
 		const sanitized = sanitizeStoreData(raw);
-		this.files = new Map(Object.entries(sanitized.files));
+		const now = this.nowFn();
+		const files = new Map<string, FileFoldRecord>();
+		for (const [path, record] of Object.entries(sanitized.files)) {
+			// G6/E7: "forgotten ... at plugin load" — a dormant anchor aged out while the
+			// plugin was disabled (or Obsidian was shut) never comes back as a candidate to
+			// retry; a long gap between loads is exactly what's supposed to expire it.
+			files.set(path, { ...record, dormant: expireDormant(record.dormant, now) });
+		}
+		this.files = files;
 		this.dirty = false;
 		this.cancelScheduledFlush();
 	}
@@ -185,6 +221,15 @@ export class FoldStore {
 		this.cancelScheduledFlush();
 		const task = this.flushChain.then(async () => {
 			if (!this.dirty) return;
+			// G6: "forgotten ... when the store is flushed" — prune expired dormant anchors
+			// out of the in-memory map itself (not just the snapshot) so a later read of
+			// `get()` for that path doesn't still see an anchor this same tick just forgot.
+			const now = this.nowFn();
+			for (const [path, record] of this.files) {
+				if (record.dormant.length === 0) continue;
+				const pruned = expireDormant(record.dormant, now);
+				if (pruned.length !== record.dormant.length) this.files.set(path, { ...record, dormant: pruned });
+			}
 			const snapshot: StoreData = {
 				version: STORE_VERSION,
 				files: Object.fromEntries(this.files),
