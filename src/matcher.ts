@@ -164,11 +164,17 @@ interface PendingAnchor {
 }
 
 /** Tier 1 (G4 exact, E1 duplicates): groups unresolved stored anchors and unconsumed candidates
- * sharing one (scope, normalized text, kind) and pairs them by order — the nth stored duplicate
- * (in `stored` order) takes the nth candidate duplicate (in `candidates` order). A stored anchor
- * past the end of its group's candidates (E1: "fewer duplicates now") is left pending here,
- * never remapped onto a different duplicate and never marked ambiguous — duplicates are E1
- * pairing, not an E2 tie (C20). No `similarity()` call: exact text is plain string equality. */
+ * sharing one (scope, normalized text, kind) and pairs them by order: within a group, a stored
+ * duplicate is first paired with the candidate duplicate at the *same* `siblingIndex` (an
+ * unchanged document pairs up trivially, and — the literal E1 example — "only the 2nd of three
+ * folded" is recovered correctly because that stored anchor's own `siblingIndex` already says
+ * "2nd", independent of how many *other* duplicates happen to be present in `stored`). Whatever
+ * is left on both sides after that (e.g. duplicates removed, shifting the rest down) is then
+ * paired by relative rank — both sides sorted by `siblingIndex` ascending and zipped position by
+ * position — so a stored anchor past the end of its group's remaining candidates (E1: "fewer
+ * duplicates now") is left pending here, never remapped onto a different duplicate and never
+ * marked ambiguous — duplicates are E1 pairing, not an E2 tie (C20). No `similarity()` call:
+ * exact text is plain string equality. */
 function runExactTier(
 	pending: PendingAnchor[],
 	stored: Anchor[],
@@ -199,10 +205,30 @@ function runExactTier(
 
 	const resolvedStoredIdx = new Set<number>();
 	for (const group of groups.values()) {
-		const n = Math.min(group.storedIdxs.length, group.candidateIdxs.length);
-		for (let i = 0; i < n; i++) {
-			const storedIdx = group.storedIdxs[i];
-			const candidateIdx = group.candidateIdxs[i];
+		const pairs = new Map<number, number>(); // storedIdx -> candidateIdx
+		const usedCandidates = new Set<number>();
+
+		for (const storedIdx of group.storedIdxs) {
+			const siblingIndex = stored[storedIdx].siblingIndex;
+			const direct = group.candidateIdxs.find(
+				(c) => !usedCandidates.has(c) && candidates[c].siblingIndex === siblingIndex,
+			);
+			if (direct !== undefined) {
+				pairs.set(storedIdx, direct);
+				usedCandidates.add(direct);
+			}
+		}
+
+		const leftoverStored = group.storedIdxs
+			.filter((i) => !pairs.has(i))
+			.sort((a, b) => stored[a].siblingIndex - stored[b].siblingIndex);
+		const leftoverCandidates = group.candidateIdxs
+			.filter((c) => !usedCandidates.has(c))
+			.sort((a, b) => candidates[a].siblingIndex - candidates[b].siblingIndex);
+		const n = Math.min(leftoverStored.length, leftoverCandidates.length);
+		for (let i = 0; i < n; i++) pairs.set(leftoverStored[i], leftoverCandidates[i]);
+
+		for (const [storedIdx, candidateIdx] of pairs) {
 			consumed[candidateIdx] = true;
 			results[storedIdx] = { tier: "exact", target: candidateIdx };
 			resolvedStoredIdx.add(storedIdx);
