@@ -69,8 +69,8 @@ describe("E1: fewer duplicates now than the stored ordinal (C18)", () => {
 
 describe("E1: duplicates under different parents never cross-pair (C18)", () => {
 	it("each parent's own duplicate is matched to itself, never to the other parent's", async () => {
-		const before = "# A\n\t- [ ] dup\n# B\n\t- [ ] dup";
-		const after = "# A\n\t- [ ] dup\n# B\n\t- [ ] dup"; // unchanged, both parents still match exactly
+		const before = "# A\n	- [ ] dup\n# B\n	- [ ] dup";
+		const after = "# A\n	- [ ] dup\n# B\n	- [ ] dup"; // unchanged, both parents still match exactly
 		const stored = anchorsFrom(before);
 		const candidates = anchorsFrom(after);
 
@@ -84,6 +84,28 @@ describe("E1: duplicates under different parents never cross-pair (C18)", () => 
 		const results = await matchAnchors([storedUnderA, storedUnderB], candidates);
 		expect(results[0]).toEqual({ tier: "exact", target: candidateUnderA });
 		expect(results[1]).toEqual({ tier: "exact", target: candidateUnderB });
+	});
+
+	it("R8: a renamed-past-its-bar parent's file-wide fallback claims only a unique exact match", async () => {
+		// Dan's repro: "Tue" is folded under; after renaming the Tue heading far enough that it
+		// no longer matches at all, the task's file-wide fallback sees two identical-text
+		// candidates (Mon's and the renamed heading's) — neither is a legitimate, unique
+		// match, so the result must be none, never Mon's task.
+		const before = "# Mon\n- [ ] follow up with client\n# Tue\n- [ ] follow up with client";
+		const stored = anchorsFrom(before).find((a) => a.kind === "task" && a.parentChain[0]?.text === "tue");
+		if (!stored) throw new Error("fixture: expected a task under Tue");
+
+		const after = "# Mon\n- [ ] follow up with client\n# Something Else Entirely\n- [ ] follow up with client";
+		const candidates = anchorsFrom(after);
+
+		const tueScore = similarityModule.similarity("tue", "something else entirely");
+		expect(tueScore).toBeLessThan(0.4); // sanity: Tue no longer matches at all
+
+		const monTask = indexOfAnchor(candidates, (a) => a.kind === "task" && a.parentChain[0]?.text === "mon");
+		expect(candidates[monTask].text).toBe(stored.text); // sanity: a genuine decoy, not the real match
+
+		const results = await matchAnchors([stored], candidates);
+		expect(results[0]).toEqual({ tier: "none", reason: "ambiguous" });
 	});
 });
 
@@ -120,7 +142,22 @@ describe("E2 reverse direction: two anchors tied for one candidate (C19)", () =>
 
 describe("C14/C20: the parent chain separates a text tie only when it itself differs", () => {
 	it("two candidates tied on text score are separated by whichever parent chain reads closer", async () => {
-		// Real similarity() throughout — no mock — so the tiebreak is driven by actual text.
+		// The stored anchor's own parent ("Tuesday") is mocked to never resolve at the ancestor
+		// level (kept clearly below the positional bar for every heading candidate), so its
+		// scope stays file-wide — both same-text candidates remain in the pool, genuinely tied
+		// at the task level, and only the parent-chain tiebreak (not ancestor scoping) decides.
+		vi.spyOn(similarityModule, "similarity").mockImplementation((a, b) => {
+			// Chain-tiebreak calls use the "kind:text" format `chainText` builds: let "Tuesday
+			// Morning"'s chain read far closer to the stored anchor's old parent than "Giraffe"'s.
+			if (/^[a-z]+:/.test(a) && /^[a-z]+:/.test(b)) {
+				return a.includes("tuesday morning") || b.includes("tuesday morning") ? 0.9 : 0.1;
+			}
+			// Ancestor-level resolution for "tuesday" against each heading candidate: force it
+			// below the positional bar every time, so Tuesday's children pool stays file-wide.
+			if (a === "tuesday" || b === "tuesday") return 0.1;
+			// Leaf-level: the two same-text task candidates both tie at a high score.
+			return 0.9;
+		});
 		const stored = anchorsFrom("# Tuesday\n- [ ] wash the dishes very thoroughly and carefully")[1];
 		const after = [
 			"# Something Unrelated",
@@ -132,8 +169,7 @@ describe("C14/C20: the parent chain separates a text tie only when it itself dif
 		].join("\n");
 		const candidates = anchorsFrom(after);
 
-		// Sanity: the two tied candidates really do share one identical text, and their own
-		// score against `stored` really is tied (same string on both sides of the comparison).
+		// Sanity: the two tied candidates really do share one identical text.
 		const tuesdayMorningTask = indexOfAnchor(
 			candidates,
 			(a) => a.kind === "task" && a.parentChain[0]?.text === "tuesday morning",
@@ -145,6 +181,8 @@ describe("C14/C20: the parent chain separates a text tie only when it itself dif
 		// "Tuesday Morning" reads far closer to the stored anchor's old parent, "Tuesday", than
 		// "Giraffe" does — the tiebreak should pick it, not leave the tie unresolved.
 		expect(results[0]).toEqual({ tier: "positional", target: tuesdayMorningTask });
+
+		vi.restoreAllMocks();
 	});
 
 	it("a reverse-direction claim with a clear (non-tied) winner needs no tiebreak at all", async () => {
