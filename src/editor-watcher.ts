@@ -14,7 +14,8 @@
  * - checked for fold/unfold effects (src/fold-recorder.ts) and recorded against the open file's
  *   path, read once per update from Obsidian's own `editorInfoField` — not tracked separately.
  * - classified (src/transaction-classifier.ts); a "non-user" classification (a document change
- *   with no user-event annotation) (re)triggers the 150ms settle timer (E9/E10).
+ *   with no user-event annotation) (re)triggers the 150ms settle timer (E9/E10) and starts a
+ *   fresh snapshot (R1, below).
  *
  * PR-5: once that settle timer actually elapses, this file no longer just forwards the event —
  * it also runs the real restore pass for *this* view (src/fold-restorer.ts's
@@ -28,6 +29,25 @@
  * `applyReadyDeferredFolds`, regardless of what kind of transaction that update carries, so a
  * plain cursor move (no document change at all) is enough to apply it.
  *
+ * R1 ("a user keystroke during the settle window or the match window silently drops the whole
+ * restore"): `generation` counts every non-user change this view has seen; a restore run
+ * captures it at the moment its settle fires and compares it again right before dispatching
+ * (`isSuperseded`), so it only ever gives up when a *newer* non-user change has genuinely
+ * superseded it (E9), not merely because the user typed in between. `changesSinceSnapshot`
+ * accumulates every change (of any kind — user or not) the view sees from the moment a
+ * non-user change starts a fresh snapshot onward, reset exactly then and composed into on every
+ * later transaction, so `restoreSettledChange` can map its candidates forward onto whatever the
+ * live document has become by the time matching finishes (src/fold-restorer.ts's own file
+ * comment has the detail).
+ *
+ * R2 (G13 deferred targets going stale): `pendingDeferred` now holds character-offset spans
+ * (`DeferredFoldTarget`), not line numbers, mapped forward through every update's own changes
+ * (`mapDeferredTargets`) before the cursor check runs — so a line added or removed inside or
+ * around a deferred block never leaves it pointing at the wrong lines. The recheck also reads
+ * the store's *live* anchor keys right before applying (`liveAnchorKeySet`), the same E3 guard
+ * `restoreSettledChange`'s own immediate path already had — a target whose anchor the user has
+ * since unfolded, or "Forget stored folds for this note" removed, is dropped instead of applied.
+ *
  * Non-Markdown views (editorInfoField resolving to no file, or a file whose extension isn't
  * "md") are ignored entirely: neither the settle timer, the fold recorder nor the restore ever
  * runs for them (F3: no fold is ever applied outside a Markdown editor).
@@ -39,13 +59,19 @@
  * synchronously) — a rejection there is caught and logged the same way, never left as an
  * unhandled promise rejection.
  */
+import { ChangeSet } from "@codemirror/state";
 import { ViewPlugin, type EditorView, type ViewUpdate, type PluginValue } from "@codemirror/view";
 import { editorInfoField } from "obsidian";
 import { classifyTransaction } from "./transaction-classifier";
 import { recordFoldEffects } from "./fold-recorder";
 import { SettleDebouncer } from "./settle-debounce";
-import { restoreSettledChange, applyReadyDeferredFolds } from "./fold-restorer";
-import type { FoldTarget } from "./restore-plan";
+import {
+	restoreSettledChange,
+	applyReadyDeferredFolds,
+	liveAnchorKeySet,
+	mapDeferredTargets,
+	type DeferredFoldTarget,
+} from "./fold-restorer";
 import type { MatcherOptions } from "./matcher";
 import type { FoldStore } from "./fold-store";
 
@@ -79,8 +105,20 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 		private readonly debouncer: SettleDebouncer<{ path: string; text: string }>;
 		private readonly view: EditorView;
 		/** G13: targets a restore pass deferred because the cursor sat inside them, re-checked
-		 * on every later update (see `runRestore`/`update` below). */
-		private pendingDeferred: FoldTarget[] = [];
+		 * on every later update (see `runRestore`/`update` below). Character-offset spans, not
+		 * line numbers (R2) — mapped forward through every update's changes before use. */
+		private pendingDeferred: DeferredFoldTarget[] = [];
+		/** R1: bumped on every non-user change; a restore run captures this at settle time and
+		 * compares it again right before dispatching, so it can tell "a newer non-user change
+		 * has superseded me" (bail) apart from "the user typed in between" (re-anchor, don't
+		 * bail) — see src/fold-restorer.ts's file comment. */
+		private generation = 0;
+		/** R1: every change (of any kind) the view has seen since the most recent non-user
+		 * change started a fresh snapshot — `null` until the first non-user change ever happens,
+		 * since nothing can be in flight before then. Reset (not composed) exactly when a new
+		 * non-user change starts a newer snapshot; composed into on every other change so it
+		 * always represents "the current snapshot's text -> the live document". */
+		private changesSinceSnapshot: ChangeSet | null = null;
 		private destroyed = false;
 
 		constructor(view: EditorView) {
@@ -96,11 +134,14 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 		}
 
 		private runRestore(path: string, text: string): void {
+			const startGeneration = this.generation;
 			restoreSettledChange(this.view, path, text, {
 				store: deps.store,
 				matcherOptions: deps.matcherOptions,
 				window: deps.window ?? window,
 				getActivePath: activeMarkdownPath,
+				isSuperseded: () => this.generation !== startGeneration,
+				getChangesSinceSnapshot: () => this.changesSinceSnapshot ?? ChangeSet.empty(this.view.state.doc.length),
 			})
 				.then((deferred) => {
 					if (this.destroyed) return;
@@ -121,7 +162,13 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			queueMicrotask(() => {
 				if (this.destroyed || this.pendingDeferred.length === 0) return;
 				try {
-					this.pendingDeferred = applyReadyDeferredFolds(this.view, this.pendingDeferred);
+					const path = activeMarkdownPath(this.view);
+					if (!path) {
+						this.pendingDeferred = []; // the pane switched to a different file entirely
+						return;
+					}
+					const liveAnchorKeys = liveAnchorKeySet(deps.store, path);
+					this.pendingDeferred = applyReadyDeferredFolds(this.view, this.pendingDeferred, liveAnchorKeys);
 				} catch (err) {
 					console.error("persistent-folded-state: deferred restore failed", err);
 				}
@@ -136,12 +183,27 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			for (const tr of update.transactions) {
 				try {
 					recordFoldEffects(deps.store, path, tr);
-					if (classifyTransaction(tr) === "non-user") {
+					const cls = classifyTransaction(tr);
+					if (cls === "non-user") {
+						// R1: a fresh snapshot starts here — reset (not compose) so changes
+						// from *before* this settle don't leak into the next run's mapping.
+						this.generation++;
+						this.changesSinceSnapshot = ChangeSet.empty(tr.state.doc.length);
 						this.debouncer.trigger({ path, text: tr.state.doc.toString() });
+					} else if (tr.docChanged && this.changesSinceSnapshot) {
+						this.changesSinceSnapshot = this.changesSinceSnapshot.compose(tr.changes);
 					}
 				} catch (err) {
 					console.error("persistent-folded-state: editor watcher failed", err);
 				}
+			}
+
+			// R2: keep every still-deferred target's span over the same content as this
+			// update's own changes (if any) — before the cursor-containment check next runs,
+			// whether that's this update (no, dispatch is forbidden inside `update()`) or the
+			// microtask recheck below.
+			if (this.pendingDeferred.length > 0 && update.docChanged) {
+				this.pendingDeferred = mapDeferredTargets(this.pendingDeferred, update.changes);
 			}
 
 			if (this.pendingDeferred.length > 0) {

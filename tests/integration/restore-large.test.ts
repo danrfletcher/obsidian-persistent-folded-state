@@ -139,9 +139,17 @@ describe("restore-large (E6): a 600-fold document", () => {
 
 		expect(keystrokeDispatched).toBe(true); // sanity: the mid-match hook actually ran
 		expect(keystrokeAppliedImmediately).toBe(true);
-		// The keystroke changed the document after the text the match was run against was
-		// captured, so that (now-stale) match correctly dispatches nothing at all (E9: a newer
-		// settle — for the post-keystroke text — is what should run instead, not this one).
-		expect(liveFoldedLineRanges(view)).toEqual([]);
+		// R1: the keystroke only inserted one character at offset 0 — no line was added or
+		// removed — so every matched candidate's line range maps forward through it unchanged,
+		// and the restore still dispatches normally instead of being silently dropped (the
+		// bug this test used to assert as correct). Same shape as the first test: up to the
+		// 500-anchor cap, every folded range one of the first 500 headings.
+		const folded = liveFoldedLineRanges(view);
+		expect(folded.length).toBeLessThanOrEqual(500);
+		expect(folded.length).toBeGreaterThan(0);
+		for (const range of folded) {
+			const headingNumber = Math.ceil(range.startLine / 2);
+			expect(headingNumber).toBeLessThanOrEqual(500);
+		}
 	}, 10000);
 });

@@ -142,6 +142,43 @@ describe("restore-cm6: E2 — a non-exact tie folds neither candidate", () => {
 	});
 });
 
+describe("restore-cm6: R1 — a keystroke during the settle window doesn't drop the restore", () => {
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	it("external rewrite, then a keystroke 50ms later (still inside the 150ms settle window), still folds", async () => {
+		const { store } = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [TUESDAY_ANCHOR], dormant: [] } });
+		const view = makeView(store, BEFORE);
+
+		// "## Another" closes off Tuesday's own section, and the cursor (parked at the very
+		// end, inside "## Another") sits outside the block that's about to be re-folded —
+		// G13 deferral isn't what this test is about.
+		const after = BEFORE + "\n## Another";
+		view.dispatch({
+			changes: { from: 0, to: view.state.doc.length, insert: after },
+			annotations: Transaction.userEvent.of("set"),
+			selection: { anchor: after.length },
+		});
+
+		// A real keystroke, mid-settle — classified "user" (src/transaction-classifier.ts),
+		// so it never re-arms the 150ms timer, but it also must not silently drop the restore
+		// already queued for the "set" above (R1). Appending to the very last line changes no
+		// line numbers at all, so Tuesday's matched range maps forward unchanged.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		view.dispatch({
+			changes: { from: view.state.doc.length, to: view.state.doc.length, insert: "!" },
+			annotations: Transaction.userEvent.of("input.type"),
+		});
+
+		await settle();
+
+		const folded = liveFoldedLineRanges(view);
+		expect(folded).toHaveLength(1);
+		expect(folded[0]).toEqual({ startLine: 1, endLine: 6 });
+	});
+});
+
 describe("restore-cm6: E11 — undo, paste and the plugin's own tag", () => {
 	afterEach(() => {
 		document.body.replaceChildren();

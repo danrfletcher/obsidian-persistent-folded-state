@@ -27,18 +27,47 @@
  * `OWN_FOLD_ANNOTATION` (src/fold-recorder.ts), so it is never mistaken for a fresh user fold
  * and fed back into the map (no feedback loop).
  *
- * Dropped, not thrown: a view destroyed, a pane switched to a different file, or the document
- * having moved on again while the match was still running (another settle will already be
- * queued for that newer text — E9's "the last settled text wins") all end the same way, with
- * `restoreSettledChange` resolving to an empty deferred list and dispatching nothing.
+ * R1: a user keystroke during the 150ms settle window or the (possibly slow, chunked) match no
+ * longer drops the whole restore. The only thing that genuinely invalidates a run is a *newer*
+ * non-user change superseding it (E9's "the last settled text wins") — `deps.isSuperseded()`,
+ * driven by a generation counter in src/editor-watcher.ts that only advances on another
+ * non-user change, answers exactly that question. A live doc that has merely diverged from the
+ * snapshot `text` because the user typed is not superseded: every matched candidate's line
+ * range is instead mapped forward through `deps.getChangesSinceSnapshot()` (every document
+ * change the view has seen since `text` was captured, composed by the same caller) onto the
+ * *current* document before `planRestore` ever sees it, so G13's cursor check, the idempotent
+ * "already folded" check and the actual dispatch all operate on live, not stale, line numbers.
+ * When nothing has changed since the snapshot this mapping is the identity (same line numbers
+ * in, same line numbers out), so the common/fast path is unaffected.
+ *
+ * Dropped, not thrown: a view destroyed, a pane switched to a different file, or a *newer*
+ * non-user settle having already started for the same view (E9) all end the same way, with
+ * `restoreSettledChange` resolving to an empty deferred list and dispatching nothing — those are
+ * the only cases left that make a run itself obsolete, as opposed to merely needing its
+ * candidates re-anchored (R1, above).
  */
 import { foldEffect, foldedRanges } from "@codemirror/language";
+import { Text, type ChangeDesc, type ChangeSet } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
-import { buildAnchors, parseAnchor, anchorKey, type Anchor, type LineRange } from "./anchors";
+import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
-import { planRestore, type FoldTarget } from "./restore-plan";
+import { planRestore } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
 import { hashText, type FoldStore } from "./fold-store";
+
+/** G13's deferred queue, kept across updates by src/editor-watcher.ts. Positions, not line
+ * numbers (R2): `from`/`to` are character offsets covering the whole block (the start of its
+ * own first line to the end of its last), mapped forward through every subsequent update's own
+ * `ChangeDesc` (`mapDeferredTargets`) so an edit inside or around a still-deferred block never
+ * leaves it pointing at stale lines. `anchorKey` lets the caller re-check the target is still
+ * live (`liveAnchorKeySet`) right before applying it — a target whose anchor the user has since
+ * unfolded, or that "Forget stored folds for this note" removed, is dropped rather than applied
+ * (R2). */
+export interface DeferredFoldTarget {
+	anchorKey: string;
+	from: number;
+	to: number;
+}
 
 export interface RestoreRunDeps {
 	store: FoldStore;
@@ -55,6 +84,18 @@ export interface RestoreRunDeps {
 	 * one at all — used to detect "pane switched to another file" between the settle firing and
 	 * the match finishing. */
 	getActivePath: (view: EditorView) => string | null;
+	/** R1: true once a *newer* non-user change has already started a fresher run for this same
+	 * view (E9 — "the last settled text wins"), at which point this run must drop everything
+	 * rather than map its now-doubly-stale candidates forward. Defaults to `() => false` when
+	 * omitted (a direct unit-test caller that only ever calls this once per view has no newer
+	 * run to be superseded by). */
+	isSuperseded?: () => boolean;
+	/** R1: every document change the view has seen since `text` (the settled snapshot this run
+	 * was given) was captured, composed into one `ChangeSet` by the caller (src/editor-watcher.ts
+	 * tracks this per view, reset exactly when a new non-user change starts a new snapshot).
+	 * Omitted entirely by a direct unit-test caller that never lets its view diverge from `text`
+	 * — candidates are then used exactly as `buildAnchors(text)` produced them. */
+	getChangesSinceSnapshot?: () => ChangeSet;
 }
 
 function currentFoldedLineRanges(view: EditorView): LineRange[] {
@@ -74,8 +115,10 @@ function cursorLineOf(view: EditorView): number | null {
 /** Anchor keys (`anchorKey`) for every entry *currently* stored for `path` — read fresh, not
  * from whatever snapshot drove the match, so a since-removed anchor is correctly absent (E3). A
  * PR-2-era raw-text record (no `siblingIndex`/`parentChain`) fails `parseAnchor` and is simply
- * excluded, same as everywhere else this PR reads stored folds. */
-function liveAnchorKeySet(store: FoldStore, path: string): ReadonlySet<string> {
+ * excluded, same as everywhere else this PR reads stored folds. Exported for R2:
+ * src/editor-watcher.ts's deferred-fold recheck needs the same fresh-live-anchor check this
+ * module already does for its own (immediate) restore pass. */
+export function liveAnchorKeySet(store: FoldStore, path: string): ReadonlySet<string> {
 	const record = store.get(path);
 	const keys = new Set<string>();
 	for (const raw of record?.folds ?? []) {
@@ -88,8 +131,10 @@ function liveAnchorKeySet(store: FoldStore, path: string): ReadonlySet<string> {
 /** Converts a line-range target into a CM6 character-offset fold effect: from the end of the
  * block's own first line to the end of its last line, leaving the first line itself visible
  * (the usual heading/task/list fold shape). Returns `null` rather than throwing when the doc no
- * longer has that many lines (it shrank between planning and dispatch). */
+ * longer has that many lines (it shrank between planning and dispatch), or when there's nothing
+ * left to hide. */
 function foldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof foldEffect.of> | null {
+	if (range.endLine <= range.startLine) return null; // nothing to collapse
 	if (range.endLine > view.state.doc.lines) return null;
 	const from = view.state.doc.line(range.startLine).to;
 	const to = view.state.doc.line(range.endLine).to;
@@ -97,7 +142,7 @@ function foldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof fo
 	return foldEffect.of({ from, to });
 }
 
-function dispatchFoldTargets(view: EditorView, targets: readonly FoldTarget[]): void {
+function dispatchFoldTargets(view: EditorView, targets: readonly { range: LineRange }[]): void {
 	if (targets.length === 0) return;
 	const effects = targets
 		.map((target) => foldEffectFor(view, target.range))
@@ -108,6 +153,54 @@ function dispatchFoldTargets(view: EditorView, targets: readonly FoldTarget[]): 
 
 function defaultYieldToHost(win: Window): () => Promise<void> {
 	return () => new Promise((resolve) => win.setTimeout(resolve, 0));
+}
+
+/** The whole-block character span (start of its own first line to the end of its last) for
+ * `range` within `doc` — the stable anchor points R1/R2 both map forward through subsequent
+ * changes, as opposed to `foldEffectFor`'s own (separately recomputed, always-fresh) fold
+ * boundaries. Clamped to `doc`'s current line count so a range computed against a
+ * since-shrunk/grown document never throws. */
+function blockSpan(doc: Text, range: LineRange): { from: number; to: number } {
+	const startLine = Math.min(Math.max(range.startLine, 1), doc.lines);
+	const endLine = Math.min(Math.max(range.endLine, 1), doc.lines);
+	return { from: doc.line(startLine).from, to: doc.line(endLine).to };
+}
+
+/** R1: maps `range` (a candidate's line range in `snapshotDoc`'s coordinates — the settled text
+ * a restore run matched against) forward through `changes` (every edit the view has seen since)
+ * onto `liveDoc`, returning the equivalent line range there. The identity when `changes` carries
+ * no edits: same offsets map to themselves, `liveDoc.lineAt` of them is the same line numbers
+ * `range` already had. `-1`/`1` bias on from/to keeps an insertion exactly at either boundary
+ * outside the block (an inserted sibling before it, or one after it, isn't swallowed in) while
+ * still letting an edit *inside* the block grow or shrink it normally. */
+function mapLineRangeForward(range: LineRange, snapshotDoc: Text, changes: ChangeDesc, liveDoc: Text): LineRange {
+	const { from, to } = blockSpan(snapshotDoc, range);
+	const mappedFrom = changes.mapPos(from, -1);
+	const mappedTo = Math.max(changes.mapPos(to, 1), mappedFrom);
+	const clampedFrom = Math.min(mappedFrom, liveDoc.length);
+	const clampedTo = Math.min(mappedTo, liveDoc.length);
+	return { startLine: liveDoc.lineAt(clampedFrom).number, endLine: liveDoc.lineAt(clampedTo).number };
+}
+
+/** Rebuilds `candidates`' ranges in `liveDoc`'s coordinate space (R1). `text` is the settled
+ * snapshot `candidates` (from `buildAnchors(text)`) was computed against; `changes` is every
+ * edit since. Only `.range` changes — `.anchor` (the structural identity) is untouched, since
+ * nothing about *what* a block is was invalidated by a user edit elsewhere in the document. */
+function mapCandidatesForward(candidates: AnchoredBlock[], text: string, changes: ChangeDesc, liveDoc: Text): AnchoredBlock[] {
+	const snapshotDoc = Text.of(text.length === 0 ? [""] : text.split("\n"));
+	return candidates.map((candidate) => ({
+		anchor: candidate.anchor,
+		range: mapLineRangeForward(candidate.range, snapshotDoc, changes, liveDoc),
+	}));
+}
+
+/** Builds a `DeferredFoldTarget` (R2) from a plan's own `FoldTarget` (anchor index + line range,
+ * already in live-doc coordinates — see `restoreSettledChange`) — the character-offset span that
+ * gets mapped forward through later changes until the cursor leaves it. */
+function toDeferredFoldTarget(view: EditorView, anchor: Anchor | undefined, range: LineRange): DeferredFoldTarget | null {
+	if (!anchor) return null; // defensive: `target.anchorIndex` should always index a real stored anchor
+	const { from, to } = blockSpan(view.state.doc, range);
+	return { anchorKey: anchorKey(anchor), from, to };
 }
 
 /**
@@ -122,7 +215,7 @@ export async function restoreSettledChange(
 	path: string,
 	text: string,
 	deps: RestoreRunDeps,
-): Promise<FoldTarget[]> {
+): Promise<DeferredFoldTarget[]> {
 	const snapshot = deps.store.get(path);
 	if (!snapshot || snapshot.folds.length === 0) return [];
 
@@ -143,12 +236,19 @@ export async function restoreSettledChange(
 
 	if (!view.dom.isConnected) return []; // the pane/view was destroyed while matching ran
 	if (deps.getActivePath(view) !== path) return []; // switched to a different file meanwhile
-	if (view.state.doc.toString() !== text) return []; // the doc moved on again (E9: a newer settle already queued)
+	if (deps.isSuperseded?.() ?? false) return []; // a newer non-user settle has already started (E9)
+
+	// R1: the live doc may have diverged from `text` because the user typed during the 150ms
+	// settle window or the match itself — not a newer settle (already ruled out above), so
+	// instead of dropping the whole restore, every candidate's range is mapped forward onto
+	// the live document before planning. When nothing has changed this is the identity.
+	const changes = deps.getChangesSinceSnapshot?.();
+	const liveCandidates = changes ? mapCandidatesForward(candidates, text, changes, view.state.doc) : candidates;
 
 	const plan = planRestore({
 		stored: storedAnchors,
 		matches,
-		candidates,
+		candidates: liveCandidates,
 		alreadyFolded: currentFoldedLineRanges(view),
 		cursorLine: cursorLineOf(view),
 		liveAnchorKeys: liveAnchorKeySet(deps.store, path),
@@ -162,24 +262,58 @@ export async function restoreSettledChange(
 	const latest = deps.store.get(path);
 	if (latest) deps.store.set(path, { ...latest, contentHash: hashText(text) });
 
-	return plan.deferred;
+	return plan.deferred
+		.map((target) => toDeferredFoldTarget(view, storedAnchors[target.anchorIndex], target.range))
+		.filter((target): target is DeferredFoldTarget => target !== null);
+}
+
+/** R2: maps every still-deferred target's character span forward through one update's own
+ * `ChangeDesc` — called unconditionally by src/editor-watcher.ts on every update that carries a
+ * document change, so a line added or removed inside (or around) a deferred block keeps its
+ * span over the same content rather than the stale line numbers it was captured with. A block
+ * whose span collapses to nothing (its content was deleted outright) is dropped, same as
+ * `foldEffectFor`'s own "nothing left to hide" guard. */
+export function mapDeferredTargets(targets: readonly DeferredFoldTarget[], changes: ChangeDesc): DeferredFoldTarget[] {
+	const mapped: DeferredFoldTarget[] = [];
+	for (const target of targets) {
+		const from = changes.mapPos(target.from, -1);
+		const to = changes.mapPos(target.to, 1);
+		if (to <= from) continue; // the block this would have folded no longer exists
+		mapped.push({ anchorKey: target.anchorKey, from, to });
+	}
+	return mapped;
 }
 
 /** G13's other half: re-checks every still-deferred target against the *current* cursor
- * position and applies (dispatches) each one whose block the cursor has since left. Cheap and
- * safe to call on every update, including ones unrelated to the cursor at all — a no-op once
- * `pending` is empty. Never throws on a doc that's since shrunk below a deferred range's line
- * numbers (`foldEffectFor` already guards that). */
-export function applyReadyDeferredFolds(view: EditorView, pending: readonly FoldTarget[]): FoldTarget[] {
+ * position and `liveAnchorKeys` (R2), applying (dispatching) each one whose block the cursor
+ * has since left — and silently dropping (neither applying nor keeping) any whose anchor is no
+ * longer live, because the user unfolded it, or "Forget stored folds for this note" ran, while
+ * it was still deferred (R2). Cheap and safe to call on every update, including ones unrelated
+ * to the cursor at all — a no-op once `pending` is empty. Never throws on a doc that's since
+ * shrunk below a deferred target's span (`foldEffectFor` already guards that). */
+export function applyReadyDeferredFolds(
+	view: EditorView,
+	pending: readonly DeferredFoldTarget[],
+	liveAnchorKeys: ReadonlySet<string>,
+): DeferredFoldTarget[] {
 	if (pending.length === 0) return [];
 
-	const cursorLine = cursorLineOf(view);
-	const ready: FoldTarget[] = [];
-	const stillPending: FoldTarget[] = [];
+	const cursorPos = view.state.selection.main.head;
+	const ready: { range: LineRange }[] = [];
+	const stillPending: DeferredFoldTarget[] = [];
 	for (const target of pending) {
-		const inside = cursorLine !== null && cursorLine >= target.range.startLine && cursorLine <= target.range.endLine;
-		if (inside) stillPending.push(target);
-		else ready.push(target);
+		if (!liveAnchorKeys.has(target.anchorKey)) continue; // R2: forgotten/unfolded while deferred
+
+		const inside = cursorPos >= target.from && cursorPos <= target.to;
+		if (inside) {
+			stillPending.push(target);
+			continue;
+		}
+
+		const doc = view.state.doc;
+		const startLine = doc.lineAt(Math.min(target.from, doc.length)).number;
+		const endLine = doc.lineAt(Math.min(target.to, doc.length)).number;
+		ready.push({ range: { startLine, endLine } });
 	}
 
 	dispatchFoldTargets(view, ready);

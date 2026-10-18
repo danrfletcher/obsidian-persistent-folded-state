@@ -115,4 +115,68 @@ describe("restore-cursor (G13)", () => {
 		await settle();
 		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 6 }]);
 	});
+
+	it("R2: deleting a line inside the deferred block keeps the fold off the next heading when the cursor leaves", async () => {
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [TUESDAY_ANCHOR], dormant: [] } });
+		const cursorAt = BEFORE.indexOf("Some text");
+		const view = makeView(store, BEFORE, cursorAt);
+
+		view.dispatch({
+			changes: { from: 0, to: view.state.doc.length, insert: BEFORE },
+			annotations: Transaction.userEvent.of("set"),
+			selection: { anchor: cursorAt },
+		});
+		await settle();
+		expect(liveFoldedLineRanges(view)).toEqual([]); // still deferred, cursor inside
+
+		// Delete "Some text under the heading." entirely — the line the cursor sits on, inside
+		// Tuesday's deferred range — so everything after it shifts up by one line.
+		const lineToDelete = view.state.doc.line(2);
+		view.dispatch({
+			changes: { from: lineToDelete.from, to: view.state.doc.line(3).from, insert: "" },
+			selection: { anchor: lineToDelete.from },
+		});
+
+		// Still inside Tuesday's own (now-shifted) range, so still deferred.
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+
+		// Move the cursor out, into the (now-shifted) "## Another".
+		const outsidePos = view.state.doc.toString().indexOf("## Another");
+		view.dispatch({ selection: { anchor: outsidePos } });
+		await Promise.resolve();
+
+		const folded = liveFoldedLineRanges(view);
+		expect(folded).toHaveLength(1);
+		// Without R2's fix the deferred target would still carry its pre-deletion line numbers
+		// (1-6), which — now that one line has shifted out of the document — would swallow
+		// "## Another" too. Mapping the target's span forward through the deletion (R2) lands
+		// it on the correct, shifted range instead.
+		expect(folded[0]).toEqual({ startLine: 1, endLine: 5 });
+	});
+
+	it("R2: forgetting the note's stored folds while a fold is deferred drops it instead of applying it later", async () => {
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [TUESDAY_ANCHOR], dormant: [] } });
+		const cursorAt = BEFORE.indexOf("Some text");
+		const view = makeView(store, BEFORE, cursorAt);
+
+		view.dispatch({
+			changes: { from: 0, to: view.state.doc.length, insert: BEFORE },
+			annotations: Transaction.userEvent.of("set"),
+			selection: { anchor: cursorAt },
+		});
+		await settle();
+		expect(liveFoldedLineRanges(view)).toEqual([]); // still deferred, cursor inside
+
+		// "Forget stored folds for this note" (G12's command) while the fold is still
+		// deferred — the anchor it was going to apply is no longer live at all.
+		store.forget(NOTE_PATH);
+
+		// Move the cursor out — without R2's fix this would still apply the now-forgotten
+		// fold, since `applyReadyDeferredFolds` never used to re-check the live store.
+		const outsidePos = view.state.doc.toString().indexOf("## Another");
+		view.dispatch({ selection: { anchor: outsidePos } });
+		await Promise.resolve();
+
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+	});
 });
