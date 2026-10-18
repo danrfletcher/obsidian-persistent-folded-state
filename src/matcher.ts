@@ -191,9 +191,10 @@ function runExactTier(
 		group.storedIdxs.push(p.index);
 		if (!groups.has(groupKey)) {
 			// Every member of a group shares the same (chainKey, kind, text), so any member's
-			// own scope pool finds the same candidate set — computed once per group.
+			// own scope pool finds the same candidate set — computed once per group. Nothing
+			// is consumed yet at this point (consumption only happens once every group's pool
+			// has been built, below), so every candidate in `p.pool` is still fair game here.
 			for (const c of p.pool) {
-				if (consumed[c]) continue;
 				const candidate = candidates[c];
 				if (candidate.kind === anchor.kind && candidate.text === anchor.text) {
 					group.candidateIdxs.push(c);
@@ -349,10 +350,9 @@ async function runScoredTier(
 			const eligible = eligibleFor(anchor, p.pool).filter((c) => !consumed[c]);
 			const scored: { candidateIdx: number; score: number }[] = [];
 			for (const c of eligible) {
-				if (budget.exhausted) break;
 				const candidate = candidates[c];
 				const score = await budget.score(p.index, c, anchor.text, candidate.text);
-				if (score === null) break;
+				if (score === null) break; // the budget's own exhausted-check, not a redundant pre-check here
 				if (score >= thresholdFor(anchor, candidate)) scored.push({ candidateIdx: c, score });
 			}
 			if (eligible.length > 0 && scored.length === 0 && !reasonHint.has(p.index)) {

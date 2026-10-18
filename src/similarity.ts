@@ -55,14 +55,10 @@ function tokenOverlap(a: string, b: string): number {
  * over UTF-16 code units (not grapheme clusters) — adequate for a similarity *score*, which
  * never needs to be character-exact, and keeps this simple and allocation-light. */
 function levenshteinDistance(a: string, b: string): number {
-	if (a === b) return 0;
-
 	// `short` is the one we size the rolling rows to, so memory tracks the smaller string.
 	const [short, long] = a.length <= b.length ? [a, b] : [b, a];
 	const shortLen = short.length;
 	const longLen = long.length;
-
-	if (shortLen === 0) return longLen;
 
 	let previousRow = new Uint32Array(shortLen + 1);
 	let currentRow = new Uint32Array(shortLen + 1);
@@ -88,15 +84,17 @@ function levenshteinDistance(a: string, b: string): number {
 
 function editSimilarity(a: string, b: string): number {
 	const maxLen = Math.max(a.length, b.length);
-	if (maxLen === 0) return 1;
 	return 1 - levenshteinDistance(a, b) / maxLen;
 }
 
-function clamp01(value: number): number {
-	if (!Number.isFinite(value)) return 0;
-	if (value < 0) return 0;
-	if (value > 1) return 1;
-	return value;
+/** A defensive `NaN` guard only — not a numeric clamp. The token-overlap and edit-similarity
+ * components are each already mathematically guaranteed to land in [0, 1] for any non-empty
+ * input (a bounded ratio, correctly rounded), and a 50/50 blend of two such values can't leave
+ * that range either — so the only real failure mode left is `NaN` from a 0/0 division (both
+ * sides tokenizing to nothing, e.g. two different whitespace-only strings), which this turns
+ * into 0 rather than ever surfacing. */
+function guardNaN(value: number): number {
+	return Number.isFinite(value) ? value : 0;
 }
 
 /**
@@ -111,5 +109,5 @@ export function similarity(a: string, b: string): number {
 
 	const token = tokenOverlap(a, b);
 	const edit = editSimilarity(a, b);
-	return clamp01(TOKEN_WEIGHT * token + (1 - TOKEN_WEIGHT) * edit);
+	return guardNaN(TOKEN_WEIGHT * token + (1 - TOKEN_WEIGHT) * edit);
 }

@@ -63,6 +63,13 @@ describe("similarity: empty vs non-empty never NaN, always 0", () => {
 		expect(similarity("", "x")).toBe(0);
 		expect(similarity("x", "")).toBe(0);
 	});
+
+	it("returns 0, never NaN, for two different whitespace-only strings (both tokenize to nothing)", () => {
+		// Neither side is the empty string (so the length===0 short-circuit doesn't fire), but
+		// both tokenize to zero tokens, which would otherwise divide 0/0 in the token-overlap
+		// half of the blend.
+		expect(similarity("   ", "  ")).toBe(0);
+	});
 });
 
 describe("similarity: unicode, CJK, emoji", () => {

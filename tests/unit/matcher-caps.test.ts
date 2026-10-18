@@ -28,6 +28,16 @@ describe("E6 C21: at most maxFolds stored anchors are processed, in stored order
 		const { MAX_FOLDS } = await import("../../src/matcher");
 		expect(MAX_FOLDS).toBe(500);
 	});
+
+	it("maxFolds: 0 caps everything immediately, before any tier runs", async () => {
+		const stored = anchorsFrom("- [ ] a\n- [ ] b");
+		const candidates = anchorsFrom("- [ ] a\n- [ ] b"); // would otherwise match exactly
+		const results = await matchAnchors(stored, candidates, { maxFolds: 0 });
+		expect(results).toEqual([
+			{ tier: "none", reason: "capped" },
+			{ tier: "none", reason: "capped" },
+		]);
+	});
 });
 
 describe("E6 C22: at most maxComparisons similarity() calls per run", () => {
@@ -97,6 +107,17 @@ describe("E6 C23: matchAnchors is async and yields through an injected yieldToHo
 	it("CHUNK_SIZE defaults to 250", async () => {
 		const { CHUNK_SIZE } = await import("../../src/matcher");
 		expect(CHUNK_SIZE).toBe(250);
+	});
+
+	it("uses its own built-in default yieldToHost when none is injected, without throwing", async () => {
+		const storedLabels = Array.from({ length: 5 }, (_, i) => `default yield task ${i} changed`);
+		const candidateLabels = Array.from({ length: 5 }, (_, i) => `default yield task ${i}`);
+		const stored = anchorsFrom(tasksMarkdown(storedLabels));
+		const candidates = anchorsFrom(tasksMarkdown(candidateLabels));
+
+		// No yieldToHost option at all — forces the module's own default, with a small
+		// chunkSize so it's actually invoked at least once.
+		await expect(matchAnchors(stored, candidates, { chunkSize: 1 })).resolves.toHaveLength(5);
 	});
 });
 

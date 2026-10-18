@@ -25,12 +25,36 @@ describe("E1: identical normalized lines under one parent pair by order (C17)", 
 		const results = await matchAnchors([secondDuplicate], candidates);
 		expect(results[0]).toEqual({ tier: "exact", target: expectedCandidateIdx });
 	});
+
+	it("leftovers that don't share a literal siblingIndex value are paired by relative rank", async () => {
+		// 4 duplicates before (siblingIndex 0,1,2,3), but only the 2nd and 4th were folded.
+		// Only 2 duplicates survive in the new text (siblingIndex 0,1). The 2nd (siblingIndex
+		// 1) still matches directly by its own siblingIndex value. The 4th (siblingIndex 3) has
+		// no siblingIndex-3 candidate left, so it falls back to rank: among what's left after
+		// the direct match consumes candidate 1, only candidate 0 remains, and it's the sole
+		// leftover on both sides — so it's paired by rank, not literal siblingIndex equality.
+		const before = "# Section\n\t- [ ] dup\n\t- [ ] dup\n\t- [ ] dup\n\t- [ ] dup";
+		const after = "# Section\n\t- [ ] dup\n\t- [ ] dup";
+		const storedAll = anchorsFrom(before).filter((a) => a.kind === "task");
+		const candidates = anchorsFrom(after);
+
+		const secondDuplicate = storedAll.find((a) => a.siblingIndex === 1);
+		const fourthDuplicate = storedAll.find((a) => a.siblingIndex === 3);
+		if (!secondDuplicate || !fourthDuplicate) throw new Error("fixture: expected 4 stored duplicates");
+
+		const candidateSibling0 = indexOfAnchor(candidates, (a) => a.kind === "task" && a.siblingIndex === 0);
+		const candidateSibling1 = indexOfAnchor(candidates, (a) => a.kind === "task" && a.siblingIndex === 1);
+
+		const results = await matchAnchors([secondDuplicate, fourthDuplicate], candidates);
+		expect(results[0]).toEqual({ tier: "exact", target: candidateSibling1 }); // direct siblingIndex match
+		expect(results[1]).toEqual({ tier: "exact", target: candidateSibling0 }); // rank-based leftover pairing
+	});
 });
 
 describe("E1: fewer duplicates now than the stored ordinal (C18)", () => {
 	it("the surplus anchors are none/no-candidate, never remapped onto the one remaining duplicate", async () => {
-		const before = "# Section\n	- [ ] dup\n	- [ ] dup\n	- [ ] dup";
-		const after = "# Section\n	- [ ] dup"; // only the first of three survives
+		const before = "# Section\n\t- [ ] dup\n\t- [ ] dup\n\t- [ ] dup";
+		const after = "# Section\n\t- [ ] dup"; // only the first of three survives
 		const stored = anchorsFrom(before).filter((a) => a.kind === "task");
 		const candidates = anchorsFrom(after);
 
@@ -123,6 +147,29 @@ describe("C14/C20: the parent chain separates a text tie only when it itself dif
 		expect(results[0]).toEqual({ tier: "positional", target: tuesdayMorningTask });
 	});
 
+	it("a reverse-direction claim with a clear (non-tied) winner needs no tiebreak at all", async () => {
+		// Two anchors under different (now-renamed) parents fall back file-wide and are both
+		// tier-2-eligible for the one shared candidate, but with clearly different (non-tied)
+		// scores — pickWinner should take the stronger claimant outright (breakTieByChain's
+		// own single-item short-circuit, never reaching its tie-separation logic at all).
+		vi.spyOn(similarityModule, "similarity").mockImplementation((a, b) => {
+			if (a === "wants it strongly" && b === "the shared candidate") return 0.9;
+			if (a === "wants it weakly" && b === "the shared candidate") return 0.6;
+			return 0.9;
+		});
+		const stored = anchorsFrom("# P1\n\t- [ ] wants it strongly\n# P2\n\t- [ ] wants it weakly").filter(
+			(a) => a.kind === "task",
+		);
+		const candidates = anchorsFrom("# Elsewhere\n\t- [ ] the shared candidate");
+
+		const results = await matchAnchors(stored, candidates);
+		const target = indexOfAnchor(candidates, (a) => a.kind === "task");
+		expect(results[0]).toEqual({ tier: "positional", target }); // the stronger claimant wins
+		expect(results[1]).toEqual({ tier: "none", reason: "no-candidate" }); // nothing else left
+
+		vi.restoreAllMocks();
+	});
+
 	it("an unseparated tie (chains equally (dis)similar) stays ambiguous", async () => {
 		vi.spyOn(similarityModule, "similarity").mockImplementation((a, b) => {
 			// Chain comparisons are recognizable by the "kind:text" format `chainText` builds;
@@ -135,6 +182,43 @@ describe("C14/C20: the parent chain separates a text tie only when it itself dif
 
 		const results = await matchAnchors(stored, candidates);
 		expect(results[0]).toEqual({ tier: "none", reason: "ambiguous" });
+
+		vi.restoreAllMocks();
+	});
+});
+
+describe("Comparison memoization: a pair re-examined across deferred-acceptance passes is cached", () => {
+	it("an anchor that loses its contest and retries the same unconsumed candidate hits the memo, not similarity() again", async () => {
+		// t1 and t2 both prefer the shared candidate ca (tied -> stays unresolved every pass);
+		// t3 cleanly wins cb in pass 1, which is the only reason there's a pass 2 at all. In
+		// pass 2, t1 and t2 re-score against ca — a pair already computed in pass 1 — which
+		// must come from the memo, not a fresh similarity() call.
+		const table: Record<string, number> = {
+			"t1|ca": 0.9,
+			"t1|cb": 0.7,
+			"t2|ca": 0.9,
+			"t2|cb": 0.1,
+			"t3|ca": 0.1,
+			"t3|cb": 0.8,
+		};
+		const spy = vi.spyOn(similarityModule, "similarity").mockImplementation((a, b) => table[`${a}|${b}`] ?? 0.05);
+
+		const stored = anchorsFrom("# P1\n\t- [ ] t1\n# P2\n\t- [ ] t2\n# P3\n\t- [ ] t3").filter((a) => a.kind === "task");
+		const candidates = anchorsFrom("# X1\n\t- [ ] ca\n# X2\n\t- [ ] cb").filter((a) => a.kind === "task");
+
+		const results = await matchAnchors(stored, candidates);
+
+		expect(results[0]).toEqual({ tier: "none", reason: "ambiguous" }); // t1: tied for ca, every pass
+		expect(results[1]).toEqual({ tier: "none", reason: "ambiguous" }); // t2: tied for ca, every pass
+		expect(results[2]).toEqual({ tier: "positional", target: 1 }); // t3: wins cb cleanly in pass 1
+
+		// Each (anchor, candidate) *scoring* pair is only ever actually computed once, however
+		// many passes re-examine it: 6 distinct (anchor, candidate) pairs (t1/t2/t3 each
+		// against ca and cb) scored once apiece, plus the ca contest's chain-tiebreak call
+		// (not memoized, and not counted toward the comparisons budget either) repeating once
+		// per pass it's tied in — 2 claimants x 2 passes = 4. 6 + 4 = 10, not 6 + 6 = 12: the
+		// memo is what keeps pass 2's re-scoring of (t1, ca) and (t2, ca) from adding to this.
+		expect(spy.mock.calls.length).toBe(10);
 
 		vi.restoreAllMocks();
 	});
