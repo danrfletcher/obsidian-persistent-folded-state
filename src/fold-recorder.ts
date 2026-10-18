@@ -38,9 +38,9 @@ import type { FoldStore } from "./fold-store";
 import { hashText } from "./fold-store";
 import { describeFold } from "./describe-fold";
 
-/** A later PR (restoring folds, PR-5) tags every transaction it dispatches to re-apply a fold
- * with this annotation, so this recorder never mistakes that re-apply for a fresh user fold
- * (E11: "The plugin tags its own fold effects ... so the recorder never stores them as user
+/** PR-5 (restoring folds) tags every transaction it dispatches to re-apply a fold with this
+ * annotation (see src/fold-restorer.ts), so this recorder never mistakes that re-apply for a
+ * fresh user fold (E11: "The plugin tags its own fold effects ... so the recorder never stores them as user
  * folds"). Tagging the whole transaction rather than each individual effect is enough in
  * practice: every fold/unfold effect a restore dispatches arrives in the same transaction it
  * tags, and nothing in this PR ever mixes a restore effect with a genuine user fold in one
