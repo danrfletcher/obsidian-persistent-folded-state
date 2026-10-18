@@ -1,77 +1,36 @@
 /**
- * PR-2's placeholder for the anchor builder PR-3 adds and PR-5 wires in in its place (see the
- * file comment in src/fold-recorder.ts, which calls this as its one seam). Until then, a fold or
- * unfold is described by exactly three things: the folded line's raw text, a rough `kind` guess
- * from that line's leading syntax, and its indent column (a tab counts as 4, matching the ticket
- * plan's Anchor definition) — nothing structural (no sibling index, no parent chain) and no
- * character offsets are stored.
+ * The seam PR-2 left for this (src/fold-recorder.ts's one call site). PR-5 replaces its old
+ * line-local guess (raw text + a rough kind + indent, no sibling index, no parent chain) with
+ * PR-3's real anchor builder (src/anchors.ts): every fold recorded from now on stores a real
+ * `Anchor` — kind, indent, normalized text, sibling index and parent chain — not raw line text.
  *
- * `kind` here is a simple, line-local guess good enough to prove recording works for every
- * foldable kind (G1) — it is deliberately not the real structural classification PR-3's anchor
- * builder will produce (that needs the syntax tree and the parent chain, not just one line).
+ * `describeFold`'s own signature is unchanged (`(state, range) -> descriptor`), so
+ * src/fold-recorder.ts needed no change at all for this swap, exactly as its own file comment
+ * predicted. Internally this now runs `buildAnchors` over the transaction's current document
+ * and picks out the one block whose range starts on the folded line — `range.from`'s line is
+ * always a block's own first line for any real fold/unfold effect, so that line number is a
+ * unique key into `buildAnchors`' output.
+ *
+ * A record built the old way (no `siblingIndex`/`parentChain`) fails `parseAnchor` and is
+ * discarded on load (`src/fold-store.ts`'s sanitiser) rather than ever being matched against —
+ * the data is per-device and at most a few minutes old, so losing it is an accepted, one-time
+ * cost of this PR landing, not something this file needs to migrate.
  */
 import type { EditorState } from "@codemirror/state";
+import { buildAnchors, type Anchor } from "./anchors";
 
-export type FoldKind =
-	| "heading"
-	| "task"
-	| "list"
-	| "callout"
-	| "blockquote"
-	| "frontmatter"
-	| "code-block"
-	| "other";
-
-export interface FoldDescriptor {
-	text: string;
-	kind: FoldKind;
-	indent: number;
-}
-
-/** Column width of a tab for indent counting (ticket plan: "a tab counted as 4"). */
-const TAB_WIDTH = 4;
-
-function indentColumns(lineText: string): number {
-	let columns = 0;
-	for (const ch of lineText) {
-		if (ch === "\t") columns += TAB_WIDTH;
-		else if (ch === " ") columns += 1;
-		else break;
-	}
-	return columns;
-}
-
-const CODE_FENCE = /^(```|~~~)/;
-const CALLOUT = /^>\s*\[!\w+\][+-]?/;
-const BLOCKQUOTE = /^>/;
-const HEADING = /^#{1,6}\s/;
-const TASK = /^(-|\*|\+|\d+[.)])\s+\[[^\]]\]/;
-const LIST = /^(-|\*|\+|\d+[.)])\s+/;
-
-function classifyKind(lineText: string, lineNumber: number): FoldKind {
-	const trimmed = lineText.trim();
-	// E13: frontmatter has one anchor; it's the opening "---" delimiter, and only when it's the
-	// very first line of the document (a "---" anywhere else is a horizontal rule or, inside a
-	// callout/blockquote, just text).
-	if (trimmed === "---" && lineNumber === 1) return "frontmatter";
-	if (CODE_FENCE.test(trimmed)) return "code-block";
-	if (CALLOUT.test(trimmed)) return "callout";
-	if (BLOCKQUOTE.test(trimmed)) return "blockquote";
-	if (HEADING.test(trimmed)) return "heading";
-	if (TASK.test(trimmed)) return "task";
-	if (LIST.test(trimmed)) return "list";
-	return "other";
-}
-
-/** The one seam PR-5 replaces (spec: "the recorder calls one seam, describeFold(state, range)").
- * `range` is the folded range from a `foldEffect`/`unfoldEffect` value — only `range.from` (the
- * folded line's start) is used; `range.to` is CM6's own bookkeeping for where the fold closes
- * and isn't needed to describe what was folded. */
-export function describeFold(state: EditorState, range: { from: number; to: number }): FoldDescriptor {
+/** Describes the fold/unfold effect at `range` as a real `Anchor` (PR-3), built fresh from
+ * `state`'s current document. `range.to` is CM6's own bookkeeping for where the fold closes and
+ * isn't needed here (same as the PR-2 placeholder this replaces) — only `range.from`'s line
+ * matters. Never throws: a `range.from` that doesn't land on any `buildAnchors` segment start
+ * (shouldn't happen for a real fold/unfold effect, since every foldable position is itself a
+ * segment start) falls back to describing that line alone as a bare, unparented "other" anchor
+ * rather than losing the record entirely. */
+export function describeFold(state: EditorState, range: { from: number; to: number }): Anchor {
 	const line = state.doc.lineAt(range.from);
-	return {
-		text: line.text,
-		kind: classifyKind(line.text, line.number),
-		indent: indentColumns(line.text),
-	};
+	const blocks = buildAnchors(state.doc.toString());
+	const match = blocks.find((block) => block.range.startLine === line.number);
+	if (match) return match.anchor;
+
+	return { kind: "other", indent: 0, text: line.text.trim().toLowerCase(), siblingIndex: 0, parentChain: [] };
 }

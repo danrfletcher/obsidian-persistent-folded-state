@@ -75,7 +75,9 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 
 		const record = store.get(NOTE_PATH);
 		expect(record?.folds).toHaveLength(1);
-		expect((record?.folds[0] as { kind: string }).kind).toBe(kind === "codeBlock" ? "code-block" : kind);
+		// PR-5: the recorder now stores a real Anchor (src/anchors.ts), whose code-block kind
+		// is "code" — not PR-2's placeholder FoldDescriptor, whose guess was "code-block".
+		expect((record?.folds[0] as { kind: string }).kind).toBe(kind === "codeBlock" ? "code" : kind);
 	});
 
 	it("G1: unfolding removes the matching entry; the store flushes it (debounced)", async () => {
@@ -247,7 +249,8 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 			// Mirrors the exact scenario from the review finding: insert a new first line, and
 			// in the same transaction fold a range that (only after the insert) falls inside it.
 			// Against `tr.startState` this would describe the wrong block (or throw past the
-			// old document's end); against `tr.state` (R5's fix) it must describe "NEW LINE".
+			// old document's end); against `tr.state` (R5's fix) it must describe "NEW LINE"
+			// (normalized, per PR-5's anchor-based describeFold: lower-cased, "new line").
 			const insert = "NEW LINE\n";
 			view.dispatch({
 				changes: { from: 0, to: 0, insert },
@@ -256,7 +259,7 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 
 			const record = store.get(NOTE_PATH);
 			expect(record?.folds).toHaveLength(1);
-			expect((record?.folds[0] as { text: string }).text).toBe("NEW LINE");
+			expect((record?.folds[0] as { text: string }).text).toBe("new line");
 		});
 	});
 });

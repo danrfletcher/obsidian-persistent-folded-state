@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { FoldStore, sanitizeStoreData, STORE_VERSION } from "../../src/fold-store";
 
+/** PR-5: every entry inside `folds`/`dormant` is now validated against `src/anchors.ts`'s real
+ * `Anchor` shape (`parseAnchor`), not just "is it a plain object" — so a fixture standing in for
+ * "a fold that should survive sanitisation" needs to actually be a valid `Anchor`, not a bare
+ * `{kind: "heading"}`. */
+const GOOD_ANCHOR = { kind: "heading", indent: 0, text: "tuesday", siblingIndex: 0, parentChain: [] };
+
 /** E8: every row must yield an empty or sanitised store from `sanitizeStoreData`, with no
  * exception, regardless of how corrupt or unexpected the input is. */
 const rows: { label: string; raw: unknown; expectEmpty: boolean }[] = [
@@ -40,12 +46,12 @@ describe("sanitizeStoreData: E8 table", () => {
 			version: STORE_VERSION,
 			files: {
 				"Bad.md": { contentHash: "abc", folds: "not an array", dormant: [] },
-				"Good.md": { contentHash: "def", folds: [{ kind: "heading" }], dormant: [] },
+				"Good.md": { contentHash: "def", folds: [GOOD_ANCHOR], dormant: [] },
 			},
 		};
 		const result = sanitizeStoreData(raw);
 		expect(Object.keys(result.files)).toEqual(["Good.md"]);
-		expect(result.files["Good.md"].folds).toEqual([{ kind: "heading" }]);
+		expect(result.files["Good.md"].folds).toEqual([GOOD_ANCHOR]);
 	});
 
 	it("a non-array dormant is sanitised to an empty array rather than dropping the record", () => {
@@ -60,10 +66,40 @@ describe("sanitizeStoreData: E8 table", () => {
 	it("non-object entries inside folds/dormant arrays are filtered out", () => {
 		const raw = {
 			version: STORE_VERSION,
-			files: { "Note.md": { contentHash: "abc", folds: [{ kind: "heading" }, "nope", 5, null], dormant: [] } },
+			files: { "Note.md": { contentHash: "abc", folds: [GOOD_ANCHOR, "nope", 5, null], dormant: [] } },
 		};
 		const result = sanitizeStoreData(raw);
-		expect(result.files["Note.md"].folds).toEqual([{ kind: "heading" }]);
+		expect(result.files["Note.md"].folds).toEqual([GOOD_ANCHOR]);
+	});
+
+	it("PR-5: a PR-2-era raw FoldDescriptor ({text, kind, indent}, no siblingIndex/parentChain) is discarded, not treated as a valid anchor", () => {
+		const raw = {
+			version: STORE_VERSION,
+			files: {
+				"Note.md": {
+					contentHash: "abc",
+					folds: [{ text: "## Tuesday", kind: "heading", indent: 0 }],
+					dormant: [],
+				},
+			},
+		};
+		const result = sanitizeStoreData(raw);
+		expect(result.files["Note.md"].folds).toEqual([]);
+	});
+
+	it("PR-5: a valid Anchor alongside a PR-2-era raw record keeps the valid one and drops only the stale one", () => {
+		const raw = {
+			version: STORE_VERSION,
+			files: {
+				"Note.md": {
+					contentHash: "abc",
+					folds: [GOOD_ANCHOR, { text: "- [ ] Old style", kind: "task", indent: 0 }],
+					dormant: [],
+				},
+			},
+		};
+		const result = sanitizeStoreData(raw);
+		expect(result.files["Note.md"].folds).toEqual([GOOD_ANCHOR]);
 	});
 });
 
@@ -101,13 +137,13 @@ describe("FoldStore.load: file absent, corrupt or rejecting loadData() (E8)", ()
 			version: STORE_VERSION,
 			files: {
 				"Bad.md": { contentHash: 42, folds: [], dormant: [] }, // contentHash wrong type
-				"Good.md": { contentHash: "abc", folds: [{ kind: "heading" }], dormant: [] },
+				"Good.md": { contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [] },
 			},
 		};
 		const store = new FoldStore({ loadData: async () => raw, saveData: vi.fn() });
 		await store.load();
 		expect(store.get("Bad.md")).toBeUndefined();
-		expect(store.get("Good.md")).toEqual({ contentHash: "abc", folds: [{ kind: "heading" }], dormant: [] });
+		expect(store.get("Good.md")).toEqual({ contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [] });
 	});
 
 	it("the next flush after a corrupt load writes a valid file", async () => {

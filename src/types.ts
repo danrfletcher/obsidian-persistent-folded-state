@@ -1,15 +1,20 @@
 /**
  * Shared on-disk/in-memory shapes for the fold store.
  *
- * This PR (PR-1) only builds the persistence layer: get/set/forget of whole records, debounced
- * and immediate flushing, and load-time sanitisation. The *contents* of a fold entry (its anchor:
- * kind, indent level, normalized text, sibling index, parent chain) are defined by a later PR
- * (the anchor and matcher module). Until then every fold entry is treated as an opaque, JSON-safe
- * object: this file only fixes the shape of the *record* and *store*, not what's inside a fold.
+ * PR-1 built the persistence layer: get/set/forget of whole records, debounced and immediate
+ * flushing, and load-time sanitisation. `StoredAnchor` was left opaque here on purpose — the
+ * *contents* of a fold entry weren't defined yet (that was PR-3's job, `src/anchors.ts`'s
+ * `Anchor`). PR-5 is the one that starts actually relying on that shape: `src/fold-store.ts`'s
+ * load-time sanitiser now validates every entry against `anchors.ts`'s `parseAnchor`, discarding
+ * anything that isn't a real `Anchor` (including a PR-2-era raw-text record). `StoredAnchor`
+ * stays `Record<string, unknown>` here regardless — it's the on-disk JSON type, which has no
+ * notion of a TypeScript interface anyway — but every entry that actually survives sanitisation
+ * from PR-5 onward is a real, valid `Anchor` round-tripped through JSON, not an arbitrary object.
  */
 
-/** A single stored fold. Opaque here on purpose — see the file comment above. Must round-trip
- * through JSON unchanged (whatever a later PR puts in survives a load/sanitise/flush cycle). */
+/** A single stored fold. Typed opaquely here (see the file comment above) but, from PR-5
+ * onward, validated against `anchors.ts`'s `Anchor` shape on load. Must round-trip through JSON
+ * unchanged (a valid `Anchor` survives a load/sanitise/flush cycle byte-for-byte). */
 export type StoredAnchor = Record<string, unknown>;
 
 /** Per-file record persisted in data.json, keyed by vault-relative path.

@@ -13,6 +13,7 @@
  * always carries the newest state, and a flush with nothing pending never calls `saveData`.
  */
 import type { FileFoldRecord, StoreData } from "./types";
+import { parseAnchor } from "./anchors";
 
 /** Bumped only if a later PR needs to migrate an incompatible on-disk shape. An unrecognised
  * version is treated the same as a corrupt file (E8): start empty rather than guess. */
@@ -32,9 +33,20 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** PR-5: each entry is validated against PR-3's real `Anchor` shape (`parseAnchor`), not just
+ * "is it a plain object" — a PR-2-era raw-text record (`{text, kind, indent}`, no
+ * `siblingIndex`/`parentChain`) fails that validation and is discarded here, on load, rather
+ * than ever being matched against (the data is per-device and at most a few minutes old, so
+ * losing it is an accepted one-time cost of this PR landing). A non-object, a string, a number
+ * or `null` entry is dropped the same way `parseAnchor` already rejects any of those. */
 function sanitizeAnchorArray(value: unknown): StoredAnchorArray {
 	if (!Array.isArray(value)) return [];
-	return value.filter(isPlainObject);
+	const result: StoredAnchorArray = [];
+	for (const entry of value) {
+		const anchor = parseAnchor(entry);
+		if (anchor !== null) result.push(anchor as unknown as Record<string, unknown>);
+	}
+	return result;
 }
 
 type StoredAnchorArray = Record<string, unknown>[];
@@ -44,7 +56,8 @@ type StoredAnchorArray = Record<string, unknown>[];
  * isn't an object — yields an empty store. Inside `files`, each record is checked on its own: a
  * record missing `contentHash` or whose `folds` isn't an array is dropped, but its neighbours
  * survive (so one bad entry never costs the whole store). `dormant` defaults to `[]` if missing
- * or malformed, since it isn't populated until a later PR. */
+ * or malformed, since it isn't populated until a later PR; both `folds` and `dormant` keep only
+ * the entries inside them that are real, valid `Anchor`s (PR-5; see `sanitizeAnchorArray`). */
 export function sanitizeStoreData(raw: unknown): StoreData {
 	const empty: StoreData = { version: STORE_VERSION, files: {} };
 	if (!isPlainObject(raw)) return empty;
