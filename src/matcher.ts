@@ -12,23 +12,44 @@
  * anchor's positional attempt, then every anchor's fuzzy attempt (G4, C9) — so a fuzzy match can
  * never take a candidate that another anchor already claimed exactly or positionally.
  *
- * Scope (G14 nesting, G7 moved blocks): a stored anchor's eligible candidate pool is, by default,
- * every candidate whose full parent chain (kind + normalized text at every ancestor level) is
- * deep-equal to the stored anchor's own parent chain — i.e. "the children of its matched parent",
- * where a parent counts as matched only when its own ancestor chain's text is unchanged end to
- * end. The moment any ancestor's text differs even slightly, that exact-chain pool is empty and
- * the anchor falls back to the *entire* candidate list (G14's "file-wide" fallback) — deliberately
- * all-or-nothing (no partial/fuzzy parent resolution): a parent either still reads the same, or
- * it counts as having no match for scoping purposes. That is also what keeps a block moved to a
- * different (still-matching) parent unclaimed (G7) without this module ever growing a notion of
- * "moved" (F6): the fallback is the *only* out-of-scope search, reached exactly when, and only
- * when, the parent chain stopped reading the same.
+ * Scope (G14 nesting, G7 moved blocks): a stored anchor's eligible candidate pool is "the
+ * children of its matched parent", where a parent counts as matched when it has a unique match
+ * at *any* tier — not only when its text reads identically. Resolving this is recursive and
+ * level-by-level (`matchAncestor`/`resolveScopePool`): to find a match for one ancestor
+ * (`AnchorParentRef`, which carries only `kind` + normalized `text` — no indent or sibling
+ * index, so an ancestor can never use tier 2's siblingIndex-and-indent eligibility test the way a
+ * real anchor does), first resolve *its own* parent the same way to get its search pool (every
+ * candidate under the already-resolved grandparent, or every candidate file-wide once some
+ * ancestor above it has no match), then look for a unique candidate of the same kind in that
+ * pool: exact text wins outright with no `similarity()` call; otherwise the unique best-scoring
+ * candidate at or above `positionalThreshold` wins (there is no separate "fuzzy" bar for an
+ * ancestor — lacking any position signal, every same-kind candidate in its pool is already as
+ * eligible as tier 2's "same position" set, so the lower bar is the only one that applies). A tie
+ * at an ancestor's own best score resolves to no match for that ancestor, same as elsewhere.
+ * Once a parent is resolved to a specific matched candidate, the next level's pool is exactly
+ * that candidate's real children (by its *current* kind + text, not the stored anchor's possibly
+ * stale memory of it) — so a parent that now reads differently (renamed, or itself found only
+ * through a fallback) still scopes its own children correctly. A parent with no match at any
+ * tier (renamed past its bar) does not demote its children to an empty pool: each child falls
+ * back to the *entire* candidate list (G14's "file-wide" fallback), found only once it is itself
+ * unique and above its own bar. That fallback is also what keeps a block moved to a different,
+ * still-matching parent unclaimed (G7): the still-matching parent's pool stays scoped to its own
+ * real children, so the moved block (now sitting under a different, unrelated parent) is simply
+ * never in that pool — without this module ever growing a notion of "moved" (F6). The fallback is
+ * the *only* out-of-scope search, reached exactly when, and only when, the immediate parent has
+ * no match of its own.
  *
  * Within a pool, the three tiers differ only in which candidates are eligible and what threshold
  * applies:
  *  - exact: candidate's normalized text === stored's, same kind (string equality — no
  *    `similarity()` call). Duplicates (several stored anchors sharing one (scope, text)) pair by
- *    order against the candidates sharing that (scope, text), per E1 — not an E2 tie (C20).
+ *    order against the candidates sharing that (scope, text), per E1 — not an E2 tie (C20). This
+ *    order-pairing only ever applies within a *real* scope (a true top-level search, or the
+ *    children of an actually-matched parent): inside a G14 *fallback* pool (the immediate parent
+ *    itself had no match), the exact tier instead requires the match to be unique file-wide —
+ *    two or more same-text candidates there are left ambiguous, never paired by order, so
+ *    duplicates that happen to sit under two different (both-unresolved) parents never cross-pair
+ *    (C18, R8).
  *  - positional: candidate has the same kind, sibling index and indent; score >= 40%.
  *  - fuzzy: candidate has the same kind but *not* the same sibling-index-and-indent pair; score
  *    >= 60% for lines of 20+ characters (the shorter of the two normalized strings), >= 80% for
@@ -41,7 +62,7 @@
  * raises a score or rescues a below-threshold candidate.
  */
 import * as similarityModule from "./similarity";
-import type { Anchor } from "./anchors";
+import type { Anchor, AnchorParentRef } from "./anchors";
 
 export type MatchTier = "exact" | "positional" | "fuzzy";
 export type NoMatchReason = "no-candidate" | "below-threshold" | "ambiguous" | "capped";
@@ -117,10 +138,16 @@ function tiedScores(a: number, b: number): boolean {
 	return Math.abs(a - b) <= TIE_EPSILON;
 }
 
-/** A deterministic key for an anchor's full ancestor lineage (kind + normalized text at every
- * level) — two anchors sharing this key read as "under the same still-recognizable parent". */
+/** A deterministic key for a full ancestor lineage (kind + normalized text at every level, as a
+ * plain array of refs) — two chains sharing this key read as "the same still-recognizable
+ * ancestry". Used both for a stored anchor's own (possibly stale) `parentChain` and, in
+ * `childrenOf`, for a resolved candidate's *current* chain + itself. */
+function chainKeyFromRefs(refs: { kind: string; text: string }[]): string {
+	return JSON.stringify(refs.map((ref) => [ref.kind, ref.text]));
+}
+
 function chainKey(anchor: Anchor): string {
-	return JSON.stringify(anchor.parentChain.map((ref) => [ref.kind, ref.text]));
+	return chainKeyFromRefs(anchor.parentChain);
 }
 
 /** Full parent-chain text, joined, for the C14/E2 tiebreak: comparing *this* (not either
@@ -136,24 +163,114 @@ function allCandidateIndices(candidates: Anchor[]): number[] {
 	return all;
 }
 
-/** Every candidate index eligible for `stored` (G14/G7 scoping, see the file comment). A
- * top-level anchor (`parentChain` empty) has no parent to match or fail, so G14's scoping has
- * nothing to restrict by — it always searches every candidate. A nested anchor's pool is every
- * candidate whose full parent chain deep-equals `stored`'s (true siblings under the same still-
- * recognizable ancestry), or — once that set is empty, meaning some ancestor's text no longer
- * matches at all — every candidate in the file (the G14 fallback). Without the top-level
- * special case, every root-level anchor would trivially "chain-match" every other root-level
- * candidate regardless of kind (both have an empty chain), which would wrongly suppress the
- * file-wide fallback a root-level anchor — having no parent — should always get. */
-function scopeFor(stored: Anchor, candidates: Anchor[]): number[] {
-	if (stored.parentChain.length === 0) return allCandidateIndices(candidates);
-
-	const key = chainKey(stored);
-	const exact: number[] = [];
+/** Every candidate that is a direct child of `parent` — i.e. whose own full parent chain is
+ * exactly `parent`'s chain with `parent` itself appended — judged by `parent`'s *current* kind
+ * and text (not any stale memory of it), so a parent found only through a rename or a fallback
+ * still scopes its own children correctly. */
+function childrenOf(parent: Anchor, candidates: Anchor[]): number[] {
+	const expectedKey = chainKeyFromRefs([...parent.parentChain, { kind: parent.kind, text: parent.text }]);
+	const result: number[] = [];
 	for (let i = 0; i < candidates.length; i++) {
-		if (chainKey(candidates[i]) === key) exact.push(i);
+		if (chainKey(candidates[i]) === expectedKey) result.push(i);
 	}
-	return exact.length > 0 ? exact : allCandidateIndices(candidates);
+	return result;
+}
+
+/** Resolves one ancestor reference (`ref`) to a unique matching candidate within `pool`, or
+ * `null` if none exists (R9). An ancestor has no indent or sibling index of its own (see the
+ * file comment), so it skips straight from exact text to a single blended bar
+ * (`positionalThreshold`) rather than running separate positional/fuzzy tiers — every same-kind
+ * candidate in `pool` is already as eligible as a real anchor's "same position" set would be,
+ * since there is no position signal available to narrow it further. Not routed through
+ * `ComparisonBudget`: like the parent-chain tiebreak elsewhere in this file, resolving an
+ * ancestor's own identity is a prerequisite for *finding* a stored anchor's scope, not one of
+ * that anchor's own tier-2/tier-3 comparisons, so these calls aren't counted toward the E6
+ * comparisons cap/spy. */
+function resolveAncestorMatch(
+	ref: { kind: string; text: string },
+	pool: number[],
+	candidates: Anchor[],
+	opts: ResolvedOptions,
+): number | null {
+	const sameKind = pool.filter((i) => candidates[i].kind === ref.kind);
+
+	const exact = sameKind.filter((i) => candidates[i].text === ref.text);
+	if (exact.length === 1) return exact[0];
+	if (exact.length > 1) return null; // duplicate ancestor text in one pool — ambiguous
+
+	let bestScore = Number.NEGATIVE_INFINITY;
+	let bestIdx = -1;
+	let tieCount = 0;
+	for (const i of sameKind) {
+		const score = similarityModule.similarity(ref.text, candidates[i].text);
+		if (score > bestScore + TIE_EPSILON) {
+			bestScore = score;
+			bestIdx = i;
+			tieCount = 1;
+		} else if (tiedScores(score, bestScore)) {
+			tieCount++;
+		}
+	}
+	if (bestIdx !== -1 && tieCount === 1 && bestScore >= opts.positionalThreshold) return bestIdx;
+	return null;
+}
+
+/** Resolves `chain` (an ancestor lineage prefix, outermost first) to the matched candidate for
+ * its *last* entry, or `null` if that entry has no match. Recursive and memoized by the chain's
+ * own content: resolving `chain[chain.length - 1]` first needs `chain`'s own parent (everything
+ * but the last entry) resolved, to know whether to search its children or fall back file-wide. */
+function matchAncestor(
+	chain: AnchorParentRef[],
+	candidates: Anchor[],
+	opts: ResolvedOptions,
+	memo: Map<string, number | null>,
+): number | null {
+	const key = chainKeyFromRefs(chain);
+	const cached = memo.get(key);
+	if (cached !== undefined) return cached;
+
+	const parentChain = chain.slice(0, -1);
+	const ref = chain[chain.length - 1];
+	const pool = poolFor(parentChain, candidates, opts, memo);
+	const result = resolveAncestorMatch(ref, pool, candidates, opts);
+
+	memo.set(key, result);
+	return result;
+}
+
+/** The candidate pool a would-be anchor with parent chain `chain` should itself be searched in:
+ * file-wide when `chain` is empty (no parent to match or fail) or when `chain`'s own last entry
+ * has no match of its own; otherwise the real children of whatever candidate that entry resolved
+ * to. */
+function poolFor(
+	chain: AnchorParentRef[],
+	candidates: Anchor[],
+	opts: ResolvedOptions,
+	memo: Map<string, number | null>,
+): number[] {
+	if (chain.length === 0) return allCandidateIndices(candidates);
+	const matched = matchAncestor(chain, candidates, opts, memo);
+	if (matched === null) return allCandidateIndices(candidates);
+	return childrenOf(candidates[matched], candidates);
+}
+
+/** Every candidate index eligible for `stored` (G14/G7 scoping, see the file comment), plus
+ * whether that pool is a real scope or the G14 file-wide fallback (R8: the fallback pool must
+ * require a *unique* exact-text match in `runExactTier`, never an order-paired one). A top-level
+ * anchor (`parentChain` empty) has no parent to match or fail, so it always searches every
+ * candidate — and that is a real (non-fallback) scope, not a fallback one: there is no parent to
+ * have failed. */
+function scopeFor(
+	stored: Anchor,
+	candidates: Anchor[],
+	opts: ResolvedOptions,
+	memo: Map<string, number | null>,
+): { pool: number[]; fallback: boolean } {
+	if (stored.parentChain.length === 0) return { pool: allCandidateIndices(candidates), fallback: false };
+
+	const matched = matchAncestor(stored.parentChain, candidates, opts, memo);
+	if (matched === null) return { pool: allCandidateIndices(candidates), fallback: true };
+	return { pool: childrenOf(candidates[matched], candidates), fallback: false };
 }
 
 interface PendingAnchor {
@@ -161,6 +278,9 @@ interface PendingAnchor {
 	index: number;
 	/** Candidate indices eligible for this anchor's scope (before any tier-specific filter). */
 	pool: number[];
+	/** True when `pool` is the G14 file-wide fallback (this anchor's immediate parent has no
+	 * match of its own), rather than a real scope — see `runExactTier`'s uniqueness guard (R8). */
+	fallback: boolean;
 }
 
 /** Tier 1 (G4 exact, E1 duplicates): groups unresolved stored anchors and unconsumed candidates
@@ -182,12 +302,12 @@ function runExactTier(
 	consumed: boolean[],
 	results: MatchResult[],
 ): PendingAnchor[] {
-	const groups = new Map<string, { storedIdxs: number[]; candidateIdxs: number[] }>();
+	const groups = new Map<string, { storedIdxs: number[]; candidateIdxs: number[]; fallback: boolean }>();
 
 	for (const p of pending) {
 		const anchor = stored[p.index];
 		const groupKey = `${chainKey(anchor)}\u0000${anchor.kind}\u0000${anchor.text}`;
-		const group = groups.get(groupKey) ?? { storedIdxs: [], candidateIdxs: [] };
+		const group = groups.get(groupKey) ?? { storedIdxs: [], candidateIdxs: [], fallback: p.fallback };
 		group.storedIdxs.push(p.index);
 		if (!groups.has(groupKey)) {
 			// Every member of a group shares the same (chainKey, kind, text), so any member's
@@ -206,6 +326,19 @@ function runExactTier(
 
 	const resolvedStoredIdx = new Set<number>();
 	for (const group of groups.values()) {
+		// R8: inside a G14 fallback pool (this group's anchors have no matched parent of their
+		// own), the exact tier must claim only a *unique* file-wide match — two or more
+		// same-text candidates here are genuinely ambiguous (they may sit under two different,
+		// unrelated, both-unresolved parents), never order-paired as if they were true E1
+		// duplicates under one real parent (C18).
+		if (group.fallback && group.candidateIdxs.length > 1) {
+			for (const storedIdx of group.storedIdxs) {
+				results[storedIdx] = { tier: "none", reason: "ambiguous" };
+				resolvedStoredIdx.add(storedIdx);
+			}
+			continue;
+		}
+
 		const pairs = new Map<number, number>(); // storedIdx -> candidateIdx
 		const usedCandidates = new Set<number>();
 
@@ -463,10 +596,12 @@ export async function matchAnchors(
 
 	const consumed = new Array<boolean>(candidates.length).fill(false);
 	const reasonHint = new Map<number, NoMatchReason>();
+	const ancestorMemo = new Map<string, number | null>();
 
 	let pending: PendingAnchor[] = [];
 	for (let i = 0; i < cappedCount; i++) {
-		pending.push({ index: i, pool: scopeFor(stored[i], candidates) });
+		const scope = scopeFor(stored[i], candidates, opts, ancestorMemo);
+		pending.push({ index: i, pool: scope.pool, fallback: scope.fallback });
 	}
 
 	pending = runExactTier(pending, stored, candidates, consumed, results);
