@@ -279,34 +279,44 @@ interface ScoredClaim {
 	score: number;
 }
 
-/** Picks the single winner among one or more anchors that all proposed to the same candidate.
- * A clear best match score wins outright. Only when several anchors are tied on their own match
- * score (E2, reverse direction) does the parent-chain tiebreak (C14) apply: separate them by how
- * well each one's own parent chain reads against the candidate's — and if *that* is tied too,
- * nobody wins this round. Never used to decide a lone claimant, and never used to compare a
- * lower text score against a higher one — only to break an already-equal text score. */
+/** Separates a group of items tied at the best score by comparing each one's own parent-chain
+ * text against a fixed chain (E2/C14, both directions — see the file comment): the forward
+ * direction fixes the anchor's chain and varies over tied candidates, the reverse direction
+ * fixes the candidate's chain and varies over tied claimant anchors. A strictly higher chain
+ * similarity (beyond `TIE_EPSILON`) wins outright; if the chain comparison is itself tied, or
+ * nothing separates the group, nobody wins (null) — this never raises or invents a text score,
+ * it only ever discriminates between options that already tied on one. */
+function breakTieByChain<T>(tied: T[], chainTextFor: (item: T) => string, fixedChainText: string): T | null {
+	if (tied.length === 1) return tied[0];
+
+	let bestChainScore = Number.NEGATIVE_INFINITY;
+	let winners: T[] = [];
+	for (const item of tied) {
+		// Not counted toward the E6 comparisons cap/spy — this is a tiebreak over already-tied
+		// text scores, not a tier-2/tier-3 eligibility comparison (see the file comment).
+		const chainScore = similarityModule.similarity(fixedChainText, chainTextFor(item));
+		if (chainScore > bestChainScore + TIE_EPSILON) {
+			bestChainScore = chainScore;
+			winners = [item];
+		} else if (tiedScores(chainScore, bestChainScore)) {
+			winners.push(item);
+		}
+	}
+	return winners.length === 1 ? winners[0] : null;
+}
+
+/** Picks the single winner among one or more anchors that all proposed to the same candidate
+ * (E2, reverse direction). A clear best text score wins outright; several anchors tied on their
+ * own match score are separated by `breakTieByChain` — how well each one's own parent chain
+ * reads against the candidate's — and if that is tied too, nobody wins this round. Never used to
+ * decide a lone claimant, and never used to compare a lower text score against a higher one —
+ * only to break an already-equal text score. */
 function pickWinner(claimants: ScoredClaim[], stored: Anchor[], candidate: Anchor): ScoredClaim | null {
 	if (claimants.length === 1) return claimants[0];
 
 	const bestScore = Math.max(...claimants.map((c) => c.score));
 	const atBestScore = claimants.filter((c) => tiedScores(c.score, bestScore));
-	if (atBestScore.length === 1) return atBestScore[0];
-
-	const candidateChain = chainText(candidate);
-	let bestChainScore = Number.NEGATIVE_INFINITY;
-	let winners: ScoredClaim[] = [];
-	for (const claim of atBestScore) {
-		// Not counted toward the E6 comparisons cap/spy — this is a tiebreak over already-tied
-		// text scores, not a tier-2/tier-3 eligibility comparison (see the file comment).
-		const chainScore = similarityModule.similarity(chainText(stored[claim.anchorIndex]), candidateChain);
-		if (chainScore > bestChainScore + TIE_EPSILON) {
-			bestChainScore = chainScore;
-			winners = [claim];
-		} else if (tiedScores(chainScore, bestChainScore)) {
-			winners.push(claim);
-		}
-	}
-	return winners.length === 1 ? winners[0] : null;
+	return breakTieByChain(atBestScore, (claim) => chainText(stored[claim.anchorIndex]), chainText(candidate));
 }
 
 /** One deferred-acceptance pass over `remaining`, repeated until no further progress is made:
@@ -358,11 +368,19 @@ async function runScoredTier(
 			if (scored.length === 0) return null;
 			const best = Math.max(...scored.map((s) => s.score));
 			const atBest = scored.filter((s) => tiedScores(s.score, best));
-			if (atBest.length > 1) {
+			if (atBest.length === 1) {
+				return { anchorIndex: p.index, candidateIdx: atBest[0].candidateIdx, score: best };
+			}
+			// E2 forward direction: several candidates tied at this one anchor's own best score.
+			// The parent chain (C14/C20) gets one chance to separate them — fixed on the
+			// anchor's own chain, varying over the tied candidates — before falling back to
+			// ambiguous; it never raises the tied text score, only discriminates between them.
+			const winner = breakTieByChain(atBest, (s) => chainText(candidates[s.candidateIdx]), chainText(stored[p.index]));
+			if (winner === null) {
 				reasonHint.set(p.index, "ambiguous");
 				return null;
 			}
-			return { anchorIndex: p.index, candidateIdx: atBest[0].candidateIdx, score: best };
+			return { anchorIndex: p.index, candidateIdx: winner.candidateIdx, score: best };
 		});
 
 		const byCandidate = new Map<number, ScoredClaim[]>();
