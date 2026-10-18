@@ -355,3 +355,106 @@ async function runScoredTier(
 
 	return remaining;
 }
+
+/** G4 Tier 2 eligibility: same kind, sibling index and indent as `anchor` (within its scope
+ * pool). Sibling index is counted per-kind by `buildAnchors`, so the kind check matters — two
+ * unrelated blocks of different kinds could otherwise coincide on a bare index number. */
+function samePositionCandidates(anchor: Anchor, pool: number[], candidates: Anchor[]): number[] {
+	return pool.filter((c) => {
+		const candidate = candidates[c];
+		return (
+			candidate.kind === anchor.kind &&
+			candidate.siblingIndex === anchor.siblingIndex &&
+			candidate.indent === anchor.indent
+		);
+	});
+}
+
+/** G4 Tier 3 eligibility: same kind as `anchor`, but *not* the same sibling-index-and-indent
+ * pair (that's Tier 2's territory) — "a block whose sibling index changed", generalized to any
+ * positional change so the two tiers partition a scope's same-kind candidates cleanly. */
+function changedPositionCandidates(anchor: Anchor, pool: number[], candidates: Anchor[]): number[] {
+	return pool.filter((c) => {
+		const candidate = candidates[c];
+		if (candidate.kind !== anchor.kind) return false;
+		return !(candidate.siblingIndex === anchor.siblingIndex && candidate.indent === anchor.indent);
+	});
+}
+
+/** G4 Tier 3's two bars, chosen by the length of the *shorter* of the two normalized strings
+ * being compared (not always the stored anchor's own text) — commented and tested per C8. */
+function fuzzyThreshold(anchorText: string, candidateText: string, opts: ResolvedOptions): number {
+	const shorterLength = Math.min(anchorText.length, candidateText.length);
+	return shorterLength >= opts.shortLongSplit ? opts.fuzzyThresholdLong : opts.fuzzyThresholdShort;
+}
+
+/**
+ * Matches every anchor in `stored` against `candidates`, returning one result per stored anchor
+ * in input order. Never throws, including on empty `stored`, empty `candidates`, or both (C24).
+ * See the file comment for the scoping, tiering, ambiguity and cap rules.
+ */
+export async function matchAnchors(
+	stored: Anchor[],
+	candidates: Anchor[],
+	options?: MatcherOptions,
+): Promise<MatchResult[]> {
+	const opts = resolveOptions(options);
+	const results: MatchResult[] = stored.map((): MatchResult => ({ tier: "none", reason: "no-candidate" }));
+	if (stored.length === 0) return results;
+
+	// E6: at most `maxFolds` stored anchors are processed at all, in stored order.
+	const cappedCount = Math.min(stored.length, Math.max(0, opts.maxFolds));
+	for (let i = cappedCount; i < stored.length; i++) {
+		results[i] = { tier: "none", reason: "capped" };
+	}
+	if (cappedCount === 0) return results;
+
+	const consumed = new Array<boolean>(candidates.length).fill(false);
+	const reasonHint = new Map<number, NoMatchReason>();
+
+	let pending: PendingAnchor[] = [];
+	for (let i = 0; i < cappedCount; i++) {
+		pending.push({ index: i, pool: scopeFor(stored[i], candidates) });
+	}
+
+	pending = runExactTier(pending, stored, candidates, consumed, results);
+	if (pending.length === 0) return results;
+
+	const budget = new ComparisonBudget(opts.maxComparisons, opts.chunkSize, opts.yieldToHost);
+
+	pending = await runScoredTier(
+		pending,
+		stored,
+		candidates,
+		consumed,
+		results,
+		reasonHint,
+		(anchor, pool) => samePositionCandidates(anchor, pool, candidates),
+		() => opts.positionalThreshold,
+		"positional",
+		budget,
+	);
+
+	if (pending.length > 0 && !budget.exhausted) {
+		pending = await runScoredTier(
+			pending,
+			stored,
+			candidates,
+			consumed,
+			results,
+			reasonHint,
+			(anchor, pool) => changedPositionCandidates(anchor, pool, candidates),
+			(anchor, candidate) => fuzzyThreshold(anchor.text, candidate.text, opts),
+			"fuzzy",
+			budget,
+		);
+	}
+
+	for (const p of pending) {
+		results[p.index] = budget.exhausted
+			? { tier: "none", reason: "capped" }
+			: { tier: "none", reason: reasonHint.get(p.index) ?? "no-candidate" };
+	}
+
+	return results;
+}
