@@ -361,8 +361,6 @@ async function runScoredTier(
 			perAnchorScored.push(scored);
 		}
 
-		if (budget.exhausted) break;
-
 		const claims: (ScoredClaim | null)[] = remaining.map((p, i) => {
 			const scored = perAnchorScored[i];
 			if (scored.length === 0) return null;
