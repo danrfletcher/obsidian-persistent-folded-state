@@ -130,20 +130,30 @@ function chainText(anchor: Anchor): string {
 	return anchor.parentChain.map((ref) => `${ref.kind}:${ref.text}`).join(" > ");
 }
 
-/** Every candidate index eligible for `stored` (G14/G7 scoping, see the file comment):
- * candidates whose full parent chain deep-equals `stored`'s, or — once that set is empty,
- * meaning some ancestor's text no longer matches at all — every candidate in the file. */
+function allCandidateIndices(candidates: Anchor[]): number[] {
+	const all: number[] = [];
+	for (let i = 0; i < candidates.length; i++) all.push(i);
+	return all;
+}
+
+/** Every candidate index eligible for `stored` (G14/G7 scoping, see the file comment). A
+ * top-level anchor (`parentChain` empty) has no parent to match or fail, so G14's scoping has
+ * nothing to restrict by — it always searches every candidate. A nested anchor's pool is every
+ * candidate whose full parent chain deep-equals `stored`'s (true siblings under the same still-
+ * recognizable ancestry), or — once that set is empty, meaning some ancestor's text no longer
+ * matches at all — every candidate in the file (the G14 fallback). Without the top-level
+ * special case, every root-level anchor would trivially "chain-match" every other root-level
+ * candidate regardless of kind (both have an empty chain), which would wrongly suppress the
+ * file-wide fallback a root-level anchor — having no parent — should always get. */
 function scopeFor(stored: Anchor, candidates: Anchor[]): number[] {
+	if (stored.parentChain.length === 0) return allCandidateIndices(candidates);
+
 	const key = chainKey(stored);
 	const exact: number[] = [];
 	for (let i = 0; i < candidates.length; i++) {
 		if (chainKey(candidates[i]) === key) exact.push(i);
 	}
-	if (exact.length > 0) return exact;
-
-	const fileWide: number[] = [];
-	for (let i = 0; i < candidates.length; i++) fileWide.push(i);
-	return fileWide;
+	return exact.length > 0 ? exact : allCandidateIndices(candidates);
 }
 
 interface PendingAnchor {
