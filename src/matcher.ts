@@ -234,3 +234,124 @@ class ComparisonBudget {
 		return value;
 	}
 }
+
+interface ScoredClaim {
+	/** Index into `stored`/`results` (not into `pending`/`remaining`). */
+	anchorIndex: number;
+	candidateIdx: number;
+	/** This claimant's own best score against `candidateIdx` — never the parent-chain score. */
+	score: number;
+}
+
+/** Picks the single winner among one or more anchors that all proposed to the same candidate.
+ * A clear best match score wins outright. Only when several anchors are tied on their own match
+ * score (E2, reverse direction) does the parent-chain tiebreak (C14) apply: separate them by how
+ * well each one's own parent chain reads against the candidate's — and if *that* is tied too,
+ * nobody wins this round. Never used to decide a lone claimant, and never used to compare a
+ * lower text score against a higher one — only to break an already-equal text score. */
+function pickWinner(claimants: ScoredClaim[], stored: Anchor[], candidate: Anchor): ScoredClaim | null {
+	if (claimants.length === 1) return claimants[0];
+
+	const bestScore = Math.max(...claimants.map((c) => c.score));
+	const atBestScore = claimants.filter((c) => tiedScores(c.score, bestScore));
+	if (atBestScore.length === 1) return atBestScore[0];
+
+	const candidateChain = chainText(candidate);
+	let bestChainScore = Number.NEGATIVE_INFINITY;
+	let winners: ScoredClaim[] = [];
+	for (const claim of atBestScore) {
+		// Not counted toward the E6 comparisons cap/spy — this is a tiebreak over already-tied
+		// text scores, not a tier-2/tier-3 eligibility comparison (see the file comment).
+		const chainScore = similarityModule.similarity(chainText(stored[claim.anchorIndex]), candidateChain);
+		if (chainScore > bestChainScore + TIE_EPSILON) {
+			bestChainScore = chainScore;
+			winners = [claim];
+		} else if (tiedScores(chainScore, bestChainScore)) {
+			winners.push(claim);
+		}
+	}
+	return winners.length === 1 ? winners[0] : null;
+}
+
+/** One deferred-acceptance pass over `remaining`, repeated until no further progress is made:
+ * every pending anchor proposes to its own best-scoring eligible, unconsumed candidate; a
+ * candidate claimed by exactly one anchor is confirmed; one claimed by several anchors is
+ * resolved by `pickWinner`. Anchors that lose a round (their candidate went to someone else, or
+ * an unbroken tie left nobody confirmed) retry next round against whatever remains — so losing
+ * a contested top choice can still end in a lower-scoring match, never in reusing a consumed
+ * candidate. Converges because every pass either confirms at least one match or leaves the
+ * state unchanged (which stops the loop), and the confirmed set only grows. */
+async function runScoredTier(
+	pending: PendingAnchor[],
+	stored: Anchor[],
+	candidates: Anchor[],
+	consumed: boolean[],
+	results: MatchResult[],
+	reasonHint: Map<number, NoMatchReason>,
+	eligibleFor: (anchor: Anchor, pool: number[]) => number[],
+	thresholdFor: (anchor: Anchor, candidate: Anchor) => number,
+	tier: "positional" | "fuzzy",
+	budget: ComparisonBudget,
+): Promise<PendingAnchor[]> {
+	let remaining = pending;
+
+	while (remaining.length > 0 && !budget.exhausted) {
+		const perAnchorScored: { candidateIdx: number; score: number }[][] = [];
+
+		for (const p of remaining) {
+			const anchor = stored[p.index];
+			const eligible = eligibleFor(anchor, p.pool).filter((c) => !consumed[c]);
+			const scored: { candidateIdx: number; score: number }[] = [];
+			for (const c of eligible) {
+				if (budget.exhausted) break;
+				const candidate = candidates[c];
+				const score = await budget.score(p.index, c, anchor.text, candidate.text);
+				if (score === null) break;
+				if (score >= thresholdFor(anchor, candidate)) scored.push({ candidateIdx: c, score });
+			}
+			if (eligible.length > 0 && scored.length === 0 && !reasonHint.has(p.index)) {
+				reasonHint.set(p.index, "below-threshold");
+			}
+			perAnchorScored.push(scored);
+		}
+
+		if (budget.exhausted) break;
+
+		const claims: (ScoredClaim | null)[] = remaining.map((p, i) => {
+			const scored = perAnchorScored[i];
+			if (scored.length === 0) return null;
+			const best = Math.max(...scored.map((s) => s.score));
+			const atBest = scored.filter((s) => tiedScores(s.score, best));
+			if (atBest.length > 1) {
+				reasonHint.set(p.index, "ambiguous");
+				return null;
+			}
+			return { anchorIndex: p.index, candidateIdx: atBest[0].candidateIdx, score: best };
+		});
+
+		const byCandidate = new Map<number, ScoredClaim[]>();
+		for (const claim of claims) {
+			if (claim === null) continue;
+			const list = byCandidate.get(claim.candidateIdx) ?? [];
+			list.push(claim);
+			byCandidate.set(claim.candidateIdx, list);
+		}
+
+		const confirmed = new Set<number>();
+		for (const [candidateIdx, claimants] of byCandidate) {
+			const winner = pickWinner(claimants, stored, candidates[candidateIdx]);
+			if (winner !== null) {
+				consumed[candidateIdx] = true;
+				results[winner.anchorIndex] = { tier, target: candidateIdx };
+				confirmed.add(winner.anchorIndex);
+			} else {
+				for (const c of claimants) reasonHint.set(c.anchorIndex, "ambiguous");
+			}
+		}
+
+		if (confirmed.size === 0) break; // no progress possible — nothing left will converge
+		remaining = remaining.filter((p) => !confirmed.has(p.index));
+	}
+
+	return remaining;
+}
