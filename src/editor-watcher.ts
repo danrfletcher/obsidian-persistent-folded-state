@@ -81,6 +81,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 		/** G13: targets a restore pass deferred because the cursor sat inside them, re-checked
 		 * on every later update (see `runRestore`/`update` below). */
 		private pendingDeferred: FoldTarget[] = [];
+		private destroyed = false;
 
 		constructor(view: EditorView) {
 			this.view = view;
@@ -102,11 +103,29 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				getActivePath: activeMarkdownPath,
 			})
 				.then((deferred) => {
+					if (this.destroyed) return;
 					this.pendingDeferred = deferred;
 				})
 				.catch((err: unknown) => {
 					console.error("persistent-folded-state: restore failed", err);
 				});
+		}
+
+		/** CM6 forbids calling `view.dispatch` (and so `view.update`) from inside an
+		 * in-progress `update()` call (`applyReadyDeferredFolds` dispatches when it has
+		 * anything ready) — so the recheck itself is deferred to a microtask, run just after
+		 * the current update cycle finishes rather than synchronously inline. A microtask
+		 * (not the 150ms settle timer) keeps G13 feeling immediate: the fold still applies the
+		 * moment the cursor leaves, not up to 150ms later. */
+		private scheduleDeferredRecheck(): void {
+			queueMicrotask(() => {
+				if (this.destroyed || this.pendingDeferred.length === 0) return;
+				try {
+					this.pendingDeferred = applyReadyDeferredFolds(this.view, this.pendingDeferred);
+				} catch (err) {
+					console.error("persistent-folded-state: deferred restore failed", err);
+				}
+			});
 		}
 
 		update(update: ViewUpdate): void {
@@ -126,15 +145,12 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			}
 
 			if (this.pendingDeferred.length > 0) {
-				try {
-					this.pendingDeferred = applyReadyDeferredFolds(update.view, this.pendingDeferred);
-				} catch (err) {
-					console.error("persistent-folded-state: deferred restore failed", err);
-				}
+				this.scheduleDeferredRecheck();
 			}
 		}
 
 		destroy(): void {
+			this.destroyed = true;
 			this.debouncer.cancel();
 			this.pendingDeferred = [];
 		}
