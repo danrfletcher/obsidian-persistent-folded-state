@@ -346,8 +346,13 @@ async function runBeforeQuit(args: Args): Promise<void> {
 		await evaluate(cdp, unfoldAllExpression());
 
 		// GP1-GP3's own baseline: fold "## Tuesday" and the task "Draft proposal", leave the
-		// sibling task "Send invoices" unfolded — exactly GP4's own starting point.
-		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Notes for Tuesday"))) as {
+		// sibling task "Send invoices" unfolded — exactly GP4's own starting point. Needle is
+		// "Tuesday" (the heading line itself), not "Notes for Tuesday" (its body text): the
+		// fixture has a blank line between the two, so a needle that only matches the body
+		// forces clickFoldIndicatorNearExpression's previousElementSibling fallback, which lands
+		// on that blank line instead of the heading and throws (T2/T4) — scripts/e2e-restore-probe.mjs
+		// already uses this same "Tuesday" needle successfully for exactly this reason.
+		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as {
 			clicked: boolean;
 			reason?: string;
 		};

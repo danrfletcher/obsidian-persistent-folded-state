@@ -306,9 +306,12 @@ function openFileExpression(vaultPath: string): string {
 (async function () {
 	const file = app.vault.getAbstractFileByPath(${JSON.stringify(vaultPath)});
 	if (!file) return { opened: false, reason: "file not found: " + ${JSON.stringify(vaultPath)} };
-	const leaves = app.workspace.getLeavesOfType("markdown");
-	for (const leaf of leaves) leaf.detach();
-	const leaf = app.workspace.getLeaf("tab");
+	// getLeaf(false) reuses the most recently active leaf (creating one if the workspace has
+	// none at all) rather than detaching every markdown leaf and asking for a brand-new tab:
+	// once this script's own detach-then-getLeaf("tab") emptied every tab group, Obsidian threw
+	// "No tab group found" on the very first open (T2/T5) — this is the same single-pane reuse
+	// a real user's own "open this file" action takes, and never needs a tab group to pre-exist.
+	const leaf = app.workspace.getLeaf(false);
 	await leaf.openFile(file);
 	return { opened: true };
 })()
@@ -343,7 +346,7 @@ async function main(): Promise<void> {
 		if (!opened.opened) throw new Error(`initial open failed: ${opened.reason ?? "unknown"}`);
 		await sleep(args.waitMs);
 		await evaluate(cdp, unfoldAllExpression());
-		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Notes for Tuesday"))) as { clicked: boolean; reason?: string };
+		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as { clicked: boolean; reason?: string };
 		if (!tuesdayClick.clicked) throw new Error(`folding "## Tuesday" failed: ${tuesdayClick.reason ?? "unknown"}`);
 		const taskClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"))) as { clicked: boolean; reason?: string };
 		if (!taskClick.clicked) throw new Error(`folding "Draft proposal" failed: ${taskClick.reason ?? "unknown"}`);
