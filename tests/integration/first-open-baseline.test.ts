@@ -173,4 +173,125 @@ describe("first-open baseline (E5/G15)", () => {
 			vi.useRealTimers();
 		}
 	});
+
+	it("R14: a disposed flag shared through deps stops the grace-recheck timer from writing to the store once the plugin has unloaded", async () => {
+		vi.useFakeTimers();
+		try {
+			const blocks = buildAnchors(TEXT);
+			const tuesday = blocks.find((b) => b.anchor.kind === "heading" && b.anchor.text === "tuesday");
+			const draftProposal = blocks.find((b) => b.anchor.kind === "task" && b.anchor.text === "draft proposal");
+			expect(tuesday).toBeDefined();
+			expect(draftProposal).toBeDefined();
+
+			const draftRange = {
+				from: lineEnd(TEXT, draftProposal!.range.startLine),
+				to: lineEnd(TEXT, draftProposal!.range.endLine),
+			};
+			const tuesdayRange = { from: lineEnd(TEXT, tuesday!.range.startLine), to: lineEnd(TEXT, tuesday!.range.endLine) };
+
+			const store = await makeStore();
+			const setSpy = vi.spyOn(store, "set");
+			const disposed = { current: false };
+			const watcher = createEditorWatcher({ store, window, firstOpenGraceMs: 150, disposed });
+			const extensions = [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))];
+
+			// Only ONE of the two live folds is visible at construction time — exactly the
+			// T20 case the grace recheck exists to catch.
+			const state1 = EditorState.create({ doc: TEXT, extensions }).update({ effects: foldEffect.of(tuesdayRange) }).state;
+			const view = new EditorView({ state: state1, parent: document.body });
+
+			expect(setSpy).toHaveBeenCalledTimes(1); // the synchronous baseline adoption only
+
+			// The second fold lands moments later via setState, exactly as the T20 test above —
+			// this would, if the timer ran its normal merge, pick it up. But main.ts's
+			// `onunload()` has set the shared `disposed` flag in between (simulating the plugin
+			// being disabled inside the grace window), so R14 says the timer must become a
+			// no-op instead.
+			const state2 = EditorState.create({
+				doc: state1.doc,
+				selection: state1.selection,
+				extensions,
+			}).update({ effects: [foldEffect.of(tuesdayRange), foldEffect.of(draftRange)] }).state;
+			await vi.advanceTimersByTimeAsync(10);
+			view.setState(state2);
+			disposed.current = true;
+
+			await vi.advanceTimersByTimeAsync(200);
+
+			// No further write happened: the stored record still only has the one anchor the
+			// synchronous constructor-time read captured.
+			expect(setSpy).toHaveBeenCalledTimes(1);
+			const record = store.get(NOTE_PATH);
+			const storedKeys = (record?.folds ?? []).map((raw) => anchorKey(raw as unknown as Anchor)).sort();
+			expect(storedKeys).toEqual([anchorKey(tuesday!.anchor)]);
+
+			view.destroy();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("R14: a pane that navigates to a different file with identical text before the grace recheck fires never merges into the original file's entry", async () => {
+		vi.useFakeTimers();
+		try {
+			const OTHER_PATH = "Projects/Quarry/Other.md";
+			const blocks = buildAnchors(TEXT);
+			const tuesday = blocks.find((b) => b.anchor.kind === "heading" && b.anchor.text === "tuesday");
+			const draftProposal = blocks.find((b) => b.anchor.kind === "task" && b.anchor.text === "draft proposal");
+			expect(tuesday).toBeDefined();
+			expect(draftProposal).toBeDefined();
+
+			const draftRange = {
+				from: lineEnd(TEXT, draftProposal!.range.startLine),
+				to: lineEnd(TEXT, draftProposal!.range.endLine),
+			};
+			const tuesdayRange = { from: lineEnd(TEXT, tuesday!.range.startLine), to: lineEnd(TEXT, tuesday!.range.endLine) };
+
+			const store = await makeStore();
+			const watcher = createEditorWatcher({ store, window, firstOpenGraceMs: 150 });
+			const extensionsForNote = [
+				codeFolding(),
+				watcher,
+				editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } })),
+			];
+
+			const state1 = EditorState.create({ doc: TEXT, extensions: extensionsForNote }).update({
+				effects: foldEffect.of(tuesdayRange),
+			}).state;
+			const view = new EditorView({ state: state1, parent: document.body });
+
+			const immediatelyAfterOpen = store.get(NOTE_PATH);
+			expect((immediatelyAfterOpen?.folds ?? []).length).toBe(1);
+
+			// Obsidian reuses this same pane for a *different* note, OTHER_PATH, whose text
+			// happens to be identical to TEXT (e.g. two notes seeded from the same template),
+			// with the second fold also live — all within the grace window. This must not be
+			// mistaken for "the same file, now with another fold captured".
+			const extensionsForOther = [
+				codeFolding(),
+				watcher,
+				editorInfoField.init(() => ({ file: { path: OTHER_PATH, extension: "md" } })),
+			];
+			const state2 = EditorState.create({
+				doc: state1.doc,
+				selection: state1.selection,
+				extensions: extensionsForOther,
+			}).update({ effects: [foldEffect.of(tuesdayRange), foldEffect.of(draftRange)] }).state;
+			await vi.advanceTimersByTimeAsync(10);
+			view.setState(state2);
+
+			await vi.advanceTimersByTimeAsync(200);
+
+			// NOTE_PATH's own entry is untouched by the stale recheck — still just the one
+			// anchor from the original synchronous read, not merged with the second fold that
+			// was only ever live for OTHER_PATH.
+			const record = store.get(NOTE_PATH);
+			const storedKeys = (record?.folds ?? []).map((raw) => anchorKey(raw as unknown as Anchor)).sort();
+			expect(storedKeys).toEqual([anchorKey(tuesday!.anchor)]);
+
+			view.destroy();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

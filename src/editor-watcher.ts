@@ -84,6 +84,21 @@
  * and runs detached from `update()` (dispatching happens once the match resolves, not
  * synchronously) — a rejection there is caught and logged the same way, never left as an
  * unhandled promise rejection.
+ *
+ * R14: the grace-recheck timer `scheduleFirstOpenGraceRecheck` schedules checks a shared
+ * `disposed` flag (`EditorWatcherDeps.disposed`) first, before anything else, and bails out if
+ * set. main.ts sets `disposed.current = true` once, from its own `onunload()`, when the whole
+ * plugin unloads. Without that check, disabling the plugin within the ~150ms grace window would
+ * leave the timer armed against the old `FoldStore` — if the plugin were re-enabled in that same
+ * short window, the stale timer firing later could call `store.set` on a `FoldStore` instance
+ * nothing else still uses, clobbering whatever the new instance already wrote on its next
+ * debounced save. This is deliberately a flag shared across every `ViewPlugin` instance one
+ * `createEditorWatcher` call creates, not any one instance's own `this.destroyed` — that already
+ * goes true on an ordinary single-pane CM6 reconfigure (T20, directly above), which must NOT
+ * suppress this recheck. The recheck also re-checks `activeMarkdownPath(this.view) === path`
+ * right before merging (not just the doc-text check already there), so a pane that has since
+ * switched to a *different* file whose text happens to match `textAtAdoption` exactly is never
+ * merged into the wrong store entry.
  */
 import { ChangeSet } from "@codemirror/state";
 import { ViewPlugin, type EditorView, type ViewUpdate, type PluginValue } from "@codemirror/view";
@@ -126,6 +141,15 @@ export interface EditorWatcherDeps {
 	 * captured by the synchronous read. Overridable only for tests; defaults to the same
 	 * 150ms E9 already treats as "settled" elsewhere in this file. */
 	firstOpenGraceMs?: number;
+	/** R14: a flag shared across every `ViewPlugin` instance this `createEditorWatcher` call
+	 * creates (one `deps` object per call — see the file comment). main.ts sets
+	 * `.current = true` from its own `onunload()`, once, when the whole plugin unloads, so a
+	 * grace-recheck timer still pending at that moment (see
+	 * `scheduleFirstOpenGraceRecheck`) becomes a no-op rather than writing to a `FoldStore`
+	 * instance a freshly re-enabled plugin has already replaced. Deliberately not derived
+	 * from any one `ViewPlugin` instance's own `destroyed` flag, which also goes true on an
+	 * ordinary single-pane CM6 reconfigure (T20) that must NOT suppress this recheck. */
+	disposed?: { current: boolean };
 }
 
 function activeMarkdownPath(view: EditorView): string | null {
@@ -215,6 +239,18 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			const win = deps.window ?? window;
 			const view = this.view;
 			win.setTimeout(() => {
+				// R14: the whole Obsidian plugin may have unloaded since this timer was
+				// scheduled — checked first, ahead of any other liveness check. This is
+				// deliberately a flag shared (via `deps`) across every `ViewPlugin` instance
+				// this one `createEditorWatcher` call ever creates, not `this.destroyed`:
+				// `this.destroyed` (and CM6 itself, via `EditorView.setState`/reconfigure —
+				// see below) already goes true whenever just *this one pane* is reconfigured
+				// while the plugin stays loaded, which must NOT cancel this recheck (that's
+				// the whole point of T20, directly below). Only main.ts's own `onunload` sets
+				// `deps.disposed.current`, so this is the one check that's actually scoped to
+				// "the plugin itself went away", guarding against a late `store.set` landing on
+				// a `FoldStore` instance a freshly re-enabled plugin has already replaced.
+				if (deps.disposed?.current) return;
 				// Deliberately not `this.destroyed`: real Obsidian (and `EditorView.setState`,
 				// which CM6 treats as "recreate every ViewPlugin fresh" rather than as an
 				// incremental update — see T20) can tear down and replace *this* ViewPlugin
@@ -226,6 +262,11 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				if (!view.dom.isConnected) return;
 				try {
 					if (this.view.state.doc.toString() !== textAtAdoption) return;
+					// R14: the pane may since have navigated to a *different* file whose text
+					// happens to match `textAtAdoption` exactly (e.g. two notes seeded from the
+					// same template) — only merge if it's still showing the file this baseline
+					// was adopted for.
+					if (activeMarkdownPath(this.view) !== path) return;
 					const latest = deps.store.get(path);
 					if (!latest) return;
 

@@ -34,6 +34,13 @@
  * external change on that pane is ever recorded by the plugin the user can actually observe
  * (`this.store`) again. `onload()` calls `updateOptions()` itself, right after registering,
  * instead of assuming `registerEditorExtension` already does it.
+ *
+ * R14 (PR-6): `editorWatcherDisposed` is the `disposed` flag `createEditorWatcher` shares across
+ * every `ViewPlugin` instance it creates (src/editor-watcher.ts). `onunload()` sets
+ * `.current = true` on it, once, so any first-open-baseline grace-recheck timer still pending at
+ * that moment (src/editor-watcher.ts's `scheduleFirstOpenGraceRecheck`) becomes a no-op instead
+ * of writing to this now-orphaned `this.store` — guarding against the narrow case where the
+ * plugin is disabled and re-enabled within that same short (~150ms) window.
  */
 import { Events, Plugin } from "obsidian";
 import { FoldStore } from "./fold-store";
@@ -48,6 +55,9 @@ export const SETTLED_NON_USER_CHANGE_EVENT = "settled-non-user-change";
 export default class PersistentFoldedStatePlugin extends Plugin {
 	store!: FoldStore;
 	readonly events = new Events();
+	/** R14: shared with every `createEditorWatcher`-created `ViewPlugin` instance; set once
+	 * `onunload()` runs. See the file comment. */
+	private readonly editorWatcherDisposed = { current: false };
 
 	async onload(): Promise<void> {
 		this.store = new FoldStore({
@@ -62,6 +72,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 			createEditorWatcher({
 				store: this.store,
 				onSettledNonUserChange: (path, text) => this.events.trigger(SETTLED_NON_USER_CHANGE_EVENT, path, text),
+				disposed: this.editorWatcherDisposed,
 			})
 		);
 		// T2: forces every already-open pane onto the extension just registered above (and
@@ -83,6 +94,8 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	}
 
 	onunload(): void {
+		// R14: must run before `flushAtOnce()` can do anything async — see the file comment.
+		this.editorWatcherDisposed.current = true;
 		this.flushAtOnce();
 	}
 
