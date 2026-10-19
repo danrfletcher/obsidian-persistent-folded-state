@@ -6,11 +6,13 @@
  * of any kind here: the caller (src/editor-watcher.ts, src/fold-restorer.ts) only ever calls
  * `FoldStore.set` with this function's own output, never `view.dispatch`.
  *
- * Reads folds from CM6's own `foldedRanges` (`@codemirror/language`) — never Obsidian's own
- * separate fold-state store (F9). `state` and `text` are expected to describe the same document
- * (`state.doc.toString() === text`) at every real call site: `text` alone decides the content
- * hash and the PR-3 candidate set a live fold is matched against; `state` alone decides which
- * ranges are actually folded right now.
+ * Reads folds via `src/live-folds.ts`'s `liveFoldedLineRanges`, which wraps CM6's own
+ * `foldedRanges` (`@codemirror/language`) — never Obsidian's own separate fold-state store (F9).
+ * `state` and `text` are expected to describe the same document (`state.doc.toString() === text`)
+ * at every real call site: `text` alone decides the content hash and the PR-3 candidate set a
+ * live fold is matched against; `state` alone decides which ranges are actually folded right now.
+ * `liveFoldedLineRanges` normalizes a fold ending at EOF to the same line `buildAnchors` would
+ * give that block (T1), so the exact `rangeKey` lookup below actually finds it.
  *
  * E5: a live-folded range that doesn't land exactly on one of `buildAnchors(text)`'s own block
  * ranges (e.g. a selection fold CM6 allows that doesn't correspond to any one foldable block) is
@@ -21,26 +23,15 @@
  * from a live range to its matching candidate is a single `Map` pass (O(live folds + candidates),
  * never O(live folds * candidates)), so this never meaningfully blocks typing (E6).
  */
-import { foldedRanges } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
 import { buildAnchors, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
 import { hashText } from "./fold-store";
 import { MAX_FOLDS } from "./matcher";
+import { liveFoldedLineRanges } from "./live-folds";
 
 export interface Baseline {
 	contentHash: string;
 	anchors: Anchor[];
-}
-
-/** Every range CM6 currently shows as folded in `state`, as 1-indexed inclusive line numbers —
- * the same `{from,to}` → line-number conversion `src/fold-restorer.ts`'s `currentFoldedLineRanges`
- * uses, so a live range here lines up exactly with an `AnchoredBlock.range` from `buildAnchors`. */
-function liveFoldedLineRanges(state: EditorState): LineRange[] {
-	const ranges: LineRange[] = [];
-	foldedRanges(state).between(0, state.doc.length, (from, to) => {
-		ranges.push({ startLine: state.doc.lineAt(from).number, endLine: state.doc.lineAt(to).number });
-	});
-	return ranges;
 }
 
 function rangeKey(range: LineRange): string {

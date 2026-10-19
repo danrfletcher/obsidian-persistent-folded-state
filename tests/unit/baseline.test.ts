@@ -96,6 +96,42 @@ describe("buildBaseline: an unbuildable range is skipped, not half-stored (E5)",
 	});
 });
 
+describe("buildBaseline: T1 — a fold ending at EOF agrees with buildAnchors' endLine", () => {
+	it("a trailing heading (the last block in the file) folded to doc.length is still adopted", () => {
+		// Every real note ends in a single trailing newline, so CM6's live fold for the last
+		// foldable block always has `to === state.doc.length`, landing one line past
+		// buildAnchors' own endLine for that block (which never counts a trailing blank line —
+		// see anchors.ts's splitLines). Before T1 this range never matched any candidate and the
+		// heading fold was silently skipped as "unbuildable" even though it was representable.
+		const text = "## Tuesday\n\nNotes for Tuesday.\n";
+		const blocks = buildAnchors(text);
+		const heading = blocks.find((b) => b.anchor.kind === "heading")!;
+		expect(heading).toBeDefined();
+
+		// The live range CM6 actually reports: from the start of the heading's line to the very
+		// end of the document (not `lineEnd(text, heading.range.endLine)`, which is the point).
+		const range = { from: 0, to: text.length };
+		const state = stateWithFolds(text, [range]);
+		const baseline = buildBaseline(state, text);
+
+		expect(baseline.anchors).toHaveLength(1);
+		expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(heading.anchor));
+	});
+
+	it("a document with no trailing newline needs no adjustment", () => {
+		const text = "## Tuesday\n\nNotes for Tuesday."; // no trailing \n
+		const blocks = buildAnchors(text);
+		const heading = blocks.find((b) => b.anchor.kind === "heading")!;
+
+		const range = { from: 0, to: text.length };
+		const state = stateWithFolds(text, [range]);
+		const baseline = buildBaseline(state, text);
+
+		expect(baseline.anchors).toHaveLength(1);
+		expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(heading.anchor));
+	});
+});
+
 describe("buildBaseline: E6 cap", () => {
 	it("never adopts more than MAX_FOLDS anchors even if more blocks are live-folded", () => {
 		const lines: string[] = [];
