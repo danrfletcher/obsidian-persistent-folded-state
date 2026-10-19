@@ -109,6 +109,12 @@ export class Workspace {
 	getActiveViewOfType<T>(type: new (...args: never[]) => T): T | null {
 		return this.active instanceof type ? (this.active as T) : null;
 	}
+	/** T2: real Obsidian's `registerEditorExtension` only updates the plugin's own extension
+	 * array — per obsidian.d.ts's own doc comment, applying that change to every already-open
+	 * editor requires an explicit `Workspace.updateOptions()` call. The mock is a no-op spy
+	 * target: tests assert it was actually called, since nothing here can simulate a real CM6
+	 * reconfigure of an already-open pane. */
+	updateOptions(): void {}
 }
 
 export class App {

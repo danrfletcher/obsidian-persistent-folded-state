@@ -23,6 +23,17 @@
  * restore is wired entirely inside `createEditorWatcher`'s own `ViewPlugin`, keyed off the same
  * `store` already passed in below, so nothing changes here in main.ts: no new dependency, no
  * new event, no new command (F10 still holds — the registered command list is unchanged).
+ *
+ * T2 (PR-6): `registerEditorExtension` only appends to this plugin's own extension array — per
+ * obsidian.d.ts's own doc comment ("Once this array is modified, calling
+ * Workspace.updateOptions() will apply the changes"), nothing reconfigures an *already-open*
+ * pane's CM6 extensions until something calls `Workspace.updateOptions()`. Without that call, a
+ * pane that was already open when the plugin was disabled keeps running the `ViewPlugin`
+ * instance from before the disable — closed over the previous `onload()`'s now-orphaned
+ * `FoldStore` — for the rest of the Obsidian session: it never sees the fresh store, so no
+ * external change on that pane is ever recorded by the plugin the user can actually observe
+ * (`this.store`) again. `onload()` calls `updateOptions()` itself, right after registering,
+ * instead of assuming `registerEditorExtension` already does it.
  */
 import { Events, Plugin } from "obsidian";
 import { FoldStore } from "./fold-store";
@@ -53,6 +64,12 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 				onSettledNonUserChange: (path, text) => this.events.trigger(SETTLED_NON_USER_CHANGE_EVENT, path, text),
 			})
 		);
+		// T2: forces every already-open pane onto the extension just registered above (and
+		// thus the fresh `this.store` it closes over) right now, rather than depending on
+		// whatever else might eventually call `updateOptions()` — in particular, a pane that
+		// was already open across a disable/re-enable cycle, which is otherwise never
+		// reconfigured for the rest of the session (see the file comment's T2 entry).
+		this.app.workspace.updateOptions();
 
 		// E12: a mobile app kill, backgrounding the app or switching tabs can all end a session
 		// without `onunload` ever running — flush at once (not after the 150ms debounce) on each.
