@@ -132,6 +132,44 @@ describe("buildBaseline: T1 — a fold ending at EOF agrees with buildAnchors' e
 	});
 });
 
+describe("buildBaseline: T22 — a live fold narrower than its candidate by a trailing blank separator line is still adopted", () => {
+	it("a click-folded list item (narrower CM6 range) still resolves to buildAnchors' wider candidate", () => {
+		// tests/fixtures/tasks-before.md's own shape: "Plain list item" (line 1) has a nested
+		// child (line 2) and is followed by a blank separator line (line 3) before its next
+		// sibling, a task, at line 4. buildAnchors' closeFramesAbove swallows that blank line
+		// into the list item's own candidate range (1:3), but a live fold made by directly
+		// clicking the list item's own fold indicator only ever covers its own content (1:2) —
+		// it has no notion of what blank line follows it.
+		const text = "- Plain list item\n\t- A nested list item\n\n- [ ] Draft proposal\n";
+		const blocks = buildAnchors(text);
+		const listItem = blocks.find((b) => b.anchor.kind === "list" && b.anchor.text === "plain list item")!;
+		expect(listItem).toBeDefined();
+		expect(listItem.range).toEqual({ startLine: 1, endLine: 3 });
+
+		// The live range CM6 actually reports for a direct-click fold: only through the nested
+		// child's own line (2), not the trailing blank separator (3) buildAnchors swallows.
+		const narrowRange = { from: lineEnd(text, 1), to: lineEnd(text, 2) };
+		const state = stateWithFolds(text, [narrowRange]);
+		const baseline = buildBaseline(state, text);
+
+		expect(baseline.anchors).toHaveLength(1);
+		expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(listItem.anchor));
+	});
+
+	it("never widens a live range that is already wider than or equal to its candidate", () => {
+		// A frontmatter-style fixed range: the live fold already lands exactly on the
+		// candidate, so the T22 fallback must never fire (and must never narrow anything).
+		const text = "---\ntags: [test]\n---\n## Tuesday\n";
+		const blocks = buildAnchors(text);
+		const frontmatter = blocks.find((b) => b.anchor.kind === "frontmatter")!;
+		const range = { from: lineEnd(text, frontmatter.range.startLine), to: lineEnd(text, frontmatter.range.endLine) };
+		const state = stateWithFolds(text, [range]);
+		const baseline = buildBaseline(state, text);
+		expect(baseline.anchors).toHaveLength(1);
+		expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(frontmatter.anchor));
+	});
+});
+
 describe("buildBaseline: E6 cap", () => {
 	it("never adopts more than MAX_FOLDS anchors even if more blocks are live-folded", () => {
 		const lines: string[] = [];

@@ -294,4 +294,62 @@ describe("first-open baseline (E5/G15)", () => {
 			vi.useRealTimers();
 		}
 	});
+
+	it("T22: a live fold narrower than its candidate by a trailing blank separator line is still merged by the grace recheck", async () => {
+		// A click-folded list item only ever covers its own content — it has no notion of the
+		// blank separator line `buildAnchors`' closeFramesAbove swallows into the block's own
+		// candidate range when a blank line sits between it and its next sibling (T22). This is
+		// the real-Obsidian shape tests/fixtures/tasks-before.md's "Plain list item" (lines 14-15
+		// live vs 14-16 candidate) exercised against the real container.
+		const TEXT_T22 = "## Tuesday\n\n- Plain list item\n	- A nested list item\n\n- [ ] Draft proposal\n	- [ ] Sub task\n";
+		vi.useFakeTimers();
+		try {
+			const blocks = buildAnchors(TEXT_T22);
+			const listItem = blocks.find((b) => b.anchor.kind === "list" && b.anchor.text === "plain list item");
+			const draftProposal = blocks.find((b) => b.anchor.kind === "task" && b.anchor.text === "draft proposal");
+			expect(listItem).toBeDefined();
+			expect(draftProposal).toBeDefined();
+			expect(listItem!.range).toEqual({ startLine: 3, endLine: 5 }); // swallows the blank line (4->5)
+
+			const draftRange = {
+				from: lineEnd(TEXT_T22, draftProposal!.range.startLine),
+				to: lineEnd(TEXT_T22, draftProposal!.range.endLine),
+			};
+			// What CM6 actually reports for a direct click-fold on the list item: through its
+			// nested child's own line (4), not the trailing blank separator (5).
+			const narrowListRange = { from: lineEnd(TEXT_T22, listItem!.range.startLine), to: lineEnd(TEXT_T22, 4) };
+
+			const store = await makeStore();
+			const watcher = createEditorWatcher({ store, window, firstOpenGraceMs: 150 });
+			const extensions = [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))];
+
+			// Only the task's fold is visible at the moment the ViewPlugin's constructor runs.
+			const state1 = EditorState.create({ doc: TEXT_T22, extensions }).update({ effects: foldEffect.of(draftRange) }).state;
+			const view = new EditorView({ state: state1, parent: document.body });
+
+			const immediatelyAfterOpen = store.get(NOTE_PATH);
+			expect((immediatelyAfterOpen?.folds ?? []).length).toBe(1);
+
+			// The list item's (narrower) fold lands moments later via a full state reset, well
+			// inside the grace window.
+			const state2 = EditorState.create({
+				doc: state1.doc,
+				selection: state1.selection,
+				extensions,
+			}).update({ effects: [foldEffect.of(narrowListRange), foldEffect.of(draftRange)] }).state;
+			await vi.advanceTimersByTimeAsync(10);
+			view.setState(state2);
+
+			await vi.advanceTimersByTimeAsync(200);
+
+			const record = store.get(NOTE_PATH);
+			expect(record?.contentHash).toBe(hashText(TEXT_T22));
+			const storedKeys = (record?.folds ?? []).map((raw) => anchorKey(raw as unknown as Anchor)).sort();
+			expect(storedKeys).toEqual([anchorKey(draftProposal!.anchor), anchorKey(listItem!.anchor)].sort());
+
+			view.destroy();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });
