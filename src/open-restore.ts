@@ -36,17 +36,20 @@
  *
  * E4 (replacing, not just adding to, native restore): the one thing this file's hash-changed
  * branch does that `restoreSettledChange` never needs to is explicitly *unfold* something.
- * `liveFoldedLineRanges` is read once, before anything else, to capture whatever Obsidian's own
- * native restore already applied to this fresh pane (T13 — real Obsidian can reapply a line
- * range as a side effect of reloading an externally-changed file, before this plugin ever runs).
- * Every range the shared match actually decided on (tier !== "none", active or dormant alike,
- * deferred-for-G13 ones included — those are still "matched", simply not dispatched yet) is
- * collected into one `matched` list and handed to `reconcileNativeRestore`
+ * `liveFoldedLineRanges` is read once, synchronously, before anything else, to capture whatever
+ * Obsidian's own native restore has applied to this fresh pane *so far* (T13 — real Obsidian can
+ * reapply a line range as a side effect of reloading an externally-changed file, before this
+ * plugin ever runs). Every range the shared match actually decided on (tier !== "none", active
+ * or dormant alike, deferred-for-G13 ones included — those are still "matched", simply not
+ * dispatched yet) is collected into one `matched` list and handed to `reconcileNativeRestore`
  * (src/vault-lifecycle.ts) alongside the native list: anything native that isn't in `matched` at
  * all is a stale offset (equal line count, changed content is exactly what gives native restore
  * no way to tell it's folding the wrong thing) and is unfolded outright, tagged with the same
  * `OWN_FOLD_ANNOTATION` as every other effect this plugin ever dispatches (so it is never
- * mistaken for a fresh user unfold and fed back into the map).
+ * mistaken for a fresh user unfold and fed back into the map). T1: that one synchronous capture
+ * is not reliably the end of native restore's own story for this pane — see
+ * `scheduleNativeRestoreGuard`'s own comment, further down this file, for the late-arrival case
+ * and the short guard window that re-corrects it.
  *
  * G13 on open: `cursorLineOf` is still read and passed through to `planRestore`, so a block the
  * cursor already sits inside (Obsidian restores cursor position too) is deferred rather than
@@ -61,7 +64,7 @@
  */
 import { foldEffect, unfoldEffect } from "@codemirror/language";
 import type { EditorView } from "@codemirror/view";
-import { anchorKey, buildAnchors, parseAnchor, type Anchor, type LineRange } from "./anchors";
+import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
 import { liveFoldedLineRanges } from "./live-folds";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
 import { planRestore } from "./restore-plan";
@@ -136,6 +139,85 @@ function dispatchFoldAndUnfold(view: EditorView, toFold: readonly LineRange[], t
 	view.dispatch({ effects, annotations: OWN_FOLD_ANNOTATION.of(true) });
 }
 
+/** T1: real Obsidian has been observed applying its own native per-session fold restore for a
+ * freshly (re)opened leaf *after* this file's own `restoreOnOpen` already ran and dispatched its
+ * E4 correction below — specifically for the equal-line-count/reordered-heading shape (a stale
+ * offset that used to be valid now lands on a different, still-foldable block, rather than on
+ * non-foldable text the way GP4's own fixture happens to). `restoreOnOpen`'s one synchronous
+ * `liveFoldedLineRanges` capture, and the one `reconcileNativeRestore`/dispatch pair that follows
+ * it, both assumed native restore had already finished by then; sometimes it hasn't, and the
+ * late arrival (whether it shows up as its own extra transaction or as Obsidian swapping the
+ * view's whole state) wins, clobbering the correction. This re-runs the same reconciliation at a
+ * couple of short delays afterwards so a late arrival still gets corrected instead of silently
+ * standing. Each check is independent and a no-op (dispatches nothing, touches the store not at
+ * all) once the live state already agrees with `matched` — the ordinary, already-synchronous
+ * case this guards against never fires a second dispatch. Bails out (without touching the view
+ * or the store) once the pane has gone away or moved on to different text, so a guard scheduled
+ * for one open can never act against a later one in the same pane. */
+const NATIVE_RESTORE_GUARD_DELAYS_MS: readonly number[] = [50, 300];
+
+/** T1: the one concrete side effect a late, untagged native-restore transaction has been
+ * observed causing live — `src/fold-recorder.ts`'s own `recordFoldEffects` runs on every
+ * transaction carrying a fold effect, tagged or not, so native restore reapplying a stale offset
+ * gets recorded as if the user had just folded that block, planting a brand-new (and wrong)
+ * active anchor. Once this guard's own reconciliation has decided a live range is stale (not in
+ * the matched set at all — see `reconcileNativeRestore`), this removes whatever anchor the
+ * candidate at that same range maps to from the stored `folds` list, if it's there, rather than
+ * leaving it to linger as a dangling entry nothing ever folds again correctly. Never touches
+ * `dormant`, and never removes an anchor the matched set still wants — only ones a
+ * `reconcileNativeRestore` call already decided have no claim on it at all. */
+function cleanupSpuriousNativeFolds(
+	store: FoldStore,
+	path: string,
+	candidates: readonly AnchoredBlock[],
+	staleRanges: readonly LineRange[],
+): void {
+	if (staleRanges.length === 0) return;
+	const latest = store.get(path);
+	if (!latest) return;
+
+	const folds = new Map<string, StoredAnchor>();
+	for (const raw of latest.folds) {
+		const anchor = parseAnchor(raw);
+		if (anchor) folds.set(anchorKey(anchor), raw);
+	}
+
+	let changed = false;
+	for (const range of staleRanges) {
+		const candidate = candidates.find((c) => sameRange(c.range, range));
+		if (!candidate) continue;
+		if (folds.delete(anchorKey(candidate.anchor))) changed = true;
+	}
+	if (changed) {
+		store.set(path, { contentHash: latest.contentHash, folds: Array.from(folds.values()), dormant: latest.dormant });
+	}
+}
+
+/** T1: schedules `NATIVE_RESTORE_GUARD_DELAYS_MS`'s own re-checks — see that constant's comment
+ * for why this exists. `matched` and `candidates` are exactly what the caller already computed
+ * for its own (possibly too-early) reconciliation; this just re-applies the same decision later. */
+function scheduleNativeRestoreGuard(
+	view: EditorView,
+	expectedText: string,
+	candidates: readonly AnchoredBlock[],
+	matched: readonly LineRange[],
+	store: FoldStore,
+	path: string,
+	win: Window,
+	delaysMs: readonly number[] = NATIVE_RESTORE_GUARD_DELAYS_MS,
+): void {
+	for (const delay of delaysMs) {
+		win.setTimeout(() => {
+			if (!view.dom.isConnected) return; // the pane was destroyed since this open
+			if (view.state.doc.toString() !== expectedText) return; // moved on (edit, or a different file)
+			const nativeFolded = liveFoldedLineRanges(view.state);
+			const { toFold, toUnfold } = reconcileNativeRestore(nativeFolded, matched);
+			dispatchFoldAndUnfold(view, toFold, toUnfold);
+			cleanupSpuriousNativeFolds(store, path, candidates, toUnfold);
+		}, delay);
+	}
+}
+
 /** G8 (hash unchanged): applies `folds` as stored, with no matching at all — content is
  * byte-identical to what was last stored, so every stored anchor's `anchorKey` necessarily maps
  * 1:1 onto a candidate built fresh from this same text. Only ever folds (idempotently); never
@@ -178,7 +260,8 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 	}
 
 	// G8 (hash differs): the file changed while it was closed. Captured before anything else
-	// touches the view, so this reflects exactly what Obsidian's own native restore applied.
+	// touches the view — this reflects whatever Obsidian's own native restore has applied *so
+	// far*, not necessarily all of it (T1: scheduleNativeRestoreGuard re-checks this later).
 	const nativeFolded = liveFoldedLineRanges(view.state);
 
 	const storedAnchors: Anchor[] = [];
@@ -191,6 +274,10 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 		// matched set unfolds every native fold outright (E4).
 		dispatchFoldAndUnfold(view, [], nativeFolded);
 		deps.store.set(path, { contentHash: currentHash, folds: [], dormant: [] });
+		// T1: native restore for this pane can still land after this handler already
+		// returned — see scheduleNativeRestoreGuard's own comment. Nothing is ever matched
+		// here, so every guard check keeps unfolding anything native that shows up late.
+		scheduleNativeRestoreGuard(view, text, buildAnchors(text), [], deps.store, path, deps.window ?? window);
 		return;
 	}
 
@@ -259,6 +346,11 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 	const { toUnfold } = reconcileNativeRestore(nativeFolded, matchedRanges);
 	const toFold = [...plan.toFold, ...dormantPlan.toFold].map((t) => t.range);
 	dispatchFoldAndUnfold(view, toFold, toUnfold);
+	// T1: see scheduleNativeRestoreGuard's own comment — the capture above is a single
+	// synchronous snapshot, and real Obsidian has been observed applying its own native
+	// restore for this exact pane *after* it, clobbering this dispatch. Re-checks the same
+	// `matchedRanges` decision a couple more times shortly afterwards.
+	scheduleNativeRestoreGuard(view, text, candidates, matchedRanges, deps.store, path, win);
 
 	// Bookkeeping delta against a fresh store read (E3) — same discipline as restoreSettledChange.
 	const latest = deps.store.get(path);

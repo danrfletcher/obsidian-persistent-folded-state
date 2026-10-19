@@ -18,8 +18,10 @@ import {
 	TFile as MockTFile,
 	Vault as MockVault,
 	Workspace as MockWorkspace,
+	editorInfoField,
 } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
+import { createEditorWatcher } from "../../src/editor-watcher";
 import { buildAnchors } from "../../src/anchors";
 import { hashText } from "../../src/fold-store";
 import type { FileFoldRecord } from "../../src/types";
@@ -220,6 +222,61 @@ describe("open-restore via the plugin's file-open handler", () => {
 		expect(after?.contentHash).toBe(hashText(TEXT_V3));
 		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1: only fold state changed, never the text
 	});
+
+	it("T1: a native restore that arrives after file-open's own synchronous handlers run is still corrected, and the spurious anchor it would otherwise plant is cleaned up", async () => {
+		const app = new App();
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } },
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+
+		// Same TEXT_V3 reorder as the test above (equal line count, "## Tuesday" moved to
+		// lines 3-4), but this time nothing is folded before file-open at all: real Obsidian's
+		// own native restore for this exact scenario has been observed, live, to land only
+		// *after* file-open's own synchronous handlers already ran (T1), not before. Simulated
+		// here as an untagged transaction dispatched a few ms into the open — through the
+		// plugin's own `createEditorWatcher` extension, the same one a real pane runs, so the
+		// spurious-anchor side effect (src/fold-recorder.ts recording it as a fresh user fold)
+		// is exercised for real, not assumed away.
+		const watcher = createEditorWatcher({ store: plugin.store, window });
+		const state = EditorState.create({
+			doc: TEXT_V3,
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		const view = new EditorView({ state, parent: document.body });
+
+		openFile(app, NOTE_PATH, view);
+		// Gives restoreOnOpen's own (microtask-fast, nothing to chunk here) initial match and
+		// dispatch time to finish correctly folding "## Tuesday" before the late arrival lands.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		const staleFrom = view.state.doc.line(1).to;
+		const staleTo = view.state.doc.line(2).to;
+		// Deliberately untagged (no OWN_FOLD_ANNOTATION) — this is what a late, genuinely
+		// native restore transaction looks like to src/fold-recorder.ts.
+		view.dispatch({ effects: foldEffect.of({ from: staleFrom, to: staleTo }) });
+
+		await settle();
+
+		// scheduleNativeRestoreGuard's next check (src/open-restore.ts) notices the live state
+		// no longer agrees with the matched set and corrects it: "## Tuesday" (lines 3-4) folded,
+		// the stale "## Wednesday" offset (lines 1-2) gone.
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+
+		// Without the T1 fix, the untagged late transaction above gets recorded by
+		// src/fold-recorder.ts as a fresh user fold of "## Wednesday"; cleanupSpuriousNativeFolds
+		// (src/open-restore.ts) removes exactly that entry instead of leaving it to linger in
+		// data.json as a legitimate anchor nothing will ever correctly apply again.
+		const after = plugin.store.get(NOTE_PATH);
+		expect(after?.folds).toHaveLength(1);
+		expect((after?.folds[0] as unknown as { text: string }).text).toBe("tuesday");
+		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1: only fold state changed, never the text
+	}, 10000);
 
 	it("G8 hash changed: several stored folds that match nothing all go dormant, leaving the note fully unfolded, without throwing", async () => {
 		const app = new App();
