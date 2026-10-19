@@ -15,7 +15,8 @@
  * Runs two cases, both from R7's corrected phase list:
  *
  *  - closeAndReopen: disable the plugin, clear its data.json entry for --note while disabled,
- *    fold the heading and the task by hand (native CM6 fold, same as a user would), enable the
+ *    fold the task and its sibling list item by hand (native CM6 fold, same as a user would —
+ *    see T14 below for why these two, not a heading and its own nested child), enable the
  *    plugin, then close and reopen --note in a fresh pane. The constructor-time baseline check
  *    in src/editor-watcher.ts only runs once, synchronously, when a `ViewPlugin` is built for a
  *    pane — this is the ordinary "a never-before-seen pane opens a file Obsidian already shows
@@ -31,14 +32,33 @@
  *    already-open pane pick up the freshly re-enabled extension at all — this case is also the
  *    only thing in this repo that exercises that fix against a real, already-open editor.
  *
- * Both cases assert: two anchors in data.json (the heading candidate plus the task candidate —
- * T1/T5/T11's own regression, since the heading's live fold ends at EOF), the stored
- * `contentHash` matches the note's on-disk text, and the content both folds hide stays hidden
- * (not leaked into the rendered editor) after the plugin adopts them as a baseline.
+ * Both cases assert: two anchors in data.json (the task candidate plus the sibling list
+ * candidate — T1/T5/T11's own regression, since a heading's live fold ending at EOF would have
+ * had the same issue, is still covered independently by tests/unit/baseline.test.ts and the
+ * container-verification script's own heading fold), the stored `contentHash` matches the
+ * note's on-disk text, and the content both folds hide stays hidden (not leaked into the
+ * rendered editor) after the plugin adopts them as a baseline.
  *
- * Fixture: tests/fixtures/tasks-before.md (heading "## Tuesday" + "- [ ] Draft proposal" with
- * three sub-tasks + a plain "- [ ] Send invoices" sibling task) — the same fixture
- * scripts/e2e-dormant-baseline-probe.mjs already uses, and the checklist's own C29 scenario.
+ * T14: the checklist's own literal scenario — folding the heading `## Tuesday` and the nested
+ * task `Draft proposal` that sits entirely inside that heading's section, then expecting both to
+ * still be independently folded — cannot occur in real Obsidian for any nested heading/child
+ * pair: CM6's own fold StateField removes a fold fully overlapped by a newly-added one,
+ * regardless of fold order or whether the fold indicator or `editor:toggle-fold` made it. This
+ * was reproduced repeatedly against the real container (see the T14 finding on record) and is
+ * not something `src/baseline.ts`/`src/live-folds.ts` control. This file instead folds two
+ * *non-overlapping sibling* blocks under the same heading — the task `- [ ] Draft proposal` and
+ * the plain list `- Plain list item` right above it, neither nested in the other — which is
+ * exactly the scenario the checklist's own adapted substitute (tester2's independent repro)
+ * verified passes for real: both anchors stored, both blocks still hidden. This also sidesteps
+ * R9's click-selector bug (the heading's own fold indicator sits on a different rendered line
+ * than the needle text the old version of this file searched for) by never needing to click a
+ * heading's fold indicator at all.
+ *
+ * Fixture: tests/fixtures/tasks-before.md (heading "## Tuesday" + a plain "- Plain list item"
+ * with one nested child + "- [ ] Draft proposal" with three sub-tasks + a plain
+ * "- [ ] Send invoices" sibling task) — the same fixture
+ * scripts/e2e-dormant-baseline-probe.mjs already uses, and the checklist's own C29 scenario
+ * (adapted per T14 to use two sibling blocks instead of a heading and its own nested child).
  *
  * Usage (inside the Obsidian desktop container, per use-desktop-container.md, with this plugin
  * built, Obsidian launched with --remote-debugging-port, and --note already open):
@@ -323,6 +343,22 @@ function enablePluginExpression(): string {
 `;
 }
 
+/** R9(c): `reenableOverOpenPane` reuses the same open pane `closeAndReopen` already ran on, so
+ * by the time its own step 3 runs, both target blocks are already folded from the previous
+ * case's own baseline adoption — clicking their fold indicators again would *unfold* them
+ * instead of setting up a clean "two folds made while disabled" state. Called unconditionally
+ * at the start of every case (harmless no-op on a pane with nothing folded yet) so each case's
+ * own fold clicks always start from the same unfolded baseline, regardless of what an earlier
+ * case left live. */
+function unfoldAllExpression(): string {
+	return `
+(function () {
+	app.commands.executeCommandById("editor:unfold-all");
+	return { unfolded: true };
+})()
+`;
+}
+
 /** T4/R7: closes every pane currently showing `vaultPath`, then opens it fresh in a new tab —
  * the "close and reopen the note" step R7 asks for, distinct from `reenableOverOpenPane`'s case
  * (which deliberately never does this). */
@@ -365,14 +401,20 @@ async function runCase(
 	// a re-open of a path this test vault has already seen (R7).
 	if (existsSync(args.data)) rmSync(args.data);
 
-	// 3. Fold the heading and the task by hand (native CM6 fold, same as a user would) — the
-	// plugin is disabled, so neither fold is recorded yet; both should still be adopted as the
-	// baseline once it's enabled.
-	const headingClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Notes for Tuesday."))) as {
+	// 2.5. R9(c): guarantee a clean, fully-unfolded starting point for the clicks below,
+	// regardless of whatever an earlier case in this same run left folded live.
+	await evaluate(cdp, unfoldAllExpression());
+
+	// 3. Fold the task and its sibling list item by hand (native CM6 fold, same as a user
+	// would) — the plugin is disabled, so neither fold is recorded yet; both should still be
+	// adopted as the baseline once it's enabled. T14: these two are siblings under the same
+	// heading, neither nested in the other, so CM6 never collapses one fold into the other the
+	// way it does for a heading and its own nested child (see the file comment).
+	const listClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Plain list item"))) as {
 		clicked: boolean;
 		reason?: string;
 	};
-	if (!headingClick.clicked) problems.push(`heading fold click failed: ${headingClick.reason ?? "unknown"}`);
+	if (!listClick.clicked) problems.push(`list fold click failed: ${listClick.reason ?? "unknown"}`);
 	const taskClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"))) as {
 		clicked: boolean;
 		reason?: string;
@@ -408,12 +450,12 @@ async function runCase(
 		problems.push(`contentHash mismatch: stored ${record.contentHash}, expected ${expectedHash}`);
 	}
 	if (record.folds.length !== 2) {
-		problems.push(`expected 2 stored anchors (heading + task), got ${record.folds.length}`);
+		problems.push(`expected 2 stored anchors (task + sibling list), got ${record.folds.length}`);
 	}
 
 	const visibleLinesRaw = (await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION)) as string;
 	const visibleLines: string[] = JSON.parse(visibleLinesRaw);
-	for (const needle of ["Notes for Tuesday.", "Outline"]) {
+	for (const needle of ["A nested list item", "Outline"]) {
 		if (visibleLines.some((line) => line.includes(needle))) {
 			problems.push(`"${needle}" is visible in the editor — a folded block leaked into view`);
 		}
