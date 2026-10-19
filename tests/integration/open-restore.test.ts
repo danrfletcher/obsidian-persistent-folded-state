@@ -44,6 +44,13 @@ const manifest: PluginManifest = {
 	isDesktopOnly: false,
 };
 
+// R3(c): equal line count, changed content — TEXT_V2 above deliberately adds a line (its own
+// comment says so), so E4's own named edge case ("the line count didn't change but the content
+// did") was only covered by the pure unit test (tests/unit/vault-lifecycle.test.ts), never here.
+// Swapping the two headings' order keeps the line count at 4 (same as TEXT_V1) while moving
+// "## Tuesday" from lines 1-2 to lines 3-4, with both bodies reworded too.
+const TEXT_V3 = ["## Wednesday", "Some new text under Wednesday.", "## Tuesday", "Some new text under Tuesday."].join("\n");
+
 function tuesdayAnchorFor(text: string): FileFoldRecord["folds"][number] {
 	const candidates = buildAnchors(text);
 	const tuesday = candidates.find((c) => c.anchor.kind === "heading" && c.anchor.text === "tuesday");
@@ -114,6 +121,7 @@ describe("open-restore via the plugin's file-open handler", () => {
 
 		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 2 }]); // "## Tuesday" folded
 		expect(plugin.store.get(NOTE_PATH)).toBe(beforeEntry); // untouched — no re-match, no write
+		expect(view.state.doc.toString()).toBe(TEXT_V1); // F1: only fold state changed, never the text
 	});
 
 	it("G8 hash unchanged: never unfolds a fold Obsidian's own native restore already applied", async () => {
@@ -142,6 +150,7 @@ describe("open-restore via the plugin's file-open handler", () => {
 			{ startLine: 1, endLine: 2 },
 			{ startLine: 3, endLine: 4 },
 		]);
+		expect(view.state.doc.toString()).toBe(TEXT_V1); // F1: only fold state changed, never the text
 	});
 
 	it("G8 hash changed + E4: re-matches the stored anchor to its new location and unfolds a stale native fold not in the matched set", async () => {
@@ -174,7 +183,125 @@ describe("open-restore via the plugin's file-open handler", () => {
 		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 2, endLine: 3 }]);
 		const after = plugin.store.get(NOTE_PATH);
 		expect(after?.contentHash).toBe(hashText(TEXT_V2));
+		expect(view.state.doc.toString()).toBe(TEXT_V2); // F1: only fold state changed, never the text
 	});
+
+	it("G8 hash changed + E4: equal line count, changed content — the stored anchor still re-matches its new location", async () => {
+		const app = new App();
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } },
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+
+		// TEXT_V3 has exactly as many lines as TEXT_V1 (4) — only the order and wording changed —
+		// so the stored hash (from TEXT_V1) still no longer matches: the re-match branch, with no
+		// line-count change to give it away.
+		expect(TEXT_V3.split("\n").length).toBe(TEXT_V1.split("\n").length);
+		const view = makeView(TEXT_V3);
+		// Obsidian's native restore reapplied the OLD line-numbered fold (line 1-2, "## Tuesday"'s
+		// position in TEXT_V1) to this fresh pane — now a stale offset that actually covers
+		// "## Wednesday" and its body, not Tuesday's own content at all.
+		const staleFrom = view.state.doc.line(1).to;
+		const staleTo = view.state.doc.line(2).to;
+		view.dispatch({ effects: foldEffect.of({ from: staleFrom, to: staleTo }) });
+
+		openFile(app, NOTE_PATH, view);
+		await settle();
+
+		// "## Tuesday" is now lines 3-4 in TEXT_V3; the matcher re-finds it there by anchor key
+		// (heading text "tuesday"), and the stale lines-1-2 offset (now "## Wednesday") is gone.
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+		const after = plugin.store.get(NOTE_PATH);
+		expect(after?.contentHash).toBe(hashText(TEXT_V3));
+		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1: only fold state changed, never the text
+	});
+
+	it("G8 hash changed: several stored folds that match nothing all go dormant, leaving the note fully unfolded, without throwing", async () => {
+		const app = new App();
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		// "task" anchors: TEXT_V1 has no task items at all, so these can never match any
+		// candidate regardless of text similarity (deterministically "none", not a borderline
+		// fuzzy-threshold call).
+		const alienFolds: FileFoldRecord["folds"] = [
+			{ kind: "task", indent: 0, text: "buy milk", siblingIndex: 0, parentChain: [] },
+			{ kind: "task", indent: 0, text: "walk the dog", siblingIndex: 1, parentChain: [] },
+		];
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: "stale-hash-forces-rematch", folds: alienFolds, dormant: [] } },
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+
+		const view = makeView(TEXT_V1);
+		expect(() => openFile(app, NOTE_PATH, view)).not.toThrow();
+		await settle();
+
+		expect(liveFoldedLineRanges(view)).toEqual([]); // fully unfolded — nothing matched, nothing to fold
+		expect(view.state.doc.toString()).toBe(TEXT_V1); // F1
+		const after = plugin.store.get(NOTE_PATH);
+		expect(after?.folds).toEqual([]);
+		expect(after?.dormant).toHaveLength(2); // both unmatched anchors demoted to dormant, not dropped
+	});
+
+	it("(b) an empty file, a file with no foldable blocks, and a 500-fold file all open through file-open without error", async () => {
+		const EMPTY_PATH = "Empty.md";
+		const PLAIN_PATH = "Plain.md";
+		const LARGE_PATH = "Large.md";
+		const PLAIN_TEXT = "Just a plain paragraph.\nAnother plain line, no headings or tasks at all.";
+		const LARGE_HEADING_COUNT = 500;
+		const largeLines: string[] = [];
+		const largeFolds: FileFoldRecord["folds"] = [];
+		for (let i = 1; i <= LARGE_HEADING_COUNT; i++) {
+			largeLines.push(`## Heading ${i}`, `body for ${i}`);
+			largeFolds.push({ kind: "heading", indent: 0, text: `heading ${i}`, siblingIndex: i - 1, parentChain: [] });
+		}
+		const LARGE_TEXT = largeLines.join("\n");
+
+		const app = new App();
+		for (const path of [EMPTY_PATH, PLAIN_PATH, LARGE_PATH]) (app.vault as unknown as MockVault).setExists(path);
+		const stored = {
+			value: {
+				version: 1,
+				files: {
+					// Hash deliberately stale so each of these exercises the re-match branch, not
+					// just the verbatim-apply shortcut.
+					[EMPTY_PATH]: { contentHash: "stale", folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] },
+					[PLAIN_PATH]: { contentHash: "stale", folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] },
+					[LARGE_PATH]: { contentHash: hashText(LARGE_TEXT), folds: largeFolds, dormant: [] },
+				},
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+
+		const emptyView = makeView("");
+		const plainView = makeView(PLAIN_TEXT);
+		const largeView = makeView(LARGE_TEXT);
+
+		expect(() => openFile(app, EMPTY_PATH, emptyView)).not.toThrow();
+		expect(() => openFile(app, PLAIN_PATH, plainView)).not.toThrow();
+		expect(() => openFile(app, LARGE_PATH, largeView)).not.toThrow();
+		await settle();
+
+		expect(liveFoldedLineRanges(emptyView)).toEqual([]);
+		expect(emptyView.state.doc.toString()).toBe("");
+		expect(liveFoldedLineRanges(plainView)).toEqual([]);
+		expect(plainView.state.doc.toString()).toBe(PLAIN_TEXT);
+
+		// The 500-fold file: hash unchanged, so applyStoredFoldsVerbatim runs directly — every
+		// one of the 500 stored headings folds, up to and including the cap (MAX_FOLDS).
+		const largeFolded = liveFoldedLineRanges(largeView);
+		expect(largeFolded.length).toBe(LARGE_HEADING_COUNT);
+		expect(largeView.state.doc.toString()).toBe(LARGE_TEXT);
+	}, 10000);
 
 	it("a file with no stored entry is left entirely alone (no throw, no store write)", async () => {
 		const app = new App();
