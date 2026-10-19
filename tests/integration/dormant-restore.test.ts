@@ -8,10 +8,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding, foldedRanges, unfoldEffect } from "@codemirror/language";
+import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { editorInfoField } from "../mocks/obsidian";
 import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
+import { OWN_FOLD_ANNOTATION } from "../../src/fold-recorder";
 import { buildAnchors, anchorKey, type Anchor, type AnchoredBlock } from "../../src/anchors";
 import type { FileFoldRecord } from "../../src/types";
 
@@ -291,6 +292,68 @@ describe("dormant folds (G6)", () => {
 			const afterSecond = store.get(NOTE_PATH);
 			expect(afterSecond?.folds).toEqual([]);
 			expect(afterSecond?.dormant).toEqual([]);
+		},
+	);
+
+	it(
+		"T13: a dormant anchor that matches on retry is promoted into folds (not dropped) even " +
+			"when its target block is already folded live for a reason other than this pass's own " +
+			"dispatch — e.g. something outside this plugin (real Obsidian's own native " +
+			"per-session fold memory) re-applied the fold first",
+		async () => {
+			const TEXT_ALPHA = "Notes\n\n- [ ] Draft proposal for client alpha\n  - [ ] Sub task\n";
+			const TEXT_UNRELATED_ALPHA = "Notes\n\nSomething else entirely, no task here at all.\n";
+
+			const alpha = findOneBlock(buildAnchors(TEXT_ALPHA), (a) => a.kind === "task" && a.text.includes("alpha")).anchor;
+
+			let clock = 0;
+			const store = await makeStore(
+				{
+					[NOTE_PATH]: {
+						contentHash: hashText(TEXT_UNRELATED_ALPHA),
+						folds: [],
+						dormant: [{ ...alpha, dormantSince: 0 }] as unknown as Record<string, unknown>[],
+					},
+				},
+				() => clock,
+			);
+
+			const view = makeView(store, () => clock, TEXT_UNRELATED_ALPHA);
+
+			// The reload that should retry "alpha" out of dormancy.
+			clock = 60_000;
+			view.dispatch({
+				changes: { from: 0, to: view.state.doc.length, insert: TEXT_ALPHA },
+				annotations: Transaction.userEvent.of("set"),
+			});
+
+			// Immediately afterwards — before this plugin's own 150ms settle debounce has had a
+			// chance to run its match and dispatch anything — something *other than the user's
+			// own fold click* folds the exact same range live. In real Obsidian this is its own
+			// native per-session fold memory re-applying the range as a side effect of the
+			// reload; this harness has no equivalent of that mechanism (R9/T13's own reasoning
+			// for why this is a real-Obsidian-only bug), so it is stood in for here with a
+			// fold effect tagged `OWN_FOLD_ANNOTATION` — which `src/fold-recorder.ts` already
+			// treats as "not the user's own action" and skips recording (E11) — reproducing the
+			// exact observable precondition the live debug trace found: the range is already
+			// folded live, but the store has no active anchor for it yet.
+			const alphaAgain = findOneBlock(buildAnchors(TEXT_ALPHA), (a) => a.kind === "task" && a.text.includes("alpha"));
+			const liveFrom = lineEnd(TEXT_ALPHA, alphaAgain.range.startLine);
+			const liveTo = lineEnd(TEXT_ALPHA, alphaAgain.range.endLine);
+			view.dispatch({ effects: [foldEffect.of({ from: liveFrom, to: liveTo })], annotations: OWN_FOLD_ANNOTATION.of(true) });
+
+			await settle();
+
+			// Still folded exactly once — not double-folded by this pass's own (idempotent,
+			// skipped) plan.
+			expect(liveFoldedLineRanges(view)).toEqual([alphaAgain.range]);
+
+			const after = store.get(NOTE_PATH);
+			// T13: promoted into the active list, not dropped — the dormant entry empties out,
+			// but the plugin's own record of the fold does not disappear along with it.
+			expect(after?.dormant).toEqual([]);
+			expect(after?.folds).toHaveLength(1);
+			expect(anchorKey(after!.folds[0] as unknown as Anchor)).toBe(anchorKey(alpha));
 		},
 	);
 });

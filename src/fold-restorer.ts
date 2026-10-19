@@ -63,10 +63,15 @@
  *    same `planRestore`/`dispatchFoldTargets` path as an active one (a second `planRestore`
  *    call, with `liveAnchorKeys: null` since dormant membership was already decided by the
  *    shared match above, not by `src/restore-plan.ts`'s own E3 check) and is promoted back into
- *    `folds` — but only if `planRestore` actually acted on it (folded it now, or deferred it for
- *    G13); a match whose target is already folded live (the user folded the same block
- *    meanwhile) is dropped outright rather than promoted or kept dormant (G6's "one fold only"
- *    edge case). A previously-active anchor the matcher now reports "no match" for is demoted
+ *    `folds` — whether `planRestore` actually dispatched it this round (folded it now, or
+ *    deferred it for G13) or it was already folded live for some other reason (T13: real
+ *    Obsidian's own native per-session fold memory can re-apply a line range as a side effect of
+ *    reloading an externally-changed file, before this pass ever runs; `alreadyFolded` can't
+ *    tell that apart from the user folding the exact same block, but it doesn't need to — the
+ *    true G6 "one fold only" duplicate, an active anchor and a dormant anchor both confidently
+ *    targeting the same candidate, is already resolved earlier in this function by the shared
+ *    `matchAnchors` call's own candidate-claiming plus `dropDormantClaimedByActive`, so nothing
+ *    that reaches this matched list can actually be that duplicate). A previously-active anchor the matcher now reports "no match" for is demoted
  *    into `dormant` via `addDormant` instead of just being dropped. Both bookkeeping steps are
  *    applied as a delta against a *fresh* read of the store (R4-style, not the stale
  *    top-of-function snapshot), so a fold or unfold the user made during the match is never
@@ -374,14 +379,24 @@ export async function restoreSettledChange(
 			dormantList = addDormant(dormantList, storedAnchors[i], now);
 		}
 
-		// R1/G6: a dormant match the plan actually acted on (folding it now, or deferring it for
-		// G13) is promoted to the active list — the "successful retry" the matcher found. A
-		// match the plan left out because its target block is already folded live right now
-		// (the user folded that same block in the meantime, independent of this anchor) is G6's
-		// "one fold only" edge case: dropped outright, neither promoted into `folds` nor kept
-		// dormant for a future retry. A match left out for any other reason (e.g. its matched
-		// block collapsed to a single line and is no longer foldable) stays dormant with its
-		// original `dormantSince` instead of being silently lost.
+		// R1/G6: a dormant match the plan actually acted on (folding it now, or deferring it
+		// for G13) is promoted to the active list — the "successful retry" the matcher found.
+		// T13: a match the plan left out because its target is already folded live right now
+		// is promoted too, not dropped — `alreadyFolded` is read before this pass's own
+		// dispatch, so "already live" here can mean the plan's own idempotent skip, another
+		// anchor's dispatch in this same pass, or (in real Obsidian) its own native
+		// per-session fold memory re-applying the range as a side effect of reloading,
+		// independent of this plugin entirely. None of those is the true G6 "one fold only"
+		// duplicate (an active anchor and this dormant anchor both confidently wanting the
+		// same candidate) — that case is already resolved earlier in this function, before
+		// `dormantResult.matched` is ever built (the shared `matchAnchors` call's own
+		// candidate-claiming, plus `dropDormantClaimedByActive`'s loser recheck) — so there is
+		// nothing here left to distinguish "the user independently folded this" from "it's
+		// already live for some unrelated reason", and dropping it anyway only threw away the
+		// plugin's own tracking of a fold that is genuinely still there. A match left out for
+		// any other reason (e.g. its matched block collapsed to a single line and is no
+		// longer foldable) stays dormant with its original `dormantSince` instead of being
+		// silently lost.
 		const actedDormantIdx = new Set<number>([...dormantPlan.toFold, ...dormantPlan.deferred].map((t) => t.anchorIndex));
 		for (let i = 0; i < dormantResult.matched.length; i++) {
 			const match = dormantResult.matched[i];
@@ -393,7 +408,11 @@ export async function restoreSettledChange(
 			const alreadyLive =
 				candidate !== undefined &&
 				alreadyFolded.some((r) => r.startLine === candidate.range.startLine && r.endLine === candidate.range.endLine);
-			if (!alreadyLive) dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
+			if (alreadyLive) {
+				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+			} else {
+				dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
+			}
 		}
 
 		deps.store.set(path, {
