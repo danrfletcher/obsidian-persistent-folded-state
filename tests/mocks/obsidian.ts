@@ -179,6 +179,12 @@ export class Vault extends Events {
  * set it directly" rationale as `getActiveViewOfType`. */
 export class Workspace extends Events {
 	private active: unknown = null;
+	/** PR-7 (R1): starts `false` — unlike real Obsidian (where layout readiness depends on the
+	 * app's own startup sequence, already finished long before most tests' synchronous setup
+	 * runs), a test here must opt in to "layout is ready" explicitly via `triggerLayoutReady`,
+	 * so a test can assert what happens (nothing) before that moment too. */
+	private layoutIsReady = false;
+	private layoutReadyCallbacks: (() => void)[] = [];
 	/** Test helper: Obsidian itself decides which view is "active" (focus, last-opened leaf,
 	 * etc.); tests set it directly rather than simulating that machinery. */
 	setActiveView(view: unknown): void {
@@ -196,6 +202,26 @@ export class Workspace extends Events {
 	 * target: tests assert it was actually called, since nothing here can simulate a real CM6
 	 * reconfigure of an already-open pane. */
 	updateOptions(): void {}
+	/** PR-7 (R1): real Obsidian's own `Workspace.onLayoutReady` — calls `callback` immediately
+	 * if the app's startup sequence has already finished populating the vault's file tree by
+	 * the time this is called, or queues it for whenever `triggerLayoutReady` says that happened.
+	 * `main.ts`'s own `onload()` defers `pruneOrphans` through this, rather than running it right
+	 * after `store.load()`, because `getAbstractFileByPath` can still answer `null` for a file
+	 * that genuinely exists until that moment (see that file's own R1 comment). */
+	onLayoutReady(callback: () => void): void {
+		if (this.layoutIsReady) callback();
+		else this.layoutReadyCallbacks.push(callback);
+	}
+	/** Test helper: fires every `onLayoutReady` callback queued so far (and any registered
+	 * after, immediately) — simulating the one moment real Obsidian's own startup sequence
+	 * reaches "layout ready". Idempotent: a second call is a no-op. */
+	triggerLayoutReady(): void {
+		if (this.layoutIsReady) return;
+		this.layoutIsReady = true;
+		const callbacks = this.layoutReadyCallbacks;
+		this.layoutReadyCallbacks = [];
+		for (const callback of callbacks) callback();
+	}
 }
 
 export class App {

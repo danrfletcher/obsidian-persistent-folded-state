@@ -50,10 +50,21 @@
  * Obsidian-managed registration in this file.
  *
  * PR-7 (G9, "renamed outside Obsidian: not in v1"): there is no listener for that case — instead,
- * right after `this.store.load()`, `pruneOrphans` drops any stored entry whose file doesn't
- * exist in the vault at all (`this.app.vault.getAbstractFileByPath(path) === null`), cleaning up
- * whatever a rename, move or delete that happened outside Obsidian (or while it wasn't running)
- * left behind.
+ * `pruneOrphans` drops any stored entry whose file doesn't exist in the vault at all
+ * (`this.app.vault.getAbstractFileByPath(path) === null`), cleaning up whatever a rename, move
+ * or delete that happened outside Obsidian (or while it wasn't running) left behind.
+ *
+ * R1: that prune call runs inside `this.app.workspace.onLayoutReady(...)`, not right after
+ * `this.store.load()` the way it first landed. Obsidian's own docs for the `Vault` "create"
+ * event say the vault's file tree is still being populated when a plugin's `onload()` runs
+ * ("'create' will not be fired for existing files when the vault is first loaded" is the
+ * documented workaround — wrap the handler in `onLayoutReady`), so `getAbstractFileByPath` can
+ * still return `null` for a note that genuinely exists, for every note in the vault, at the
+ * exact moment `onload()` would otherwise have called this. Pruning on that false signal deleted
+ * every stored fold on relaunch (GP4's own failure mode) rather than only the genuine orphans
+ * this call is meant to clean up. `onLayoutReady` calls back immediately if layout is already
+ * ready (so this is a no-op delay in that case) or once it becomes ready otherwise — either way,
+ * `getAbstractFileByPath` is answering for real by the time this runs.
  *
  * PR-7 (G8/E4, open restore): `this.app.workspace.on("file-open", ...)` is the hook, deliberately
  * *not* the editor watcher's own `ViewPlugin` constructor (src/editor-watcher.ts) that the
@@ -100,8 +111,11 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 
 		// G9 ("renamed outside Obsidian: not in v1"): drops any entry whose file no longer
 		// exists in the vault at all — the only cleanup for a rename/move/delete that happened
-		// outside Obsidian, or while it wasn't running.
-		this.store.pruneOrphans((path) => this.app.vault.getAbstractFileByPath(path) !== null);
+		// outside Obsidian, or while it wasn't running. R1: deferred to onLayoutReady — see the
+		// file comment for why running this straight after load() is unsafe.
+		this.app.workspace.onLayoutReady(() => {
+			this.store.pruneOrphans((path) => this.app.vault.getAbstractFileByPath(path) !== null);
+		});
 
 		registerForgetNoteFoldsCommand(this);
 		this.addSettingTab(new PersistentFoldedStateSettingTab(this.app, this));
