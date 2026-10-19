@@ -99,6 +99,18 @@
  * right before merging (not just the doc-text check already there), so a pane that has since
  * switched to a *different* file whose text happens to match `textAtAdoption` exactly is never
  * merged into the wrong store entry.
+ *
+ * T22: the grace recheck's own candidate lookup (and the constructor's synchronous `buildBaseline`
+ * call above it) used to require an *exact* `{startLine,endLine}` match between a live fold and
+ * a `buildAnchors` candidate. That missed a live fold made by directly clicking its own fold
+ * indicator (never closed/reopened since) whenever the block is followed by a blank separator
+ * line before its next sibling: `buildAnchors`' own `closeFramesAbove` swallows that blank run
+ * into the block's own candidate range (anchors.ts), but a click-to-fold action only ever covers
+ * the block's own content, with no notion of what follows it. `resolveCandidateForLiveRange`
+ * (src/live-folds.ts) now falls back, once the exact match fails, to widening the live range
+ * forward over nothing but blank lines to reach such a candidate — used by both this recheck and
+ * `src/baseline.ts`'s own lookup, so the constructor's first synchronous read and this grace
+ * recheck agree on the same candidate for the same live fold either way.
  */
 import { ChangeSet } from "@codemirror/state";
 import { ViewPlugin, type EditorView, type ViewUpdate, type PluginValue } from "@codemirror/view";
@@ -114,8 +126,8 @@ import {
 	type DeferredFoldTarget,
 } from "./fold-restorer";
 import { buildBaseline } from "./baseline";
-import { liveFoldedLineRanges } from "./live-folds";
-import { anchorKey, buildAnchors, parseAnchor, type AnchoredBlock } from "./anchors";
+import { groupCandidatesByStartLine, liveFoldedLineRanges, resolveCandidateForLiveRange } from "./live-folds";
+import { anchorKey, buildAnchors, parseAnchor } from "./anchors";
 import { MAX_FOLDS, type MatcherOptions } from "./matcher";
 import type { FoldStore } from "./fold-store";
 import type { StoredAnchor } from "./types";
@@ -274,10 +286,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 					if (liveFolds.length === 0) return;
 
 					const candidates = buildAnchors(textAtAdoption);
-					const byRange = new Map<string, AnchoredBlock>();
-					for (const candidate of candidates) {
-						byRange.set(`${candidate.range.startLine}:${candidate.range.endLine}`, candidate);
-					}
+					const candidatesByStart = groupCandidatesByStartLine(candidates);
 
 					const existingKeys = new Set<string>();
 					for (const raw of latest.folds) {
@@ -289,7 +298,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 					let changed = false;
 					for (const range of liveFolds) {
 						if (merged.length >= MAX_FOLDS) break; // E6: respects the PR-4 cap here too
-						const candidate = byRange.get(`${range.startLine}:${range.endLine}`);
+						const candidate = resolveCandidateForLiveRange(this.view.state, range, candidatesByStart);
 						if (!candidate) continue; // E5: a range the PR-3 builder can't produce stays skipped
 						const key = anchorKey(candidate.anchor);
 						if (existingKeys.has(key)) continue;

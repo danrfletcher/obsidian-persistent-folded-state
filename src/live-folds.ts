@@ -17,10 +17,26 @@
  * Only the EOF case is special-cased: a fold whose `to` lands anywhere else (not at
  * `state.doc.length`) is unaffected, and a document with no trailing newline at all already
  * agrees with `buildAnchors` (nothing to subtract).
+ *
+ * T22: a second, mid-document mismatch in the *other* direction. `buildAnchors`' own
+ * `closeFramesAbove` (anchors.ts) swallows a run of blank separator lines between an EXTENDABLE
+ * block (heading/task/list/other) and its next sibling into that block's own `endLine`. A live
+ * CM6 fold made by directly clicking its own fold indicator has no notion of that convention —
+ * it only ever covers the block's own content, so it can land *short* of the matching
+ * candidate's `endLine` by exactly that trailing blank run (Obsidian's own reopen-time fold
+ * restoration happens to recompute a wider range that agrees with `buildAnchors`, but a fold
+ * that's never re-rendered keeps its original, narrower range). `widenLiveRangeToCandidate`
+ * and `resolveCandidateForLiveRange` below are the fallback both `src/baseline.ts` and
+ * `src/editor-watcher.ts`'s grace recheck use, once an *exact* rangeKey match has already
+ * failed, to still resolve such a range to its candidate — never the reverse (a candidate is
+ * never narrowed to fit a live range), and never for a run that contains anything but blank
+ * lines, so a fold whose own convention already agrees with `buildAnchors` (every
+ * non-EXTENDABLE kind — frontmatter/code/callout/blockquote — included, since those always
+ * have a fixed range that's never extended this way) is completely unaffected.
  */
 import { foldedRanges } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
-import type { LineRange } from "./anchors";
+import type { AnchoredBlock, LineRange } from "./anchors";
 
 /** `to`'s line number, adjusted so a fold that runs to the very end of a document ending in a
  * trailing newline doesn't count CM6's own trailing blank line — the one line `buildAnchors`
@@ -41,4 +57,53 @@ export function liveFoldedLineRanges(state: EditorState): LineRange[] {
 		ranges.push({ startLine: state.doc.lineAt(from).number, endLine: liveEndLine(state, to) });
 	});
 	return ranges;
+}
+
+/** T22: true when `candidate` is `range` widened by nothing but a run of blank lines — same
+ * `startLine`, a strictly greater `endLine`, and every line in between is blank. Never widens
+ * past `state.doc.lines`, and never matches a `candidate` that's narrower than or equal to
+ * `range` (that's the already-handled exact-match or EOF case, not this one). */
+export function widenLiveRangeToCandidate(state: EditorState, range: LineRange, candidate: LineRange): boolean {
+	if (candidate.startLine !== range.startLine) return false;
+	if (candidate.endLine <= range.endLine) return false;
+	if (candidate.endLine > state.doc.lines) return false;
+	for (let line = range.endLine + 1; line <= candidate.endLine; line++) {
+		if (state.doc.line(line).text.trim() !== "") return false; // only blank separators are swallowed
+	}
+	return true;
+}
+
+/** Resolves one of `liveFoldedLineRanges`' own outputs to whichever `AnchoredBlock` in
+ * `candidatesByStart` (grouped by `range.startLine`) it represents: an exact rangeKey match
+ * first, falling back to `widenLiveRangeToCandidate` (T22) so a live fold whose range is a
+ * blank-line-narrower subset of its own candidate's range still resolves. Returns `null` if
+ * neither finds anything (E5: a range the PR-3 builder can't produce for any candidate stays
+ * unbuildable). Shared by `src/baseline.ts` and `src/editor-watcher.ts`'s grace recheck so
+ * first-open baseline adoption behaves identically at either call site. */
+export function resolveCandidateForLiveRange(
+	state: EditorState,
+	range: LineRange,
+	candidatesByStart: ReadonlyMap<number, readonly AnchoredBlock[]>,
+): AnchoredBlock | null {
+	const sameStart = candidatesByStart.get(range.startLine);
+	if (!sameStart) return null;
+	for (const candidate of sameStart) {
+		if (candidate.range.endLine === range.endLine) return candidate;
+	}
+	for (const candidate of sameStart) {
+		if (widenLiveRangeToCandidate(state, range, candidate.range)) return candidate;
+	}
+	return null;
+}
+
+/** Groups `candidates` by their `range.startLine` — the shape `resolveCandidateForLiveRange`
+ * expects. A plain helper so both call sites build this map the same way. */
+export function groupCandidatesByStartLine(candidates: readonly AnchoredBlock[]): Map<number, AnchoredBlock[]> {
+	const byStart = new Map<number, AnchoredBlock[]>();
+	for (const candidate of candidates) {
+		const list = byStart.get(candidate.range.startLine);
+		if (list) list.push(candidate);
+		else byStart.set(candidate.range.startLine, [candidate]);
+	}
+	return byStart;
 }
