@@ -76,6 +76,47 @@ proto.removeClass = function (...cls: string[]) {
 };
 
 // --- Vault/workspace model (just enough for the forget-note-folds command) ----------------------
+
+/** Real Obsidian's `Events` base class (used by `Vault`/`Workspace`/`MetadataCache`): `on`
+ * registers a listener and returns a ref `off`/`offref` can later remove; `trigger` calls every
+ * listener for that name, in registration order, catching nothing itself (a throwing listener
+ * propagates, same as real Obsidian's documented "executing all the listeners in order even if
+ * some of them throw" — this mock keeps that simple rather than exactly replicating the
+ * async-rethrow wording, which no test here depends on). R3 (`src/main.ts`) is this PR's only
+ * user: the "settled non-user change" subscription point. Declared here, ahead of `Vault` and
+ * `Workspace` (PR-7), since both now `extends Events`. */
+export interface EventRef {
+	name: string;
+	callback: (...data: unknown[]) => unknown;
+	/** The `Events` instance `on()` was called against — real Obsidian's `EventRef` carries
+	 * this too (opaquely); `Plugin.registerEvent` (below) uses it to call `offref` on exactly
+	 * the right object at unload, without having to be told which one up front. */
+	source: Events;
+}
+
+export class Events {
+	private listeners = new Map<string, Set<(...data: unknown[]) => unknown>>();
+
+	on(name: string, callback: (...data: unknown[]) => unknown): EventRef {
+		let set = this.listeners.get(name);
+		if (!set) {
+			set = new Set();
+			this.listeners.set(name, set);
+		}
+		set.add(callback);
+		return { name, callback, source: this };
+	}
+	off(name: string, callback: (...data: unknown[]) => unknown): void {
+		this.listeners.get(name)?.delete(callback);
+	}
+	offref(ref: EventRef): void {
+		this.off(ref.name, ref.callback);
+	}
+	trigger(name: string, ...data: unknown[]): void {
+		for (const callback of this.listeners.get(name) ?? []) callback(...data);
+	}
+}
+
 export class TFile {
 	extension = "md";
 	constructor(public path: string) {}
@@ -93,13 +134,50 @@ export class TFile {
  * `MarkdownView`, so `getActiveViewOfType(MarkdownView)` correctly returns null for it. */
 export class OtherView {}
 
-export class MarkdownView {
-	file: TFile | null = null;
+/** PR-7 (G8, open restore): real Obsidian's own CM5/CM6 bridge (`obsidian.d.ts`'s `Editor`) has
+ * no *public, typed* way to reach the underlying CM6 `EditorView` — `src/main.ts`'s own
+ * `file-open` handler reaches it via the same `(editor as unknown as { cm?: EditorView })`
+ * pattern the wider Obsidian plugin community uses, since there is no supported alternative.
+ * This mock models exactly that shape: a plain holder for whatever `EditorView` a test
+ * constructed directly (same `makeView`/`makePaneView` helpers every other CM6-level test here
+ * already uses), rather than a real CM5/CM6 bridge object. */
+export class Editor {
+	constructor(public cm?: unknown) {}
 }
 
-export class Editor {}
+export class MarkdownView {
+	file: TFile | null = null;
+	editor?: Editor;
+}
 
-export class Workspace {
+/** Just enough of real Obsidian's `Vault` (PR-7, G9/G10) to exercise `app.vault.on("rename"/
+ * "delete", ...)` and `getAbstractFileByPath`: extends `Events` (declared just above), so
+ * `vault.on(...)`/`vault.trigger(...)` behave exactly like every other Obsidian event (same
+ * rationale as `src/main.ts`'s own `events` — see that file's R3 comment). `getAbstractFileByPath`
+ * is backed by a plain `Set` a test seeds directly with `setExists` (rather than a real
+ * filesystem) — Obsidian itself decides what's actually in the vault; this mock only needs to
+ * answer "does this path exist" the way `main.ts`'s own `pruneOrphans` call asks it to. */
+export class Vault extends Events {
+	private paths = new Set<string>();
+
+	getAbstractFileByPath(path: string): TFile | null {
+		return this.paths.has(path) ? new TFile(path) : null;
+	}
+	/** Test helper: marks `path` as existing in the vault (or not), independent of ever calling
+	 * `trigger("rename"/"delete", ...)` — a test drives those two separately so it can exercise
+	 * "the listener ran but the path still/no-longer exists" however it needs to. */
+	setExists(path: string, exists = true): void {
+		if (exists) this.paths.add(path);
+		else this.paths.delete(path);
+	}
+}
+
+/** PR-7 adds `extends Events` (real Obsidian's `Workspace` does too) so `on("file-open", ...)`/
+ * `trigger("file-open", ...)` work the same way every other Obsidian event in this mock does,
+ * and `activeEditor` (real Obsidian's own `Workspace.activeEditor`, a public getter — see
+ * obsidian.d.ts), derived from whichever view `setActiveView` was last given, the same "tests
+ * set it directly" rationale as `getActiveViewOfType`. */
+export class Workspace extends Events {
 	private active: unknown = null;
 	/** Test helper: Obsidian itself decides which view is "active" (focus, last-opened leaf,
 	 * etc.); tests set it directly rather than simulating that machinery. */
@@ -108,6 +186,9 @@ export class Workspace {
 	}
 	getActiveViewOfType<T>(type: new (...args: never[]) => T): T | null {
 		return this.active instanceof type ? (this.active as T) : null;
+	}
+	get activeEditor(): { file: TFile | null; editor?: Editor } | null {
+		return this.active instanceof MarkdownView ? { file: this.active.file, editor: this.active.editor } : null;
 	}
 	/** T2: real Obsidian's `registerEditorExtension` only updates the plugin's own extension
 	 * array — per obsidian.d.ts's own doc comment, applying that change to every already-open
@@ -119,6 +200,7 @@ export class Workspace {
 
 export class App {
 	workspace = new Workspace();
+	vault = new Vault();
 }
 
 // --- UI --------------------------------------------------------------------------------------
@@ -139,41 +221,6 @@ export class Notice {
 }
 
 export class Scope {}
-
-/** Real Obsidian's `Events` base class (used by `Vault`/`Workspace`/`MetadataCache`): `on`
- * registers a listener and returns a ref `off`/`offref` can later remove; `trigger` calls every
- * listener for that name, in registration order, catching nothing itself (a throwing listener
- * propagates, same as real Obsidian's documented "executing all the listeners in order even if
- * some of them throw" — this mock keeps that simple rather than exactly replicating the
- * async-rethrow wording, which no test here depends on). R3 (`src/main.ts`) is this PR's only
- * user: the "settled non-user change" subscription point. */
-export interface EventRef {
-	name: string;
-	callback: (...data: unknown[]) => unknown;
-}
-
-export class Events {
-	private listeners = new Map<string, Set<(...data: unknown[]) => unknown>>();
-
-	on(name: string, callback: (...data: unknown[]) => unknown): EventRef {
-		let set = this.listeners.get(name);
-		if (!set) {
-			set = new Set();
-			this.listeners.set(name, set);
-		}
-		set.add(callback);
-		return { name, callback };
-	}
-	off(name: string, callback: (...data: unknown[]) => unknown): void {
-		this.listeners.get(name)?.delete(callback);
-	}
-	offref(ref: EventRef): void {
-		this.off(ref.name, ref.callback);
-	}
-	trigger(name: string, ...data: unknown[]): void {
-		for (const callback of this.listeners.get(name) ?? []) callback(...data);
-	}
-}
 
 /** Base `Modal`: a real jsdom DOM, closing on Escape and on a backdrop click, same as real
  * Obsidian — so every subclass (just `ForgetAllFoldsModal` in this PR) gets that for free. */
@@ -362,6 +409,7 @@ export class Plugin {
 	private commands: Command[] = [];
 	private settingTabs: PluginSettingTab[] = [];
 	private domListeners: DomListener[] = [];
+	private eventRefs: EventRef[] = [];
 	private storedData: unknown = null;
 
 	constructor(app: App, manifest: PluginManifest) {
@@ -399,6 +447,14 @@ export class Plugin {
 		this.domListeners.push({ el, type, cb });
 	}
 
+	/** Real Obsidian's own `Component.registerEvent`: tracked here (rather than immediately
+	 * `offref`'d) so `unload()` below can detach it automatically, same as `registerDomEvent`'s
+	 * own listeners (E7/E12: "gone after unload") — `main.ts`'s PR-7 rename/delete listeners
+	 * rely on this. */
+	registerEvent(eventRef: EventRef): void {
+		this.eventRefs.push(eventRef);
+	}
+
 	/** Real Obsidian applies the extension to every open (and later-opened) CM6 editor and tears
 	 * it back out on unload; this mock only needs to not throw when `onload()` calls it — the
 	 * editor-watcher's own CM6-level tests exercise the extension directly against a real
@@ -412,6 +468,8 @@ export class Plugin {
 		this.onunload();
 		for (const { el, type, cb } of this.domListeners) el.removeEventListener(type, cb);
 		this.domListeners = [];
+		for (const ref of this.eventRefs) ref.source.offref(ref);
+		this.eventRefs = [];
 	}
 
 	async onload(): Promise<void> {}
