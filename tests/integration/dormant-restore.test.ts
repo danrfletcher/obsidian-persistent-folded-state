@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding, foldedRanges } from "@codemirror/language";
+import { codeFolding, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { editorInfoField } from "../mocks/obsidian";
 import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
@@ -56,6 +56,15 @@ function liveFoldedLineRanges(view: EditorView): { startLine: number; endLine: n
 		ranges.push({ startLine: view.state.doc.lineAt(from).number, endLine: view.state.doc.lineAt(to).number });
 	});
 	return ranges.sort((a, b) => a.startLine - b.startLine);
+}
+
+/** End offset of 1-indexed line `n` in `text` — the same "end of first line -> end of last
+ * line" CM6 fold-range convention src/fold-restorer.ts's `foldEffectFor` uses. */
+function lineEnd(text: string, n: number): number {
+	const lines = text.split("\n");
+	let offset = 0;
+	for (let i = 0; i < n - 1; i++) offset += lines[i].length + 1;
+	return offset + lines[n - 1].length;
 }
 
 async function settle(): Promise<void> {
@@ -207,12 +216,81 @@ describe("dormant folds (G6)", () => {
 			const after = store.get(NOTE_PATH);
 			expect(after?.folds).toHaveLength(1); // one anchor per block (never-break rule 4)
 			expect(anchorKey(after!.folds[0] as unknown as Anchor)).toBe(anchorKey(alpha));
-			// The dormant "bravo" anchor never claimed the candidate the active "alpha" anchor
-			// already matched exactly — it stays dormant (with its original dormantSince),
-			// rather than being wrongly promoted into `folds` alongside alpha.
-			expect(after?.dormant).toHaveLength(1);
-			expect(anchorKey(after!.dormant[0] as unknown as Anchor)).toBe(anchorKey(bravo));
-			expect((after!.dormant[0] as unknown as { dormantSince: number }).dormantSince).toBe(0);
+			// T3/R6: the dormant "bravo" anchor's only confident candidate is the exact block the
+			// active "alpha" anchor already claimed this round — G6's "one fold only, the dormant
+			// entry is dropped" edge case. It is dropped outright, not kept dormant and not
+			// promoted alongside alpha.
+			expect(after?.dormant).toEqual([]);
+		},
+	);
+
+	it(
+		"T3/R6: a dormant anchor dropped because an active anchor already claimed its candidate " +
+			"stays dropped — unfolding that block and reloading again never refolds or resurrects it",
+		async () => {
+			const TEXT_ALPHA = "Notes\n\n- [ ] Draft proposal for client alpha\n  - [ ] Sub task\n";
+			const TEXT_ALPHA_REWRITTEN =
+				"Notes\n\nSomething else entirely, unrelated to the task below.\n\n" +
+				"- [ ] Draft proposal for client alpha\n  - [ ] Sub task\n";
+			const TEXT_BRAVO = "Notes\n\n- [ ] Draft proposal for client bravo\n  - [ ] Sub task\n";
+
+			const alpha = findOneBlock(buildAnchors(TEXT_ALPHA), (a) => a.kind === "task" && a.text.includes("alpha")).anchor;
+			const bravo = findOneBlock(buildAnchors(TEXT_BRAVO), (a) => a.kind === "task" && a.text.includes("bravo")).anchor;
+
+			let clock = 0;
+			const store = await makeStore(
+				{
+					[NOTE_PATH]: {
+						contentHash: hashText(TEXT_ALPHA),
+						folds: [alpha] as unknown as Record<string, unknown>[],
+						dormant: [{ ...bravo, dormantSince: 0 }] as unknown as Record<string, unknown>[],
+					},
+				},
+				() => clock,
+			);
+
+			const view = makeView(store, () => clock, TEXT_ALPHA);
+
+			// First reload: alpha (active) claims the block; bravo (dormant) loses it and, per
+			// R6's fix, is dropped rather than kept dormant.
+			view.dispatch({
+				changes: { from: 0, to: view.state.doc.length, insert: TEXT_ALPHA_REWRITTEN },
+				annotations: Transaction.userEvent.of("set"),
+			});
+			await settle();
+
+			const afterFirst = store.get(NOTE_PATH);
+			expect(afterFirst?.folds).toHaveLength(1);
+			expect(afterFirst?.dormant).toEqual([]); // dropped, not merely still-dormant
+
+			// The user now unfolds that block by hand.
+			const foldedNow = liveFoldedLineRanges(view);
+			expect(foldedNow).toHaveLength(1);
+			const alphaAgain = findOneBlock(
+				buildAnchors(TEXT_ALPHA_REWRITTEN),
+				(a) => a.kind === "task" && a.text.includes("alpha"),
+			);
+			const liveFrom = lineEnd(view.state.doc.toString(), alphaAgain.range.startLine);
+			const liveTo = lineEnd(view.state.doc.toString(), alphaAgain.range.endLine);
+			view.dispatch({ effects: [unfoldEffect.of({ from: liveFrom, to: liveTo })] });
+			expect(store.get(NOTE_PATH)?.folds).toEqual([]);
+			expect(store.get(NOTE_PATH)?.dormant).toEqual([]); // bravo was already gone, not revived
+
+			// A later reload that keeps the same "alpha" text must not refold the block on
+			// bravo's behalf — there is nothing left of bravo to match at all (R6's regression:
+			// before this fix, bravo could still be sitting in `dormant` at this point and get
+			// wrongly promoted here, refolding a block the user just unfolded).
+			clock = 60_000;
+			view.dispatch({
+				changes: { from: 0, to: view.state.doc.length, insert: TEXT_ALPHA_REWRITTEN },
+				annotations: Transaction.userEvent.of("set"),
+			});
+			await settle();
+
+			expect(liveFoldedLineRanges(view)).toEqual([]); // never-break rule 2: not refolded
+			const afterSecond = store.get(NOTE_PATH);
+			expect(afterSecond?.folds).toEqual([]);
+			expect(afterSecond?.dormant).toEqual([]);
 		},
 	);
 });

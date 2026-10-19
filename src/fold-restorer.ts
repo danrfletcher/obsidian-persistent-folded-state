@@ -72,15 +72,22 @@
  *    top-of-function snapshot), so a fold or unfold the user made during the match is never
  *    clobbered (E3).
  */
-import { foldEffect, foldedRanges } from "@codemirror/language";
+import { foldEffect } from "@codemirror/language";
 import { Text, type ChangeDesc, type ChangeSet } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
+import { liveFoldedLineRanges } from "./live-folds";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
 import { planRestore, type FoldTarget } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
 import { hashText, type FoldStore } from "./fold-store";
-import { addDormant, freshDormantAnchors, splitDormantResults } from "./dormant";
+import {
+	addDormant,
+	dropDormantClaimedByActive,
+	freshDormantAnchors,
+	splitDormantResults,
+	survivorsStillDormant,
+} from "./dormant";
 import { buildBaseline } from "./baseline";
 import type { StoredAnchor } from "./types";
 
@@ -130,12 +137,10 @@ export interface RestoreRunDeps {
 	now?: () => number;
 }
 
+/** T1: delegates to `src/live-folds.ts` so this agrees with `src/baseline.ts` on the same
+ * EOF-boundary convention `buildAnchors` uses — see that module's file comment. */
 function currentFoldedLineRanges(view: EditorView): LineRange[] {
-	const ranges: LineRange[] = [];
-	foldedRanges(view.state).between(0, view.state.doc.length, (from, to) => {
-		ranges.push({ startLine: view.state.doc.lineAt(from).number, endLine: view.state.doc.lineAt(to).number });
-	});
-	return ranges;
+	return liveFoldedLineRanges(view.state);
 }
 
 function cursorLineOf(view: EditorView): number | null {
@@ -288,7 +293,26 @@ export async function restoreSettledChange(
 	const combinedMatches: MatchResult[] =
 		combinedStored.length > 0 ? await matchAnchors(combinedStored, candidateAnchors, matcherOptions) : [];
 	const matches = combinedMatches.slice(0, storedAnchors.length);
-	const dormantResult = splitDormantResults(dormantSurvivors, combinedMatches.slice(storedAnchors.length));
+	const dormantMatchResults = combinedMatches.slice(storedAnchors.length);
+	const dormantMatched = splitDormantResults(dormantSurvivors, dormantMatchResults).matched;
+
+	// T3/R6 (G6): a dormant anchor the shared match just reported "no match" for might
+	// genuinely have no matching candidate at all (keep it dormant — the ordinary case), or it
+	// might have lost its only confident candidate to one of the active anchors matched in the
+	// very same round (the user has meanwhile folded that same block: G6's "one fold only, the
+	// dormant entry is dropped"). A plain "none" tier can't tell those apart on its own, so any
+	// loser is re-matched alone (no active anchors competing) against the same candidates; one
+	// that lands on a candidate the active pass already claimed is dropped outright instead of
+	// being carried forward.
+	const activeTargets = new Set<number>();
+	for (const m of matches) if (m.tier !== "none") activeTargets.add(m.target);
+	const losers = survivorsStillDormant(dormantSurvivors, dormantMatchResults);
+	let stillDormant = losers.map((s) => s.raw);
+	if (losers.length > 0 && activeTargets.size > 0) {
+		const soloResults = await matchAnchors(losers.map((s) => s.anchor), candidateAnchors, matcherOptions);
+		stillDormant = dropDormantClaimedByActive(losers, soloResults, activeTargets).kept;
+	}
+	const dormantResult = { matched: dormantMatched, stillDormant };
 
 	if (!view.dom.isConnected) return []; // the pane/view was destroyed while matching ran
 	if (deps.getActivePath(view) !== path) return []; // switched to a different file meanwhile

@@ -123,8 +123,16 @@ export function freshDormantAnchors(dormant: readonly StoredAnchor[], now: numbe
 }
 
 /** Splits `survivors` into matched/still-dormant given `results` (one `MatchResult` per
- * survivor, in the same order) — the second half of `retryDormant`, usable on its own (R1) when
- * `results` came from a combined `matchAnchors` call rather than one scoped to `survivors` alone. */
+ * survivor, in the same order) — the second half of `retryDormant` (R1) when
+ * `results` came from a combined `matchAnchors` call rather than one scoped to `survivors` alone.
+ *
+ * A survivor with tier "none" here is, on its own, ambiguous between two different outcomes:
+ * there is genuinely no matching candidate at all (keep it dormant, the ordinary case), or its
+ * only confident candidate was already claimed by one of the *active* anchors matched in the
+ * same round (G6: "the user has meanwhile folded the same block — one fold only, the dormant
+ * entry is dropped"). This function alone can't tell those apart; `survivorsStillDormant` plus
+ * `dropDormantClaimedByActive` (below) is what the caller (src/fold-restorer.ts) uses to resolve
+ * that ambiguity with a second, dormant-only match. */
 export function splitDormantResults(
 	survivors: readonly DormantSurvivor[],
 	results: readonly MatchResult[],
@@ -140,6 +148,50 @@ export function splitDormantResults(
 		}
 	}
 	return { matched, stillDormant };
+}
+
+/** The same "still dormant" filter as `splitDormantResults`, but keeping each entry's parsed
+ * `DormantAnchor` (not just its raw form) — what `dropDormantClaimedByActive` needs to re-match
+ * a loser on its own, with no active anchor competing. */
+export function survivorsStillDormant(
+	survivors: readonly DormantSurvivor[],
+	results: readonly MatchResult[],
+): DormantSurvivor[] {
+	const losers: DormantSurvivor[] = [];
+	for (let i = 0; i < survivors.length; i++) {
+		const result = results[i];
+		if (!result || result.tier === "none") losers.push(survivors[i]);
+	}
+	return losers;
+}
+
+/** G6 (R6/T3): of the dormant survivors a shared `matchAnchors` call (active anchors and
+ * dormant anchors matched together, one candidate claimable by at most one of them) already
+ * reported "no match" for, drops the ones that would have confidently matched a candidate an
+ * *active* anchor claimed in that same round instead — G6's "the user has meanwhile folded the
+ * same block: one fold only, the dormant entry is dropped" edge case. A loser whose
+ * dormant-only match is still "none" (there genuinely is no matching candidate for it, active or
+ * otherwise) is kept dormant, exactly as before.
+ *
+ * `soloResults` must be a second `matchAnchors` call result for exactly `losers`' own anchors
+ * against the same candidates, with no active anchors in that call — the only way to learn what
+ * a loser would have matched absent the active pass's competition, since a plain "none" tier
+ * from the shared call can't distinguish "no candidate at all" from "lost this candidate to an
+ * active anchor". `activeTargets` is the set of candidate indices the active pass actually
+ * claimed (tier !== "none") in the shared call. */
+export function dropDormantClaimedByActive(
+	losers: readonly DormantSurvivor[],
+	soloResults: readonly MatchResult[],
+	activeTargets: ReadonlySet<number>,
+): { dropped: DormantSurvivor[]; kept: StoredAnchor[] } {
+	const dropped: DormantSurvivor[] = [];
+	const kept: StoredAnchor[] = [];
+	for (let i = 0; i < losers.length; i++) {
+		const solo = soloResults[i];
+		if (solo && solo.tier !== "none" && activeTargets.has(solo.target)) dropped.push(losers[i]);
+		else kept.push(losers[i].raw);
+	}
+	return { dropped, kept };
 }
 
 /** G6: retries every still-fresh anchor in `dormant` against `candidates`, in its own
