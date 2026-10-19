@@ -64,6 +64,20 @@
  * share the same "store has no entry" guard, so whichever runs first wins and the other is a
  * no-op.
  *
+ * T20: that synchronous read is not the end of the story. Real Obsidian has been observed, when
+ * reconfiguring an *already-open* pane's CM6 extensions (the re-enable-over-an-open-pane path
+ * src/main.ts's own `updateOptions()` call exists to exercise), to leave a live fold that was
+ * genuinely already on screen missing from this first read, with nothing afterwards dispatching
+ * a transaction that would let `src/fold-recorder.ts`'s own recording pick it up either.
+ * `scheduleFirstOpenGraceRecheck` guards against that: a short grace period after adopting a
+ * baseline, it re-reads the view's *live* fold state directly (not via any transaction) and
+ * merges in — never removes — anything the first read missed. Because `EditorView.setState`
+ * (unlike `dispatch`) recreates every `ViewPlugin` instance fresh rather than calling `update()`
+ * on it, that recheck deliberately keys its liveness check off `view.dom.isConnected`, not
+ * `this.destroyed`: this specific instance may already have been quietly replaced by the time
+ * the timer fires, even though the pane itself, and the one long-lived `EditorView` it wraps,
+ * never closed.
+ *
  * "Added": a thrown error inside the classifier, recorder or deferred-fold recheck is caught and
  * logged per-update, so one bad transaction can never block the rest of the batch, and a bug
  * here can never stop typing or folding in the editor itself. The restore pass itself is async
@@ -85,7 +99,9 @@ import {
 	type DeferredFoldTarget,
 } from "./fold-restorer";
 import { buildBaseline } from "./baseline";
-import type { MatcherOptions } from "./matcher";
+import { liveFoldedLineRanges } from "./live-folds";
+import { anchorKey, buildAnchors, parseAnchor, type AnchoredBlock } from "./anchors";
+import { MAX_FOLDS, type MatcherOptions } from "./matcher";
 import type { FoldStore } from "./fold-store";
 import type { StoredAnchor } from "./types";
 
@@ -105,6 +121,11 @@ export interface EditorWatcherDeps {
 	/** PR-6 (G6): clock passed through to `restoreSettledChange`'s dormant handling. Defaults to
 	 * `Date.now`; overridable so a test can drive dormancy/expiry with a fake clock. */
 	now?: () => number;
+	/** T20: how long after a first-open baseline adoption the constructor's grace re-check
+	 * (`scheduleFirstOpenGraceRecheck`) waits before merging in any live fold that wasn't
+	 * captured by the synchronous read. Overridable only for tests; defaults to the same
+	 * 150ms E9 already treats as "settled" elsewhere in this file. */
+	firstOpenGraceMs?: number;
 }
 
 function activeMarkdownPath(view: EditorView): string | null {
@@ -156,16 +177,92 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			try {
 				const path = activeMarkdownPath(view);
 				if (path && !deps.store.get(path)) {
-					const baseline = buildBaseline(view.state, view.state.doc.toString());
+					const text = view.state.doc.toString();
+					const baseline = buildBaseline(view.state, text);
 					deps.store.set(path, {
 						contentHash: baseline.contentHash,
 						folds: baseline.anchors as unknown as StoredAnchor[],
 						dormant: [],
 					});
+					// T20: when this ViewPlugin instance is created by Obsidian reconfiguring
+					// an *already-open* pane's CM6 extensions (the re-enable-over-an-open-pane
+					// path src/main.ts's T2 fix exists to exercise) rather than by a brand-new
+					// EditorView's own initial construction, a live fold that was genuinely
+					// already on screen at the moment of enabling has been observed missing
+					// from this synchronous read against real Obsidian (not reproducible
+					// against jsdom/CM6 directly, where a reconfigure's own fold state is
+					// already consistent by the time this constructor runs — see the T20
+					// issue). A short grace-period re-check, reading the view's live state
+					// again shortly afterwards and merging in (never removing) any live fold
+					// this first read didn't capture, guards against that without changing
+					// anything about the ordinary, already-reliable brand-new-pane path (there
+					// is nothing left to merge there).
+					this.scheduleFirstOpenGraceRecheck(path, text);
 				}
 			} catch (err) {
 				console.error("persistent-folded-state: first-open baseline failed", err);
 			}
+		}
+
+		/** T20: scheduled once, from the constructor, right after a first-open baseline was
+		 * just adopted for `path`. Re-reads the view's *live* fold state after a short grace
+		 * period and merges in (never removes) any live fold the synchronous constructor-time
+		 * read didn't capture — see the constructor's own comment for why this exists. A no-op
+		 * once the document itself has changed (no longer "the text as opened"), once the
+		 * store entry for `path` has been removed entirely (e.g. "Forget stored folds for this
+		 * note"), or once there is nothing left to merge (the common case). */
+		private scheduleFirstOpenGraceRecheck(path: string, textAtAdoption: string): void {
+			const win = deps.window ?? window;
+			const view = this.view;
+			win.setTimeout(() => {
+				// Deliberately not `this.destroyed`: real Obsidian (and `EditorView.setState`,
+				// which CM6 treats as "recreate every ViewPlugin fresh" rather than as an
+				// incremental update — see T20) can tear down and replace *this* ViewPlugin
+				// instance for the same, still-open pane before this timer fires, without the
+				// underlying `EditorView`/pane itself ever closing. `view` is still the one,
+				// long-lived object either way, so its `.dom.isConnected` is the right liveness
+				// check — unlike `this.destroyed`, it still reflects reality once a
+				// reconfigure/setState has quietly replaced this specific instance.
+				if (!view.dom.isConnected) return;
+				try {
+					if (this.view.state.doc.toString() !== textAtAdoption) return;
+					const latest = deps.store.get(path);
+					if (!latest) return;
+
+					const liveFolds = liveFoldedLineRanges(this.view.state);
+					if (liveFolds.length === 0) return;
+
+					const candidates = buildAnchors(textAtAdoption);
+					const byRange = new Map<string, AnchoredBlock>();
+					for (const candidate of candidates) {
+						byRange.set(`${candidate.range.startLine}:${candidate.range.endLine}`, candidate);
+					}
+
+					const existingKeys = new Set<string>();
+					for (const raw of latest.folds) {
+						const anchor = parseAnchor(raw);
+						if (anchor) existingKeys.add(anchorKey(anchor));
+					}
+
+					const merged = [...latest.folds];
+					let changed = false;
+					for (const range of liveFolds) {
+						if (merged.length >= MAX_FOLDS) break; // E6: respects the PR-4 cap here too
+						const candidate = byRange.get(`${range.startLine}:${range.endLine}`);
+						if (!candidate) continue; // E5: a range the PR-3 builder can't produce stays skipped
+						const key = anchorKey(candidate.anchor);
+						if (existingKeys.has(key)) continue;
+						existingKeys.add(key);
+						merged.push(candidate.anchor as unknown as StoredAnchor);
+						changed = true;
+					}
+					if (changed) {
+						deps.store.set(path, { contentHash: latest.contentHash, folds: merged, dormant: latest.dormant });
+					}
+				} catch (err) {
+					console.error("persistent-folded-state: first-open baseline grace recheck failed", err);
+				}
+			}, deps.firstOpenGraceMs ?? 150);
 		}
 
 		private runRestore(path: string, text: string): void {

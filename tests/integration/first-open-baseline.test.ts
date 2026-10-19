@@ -111,4 +111,66 @@ describe("first-open baseline (E5/G15)", () => {
 
 		view.destroy();
 	});
+
+	it("T20: a live fold applied via a state reset (setState) that recordFoldEffects can't observe is still merged in by the grace recheck", async () => {
+		// setState — unlike dispatch — never fires an `update()` call at all for an
+		// already-attached ViewPlugin (verified separately: `EditorView.updateListener`
+		// never sees it), so `src/fold-recorder.ts`'s own `recordFoldEffects` — which only
+		// ever runs from inside `update()` — can never observe a fold applied this way. This
+		// isolates the grace recheck this fix adds (src/editor-watcher.ts's
+		// `scheduleFirstOpenGraceRecheck`, which re-reads `view.state` directly rather than
+		// listening for transactions) from that pre-existing, unrelated safety net, and
+		// stands in for whatever real-Obsidian mechanism T20 describes applying a fold the
+		// constructor's own synchronous read missed without ever dispatching a transaction
+		// our own `update()` would see.
+		vi.useFakeTimers();
+		try {
+			const blocks = buildAnchors(TEXT);
+			const tuesday = blocks.find((b) => b.anchor.kind === "heading" && b.anchor.text === "tuesday");
+			const draftProposal = blocks.find((b) => b.anchor.kind === "task" && b.anchor.text === "draft proposal");
+			expect(tuesday).toBeDefined();
+			expect(draftProposal).toBeDefined();
+
+			const draftRange = {
+				from: lineEnd(TEXT, draftProposal!.range.startLine),
+				to: lineEnd(TEXT, draftProposal!.range.endLine),
+			};
+			const tuesdayRange = { from: lineEnd(TEXT, tuesday!.range.startLine), to: lineEnd(TEXT, tuesday!.range.endLine) };
+
+			const store = await makeStore();
+			const watcher = createEditorWatcher({ store, window, firstOpenGraceMs: 150 });
+			const extensions = [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))];
+
+			// Only ONE of the two live folds is visible at the moment the ViewPlugin's
+			// constructor runs.
+			const state1 = EditorState.create({ doc: TEXT, extensions }).update({ effects: foldEffect.of(tuesdayRange) }).state;
+			const view = new EditorView({ state: state1, parent: document.body });
+
+			// The constructor's synchronous read only ever saw `tuesdayRange`.
+			const immediatelyAfterOpen = store.get(NOTE_PATH);
+			expect(immediatelyAfterOpen).toBeDefined();
+			expect((immediatelyAfterOpen?.folds ?? []).length).toBe(1);
+
+			// The second fold lands moments later via a full state reset (setState), well
+			// inside the grace window — not a dispatch, so `recordFoldEffects` never runs.
+			const state2 = EditorState.create({
+				doc: state1.doc,
+				selection: state1.selection,
+				extensions,
+			}).update({ effects: [foldEffect.of(tuesdayRange), foldEffect.of(draftRange)] }).state;
+			await vi.advanceTimersByTimeAsync(10);
+			view.setState(state2);
+
+			await vi.advanceTimersByTimeAsync(200);
+
+			const record = store.get(NOTE_PATH);
+			expect(record?.contentHash).toBe(hashText(TEXT));
+			const storedKeys = (record?.folds ?? []).map((raw) => anchorKey(raw as unknown as Anchor)).sort();
+			expect(storedKeys).toEqual([anchorKey(tuesday!.anchor), anchorKey(draftProposal!.anchor)].sort());
+
+			view.destroy();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });
