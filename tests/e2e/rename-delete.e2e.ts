@@ -346,10 +346,15 @@ async function main(): Promise<void> {
 		if (!opened.opened) throw new Error(`initial open failed: ${opened.reason ?? "unknown"}`);
 		await sleep(args.waitMs);
 		await evaluate(cdp, unfoldAllExpression());
-		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as { clicked: boolean; reason?: string };
-		if (!tuesdayClick.clicked) throw new Error(`folding "## Tuesday" failed: ${tuesdayClick.reason ?? "unknown"}`);
+		// T7: "Draft proposal" is folded *before* "## Tuesday" — in the real fixture, "Draft
+		// proposal" is a task nested directly under "## Tuesday" with nothing else between
+		// them, so folding the heading first removes the task's own line from the rendered DOM
+		// before the second click ever runs. See tests/e2e/relaunch.e2e.ts's own comment on
+		// the same reorder for the full explanation.
 		const taskClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"))) as { clicked: boolean; reason?: string };
 		if (!taskClick.clicked) throw new Error(`folding "Draft proposal" failed: ${taskClick.reason ?? "unknown"}`);
+		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as { clicked: boolean; reason?: string };
+		if (!tuesdayClick.clicked) throw new Error(`folding "## Tuesday" failed: ${tuesdayClick.reason ?? "unknown"}`);
 		await sleep(args.waitMs);
 
 		let data = readPluginData(args.data);

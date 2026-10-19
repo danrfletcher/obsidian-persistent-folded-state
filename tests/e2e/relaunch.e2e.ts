@@ -352,16 +352,24 @@ async function runBeforeQuit(args: Args): Promise<void> {
 		// forces clickFoldIndicatorNearExpression's previousElementSibling fallback, which lands
 		// on that blank line instead of the heading and throws (T2/T4) — scripts/e2e-restore-probe.mjs
 		// already uses this same "Tuesday" needle successfully for exactly this reason.
-		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as {
-			clicked: boolean;
-			reason?: string;
-		};
-		if (!tuesdayClick.clicked) throw new Error(`folding "## Tuesday" failed: ${tuesdayClick.reason ?? "unknown"}`);
+		//
+		// T7: "Draft proposal" is folded *before* "## Tuesday", not after. In the real fixture
+		// (tests/fixtures/tasks-before.md), "Draft proposal" is a task nested directly under
+		// "## Tuesday" with nothing else between them — folding "## Tuesday" first removes
+		// "Draft proposal"'s own line from the rendered DOM before the second click ever runs,
+		// so that click always fails with "no rendered .cm-line contains ...". Folding the
+		// nested task first, then the heading that contains it, works every time (the same
+		// order the tester's own manual verification already used).
 		const taskClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"))) as {
 			clicked: boolean;
 			reason?: string;
 		};
 		if (!taskClick.clicked) throw new Error(`folding "Draft proposal" failed: ${taskClick.reason ?? "unknown"}`);
+		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as {
+			clicked: boolean;
+			reason?: string;
+		};
+		if (!tuesdayClick.clicked) throw new Error(`folding "## Tuesday" failed: ${tuesdayClick.reason ?? "unknown"}`);
 
 		await sleep(args.waitMs);
 
