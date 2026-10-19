@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, Plugin, type PluginManifest } from "obsidian";
-import type { Plugin as MockPlugin } from "../mocks/obsidian";
+import type { Plugin as MockPlugin, Vault as MockVault } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
 import { FORGET_NOTE_FOLDS_COMMAND_ID } from "../../src/commands";
 
@@ -121,6 +121,10 @@ describe("lifecycle: disable then re-enable keeps the map (E7)", () => {
 		const first = new PersistentFoldedStatePlugin(app, manifest);
 		first.loadData = sharedLoadData;
 		first.saveData = sharedSaveData;
+		// G9: pruneOrphans (onload) would otherwise drop "Tasks.md" immediately — this test
+		// is about E7 (disable/re-enable keeps the map), not G9, so the file is seeded as
+		// existing in the mock vault the same way a real one always would be.
+		(app.vault as unknown as MockVault).setExists("Tasks.md");
 		await first.onload();
 		// PR-5: a fold entry must be a real Anchor (src/anchors.ts) to survive FoldStore's
 		// load-time validation — a bare {kind: "heading"} is a PR-2-era shape and is discarded.
