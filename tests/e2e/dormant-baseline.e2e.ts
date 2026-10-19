@@ -32,12 +32,16 @@
  *    already-open pane pick up the freshly re-enabled extension at all — this case is also the
  *    only thing in this repo that exercises that fix against a real, already-open editor.
  *
- * Both cases assert: two anchors in data.json (the task candidate plus the sibling list
- * candidate — T1/T5/T11's own regression, since a heading's live fold ending at EOF would have
- * had the same issue, is still covered independently by tests/unit/baseline.test.ts and the
- * container-verification script's own heading fold), the stored `contentHash` matches the
- * note's on-disk text, and the content both folds hide stays hidden (not leaked into the
- * rendered editor) after the plugin adopts them as a baseline.
+ * Both cases assert: two non-frontmatter anchors in data.json (the task candidate plus the
+ * sibling list candidate — T1/T5/T11's own regression, since a heading's live fold ending at EOF
+ * would have had the same issue, is still covered independently by tests/unit/baseline.test.ts
+ * and the container-verification script's own heading fold), the stored `contentHash` matches
+ * the note's on-disk text, and the content both folds hide stays hidden (not leaked into the
+ * rendered editor) after the plugin adopts them as a baseline. T25/R13: the fixture opens with a
+ * `---` frontmatter block that Obsidian auto-folds on its own; a correct baseline legitimately
+ * stores that as a third, "frontmatter"-kind anchor too, so the assertion counts only the
+ * task/list anchors and separately flags any kind it doesn't expect, instead of asserting the
+ * total is exactly 2.
  *
  * T14: the checklist's own literal scenario — folding the heading `## Tuesday` and the nested
  * task `Draft proposal` that sits entirely inside that heading's section, then expecting both to
@@ -209,9 +213,15 @@ async function withConnection<T>(cdpPort: number, fn: (cdp: CdpConnection) => Pr
 
 // --- this plugin's own data.json (read/written directly from the host filesystem) -------------
 
+/** A stored fold round-trips `src/anchors.ts`'s `Anchor` shape (see `src/types.ts`'s
+ * `StoredAnchor` comment) — only `kind` is read here, so this stays loose about the rest. */
+interface StoredAnchorLike {
+	kind?: string;
+}
+
 interface StoredFileRecordLike {
 	contentHash: string;
-	folds: unknown[];
+	folds: StoredAnchorLike[];
 	dormant: unknown[];
 }
 
@@ -449,8 +459,24 @@ async function runCase(
 	if (record.contentHash !== expectedHash) {
 		problems.push(`contentHash mismatch: stored ${record.contentHash}, expected ${expectedHash}`);
 	}
-	if (record.folds.length !== 2) {
-		problems.push(`expected 2 stored anchors (task + sibling list), got ${record.folds.length}`);
+	// T25/R13: Obsidian auto-folds frontmatter on its own, independently of this plugin, so a
+	// genuinely correct baseline on tests/fixtures/tasks-before.md (which opens with a `---`
+	// frontmatter block) legitimately stores that fold too, as a third, "frontmatter"-kind
+	// anchor (E13 explicitly lists frontmatter as a fold kind the baseline builder must handle).
+	// `editor:unfold-all` (unfoldAllExpression, step 2.5) does not reliably clear a frontmatter
+	// fold in real Obsidian, so asserting the *total* count is 2 fails on a correct run. Assert
+	// instead on the two anchors this case's own clicks actually made (task + sibling list),
+	// ignoring any frontmatter anchor, and flag anything else as a genuine regression.
+	const nonFrontmatterFolds = record.folds.filter((fold) => fold.kind !== "frontmatter");
+	if (nonFrontmatterFolds.length !== 2) {
+		problems.push(
+			`expected 2 non-frontmatter stored anchors (task + sibling list), got ${nonFrontmatterFolds.length} ` +
+				`(${record.folds.length} total, kinds: ${JSON.stringify(record.folds.map((fold) => fold.kind))})`,
+		);
+	}
+	const unexpectedKinds = record.folds.filter((fold) => fold.kind !== "frontmatter" && fold.kind !== "task" && fold.kind !== "list");
+	if (unexpectedKinds.length > 0) {
+		problems.push(`unexpected anchor kinds stored: ${JSON.stringify(unexpectedKinds.map((fold) => fold.kind))}`);
 	}
 
 	const visibleLinesRaw = (await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION)) as string;
