@@ -9,7 +9,10 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App, type PluginManifest } from "obsidian";
-import { TFile as MockTFile, Vault as MockVault } from "../mocks/obsidian";
+import { EditorState, Transaction } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import { codeFolding } from "@codemirror/language";
+import { TFile as MockTFile, Vault as MockVault, Workspace as MockWorkspace, editorInfoField } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
 
 function setExists(app: App, path: string): void {
@@ -149,6 +152,59 @@ describe("vault-events: rename (G9)", () => {
 		await vi.advanceTimersByTimeAsync(200);
 		expect(stored.value).toEqual({ version: 1, files: { "B.md": { contentHash: "fresh", folds: [], dormant: [] } } });
 	});
+
+	it(
+		"R2: a rename arriving while a settle timer is pending for the old path leaves no entry " +
+			"under the old key once that timer fires",
+		async () => {
+			vi.useFakeTimers();
+			const app = new App();
+			setExists(app, "A.md");
+			const stored = {
+				value: { version: 1, files: { "A.md": { contentHash: "unrelated", folds: [], dormant: [] } } } as unknown,
+			};
+			const plugin = makePlugin(app, stored);
+			const registerEditorExtension = vi.spyOn(plugin, "registerEditorExtension");
+			await plugin.onload();
+			const watcherExtension = registerEditorExtension.mock.calls[0][0];
+
+			// Real Obsidian mutates a renamed file's own TFile.path in place, so a pane already
+			// showing it reflects the rename immediately too — modelled here as a mutable file
+			// reference the mock editorInfoField reads (the same object every read), rather than
+			// a fresh object computed from a plain variable each time.
+			const fileRef = { path: "A.md", extension: "md" };
+			const view = new EditorView({
+				state: EditorState.create({
+					doc: "line one\nline two",
+					extensions: [codeFolding(), watcherExtension as never, editorInfoField.init(() => ({ file: fileRef }))],
+				}),
+				parent: document.body,
+			});
+
+			// A settled non-user change starts the 150ms settle timer for "A.md" (src/editor-watcher.ts).
+			view.dispatch({ changes: { from: 0, to: 0, insert: "x" }, annotations: Transaction.userEvent.of("set") });
+
+			// The rename arrives before that timer fires.
+			fileRef.path = "B.md";
+			triggerRename(app, "B.md", "A.md");
+			await plugin.store.flush();
+			expect(stored.value).toEqual({ version: 1, files: { "B.md": { contentHash: "unrelated", folds: [], dormant: [] } } });
+
+			// Letting the settle timer (and whatever debounce it might otherwise schedule) elapse
+			// must never land a fresh write under the stale "A.md" key (src/fold-restorer.ts's
+			// own E5/G15 "no entry" baseline branch would otherwise do exactly that).
+			await vi.advanceTimersByTimeAsync(500);
+			await plugin.store.flush();
+
+			const files = (stored.value as { files: Record<string, unknown> }).files;
+			expect(files["A.md"]).toBeUndefined();
+			expect(Object.keys(files)).toEqual(["B.md"]);
+
+			view.destroy();
+			document.body.replaceChildren();
+			vi.useRealTimers();
+		},
+	);
 });
 
 describe("vault-events: delete (G10)", () => {
@@ -228,6 +284,8 @@ describe('vault-events: prune at load (G9, "renamed outside Obsidian: not in v1"
 		};
 		const plugin = makePlugin(app, stored);
 		await plugin.onload();
+		(app.workspace as unknown as MockWorkspace).triggerLayoutReady();
+		await plugin.store.flush();
 
 		expect(plugin.store.get("Exists.md")).toBeDefined();
 		expect(plugin.store.get("Gone.md")).toBeUndefined();
@@ -239,6 +297,8 @@ describe('vault-events: prune at load (G9, "renamed outside Obsidian: not in v1"
 		const stored = { value: null as unknown };
 		const plugin = makePlugin(app, stored);
 		await expect(plugin.onload()).resolves.toBeUndefined();
+		(app.workspace as unknown as MockWorkspace).triggerLayoutReady();
+		await plugin.store.flush();
 		expect(plugin.store.size).toBe(0);
 	});
 
@@ -250,6 +310,46 @@ describe('vault-events: prune at load (G9, "renamed outside Obsidian: not in v1"
 		};
 		plugin.saveData = async () => undefined;
 		await expect(plugin.onload()).resolves.toBeUndefined();
+		(app.workspace as unknown as MockWorkspace).triggerLayoutReady();
+		await plugin.store.flush();
 		expect(plugin.store.size).toBe(0);
+	});
+
+	it("R1: does not run, and removes nothing, before layout is ready", async () => {
+		const app = new App();
+		setExists(app, "Exists.md");
+		// "Gone.md" is deliberately not registered as existing — at the real moment this matters
+		// (onload, before Obsidian's own startup has finished populating the vault's file tree),
+		// `getAbstractFileByPath` would return null for "Exists.md" too, not just "Gone.md"; this
+		// mock's `setExists` state is unaffected by layout readiness, so this test instead proves
+		// the narrower, directly observable claim: pruning simply hasn't run yet at all.
+		const stored: { value: unknown } = {
+			value: {
+				version: 1,
+				files: {
+					"Exists.md": { contentHash: "a", folds: [], dormant: [] },
+					"Gone.md": { contentHash: "b", folds: [], dormant: [] },
+				},
+			},
+		};
+		const saveData = vi.fn(async (data: unknown) => {
+			stored.value = data;
+		});
+		const plugin = makePlugin(app, stored);
+		plugin.saveData = saveData;
+		await plugin.onload();
+
+		// Layout is not yet ready: pruneOrphans must not have run (and so must not have written
+		// data.json either) — both entries are still exactly as they were loaded.
+		expect(plugin.store.get("Exists.md")).toBeDefined();
+		expect(plugin.store.get("Gone.md")).toBeDefined();
+		expect(saveData).not.toHaveBeenCalled();
+
+		(app.workspace as unknown as MockWorkspace).triggerLayoutReady();
+		await plugin.store.flush();
+
+		expect(plugin.store.get("Exists.md")).toBeDefined();
+		expect(plugin.store.get("Gone.md")).toBeUndefined();
+		expect(stored.value).toEqual({ version: 1, files: { "Exists.md": { contentHash: "a", folds: [], dormant: [] } } });
 	});
 });
