@@ -1,0 +1,10 @@
+{
+	"id": "persistent-folded-state",
+	"name": "Persistent Folded State",
+	"version": "0.1.0",
+	"minAppVersion": "1.13.0",
+	"description": "Preserves your folded and unfolded blocks and tasks in a note across external file modifications (an AI agent, another program, a git pull or a sync tool) and across quitting and relaunching Obsidian.",
+	"author": "Dan Fletcher",
+	"authorUrl": "https://github.com/danrfletcher",
+	"isDesktopOnly": false
+}
