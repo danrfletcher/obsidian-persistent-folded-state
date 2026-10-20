@@ -22,8 +22,9 @@ export type StoredAnchor = Record<string, unknown>;
  *   used by a later PR to detect a non-user change and decide whether anchors need re-matching.
  * - `folds`: the user's confirmed, currently-applied folds.
  * - `dormant`: anchors that found no confident match on a reload (G6), kept for a 10-minute
- *   reprieve and retried on every reload of that file. Always present (never undefined) so the
- *   on-disk shape doesn't change when a later PR starts populating it. */
+ *   reprieve and retried on every reload of that file (PR-6: `src/dormant.ts`, wired from
+ *   `src/fold-restorer.ts`). Always present (never undefined) so the on-disk shape never had to
+ *   change when PR-6 started populating it. */
 export interface FileFoldRecord {
 	contentHash: string;
 	folds: StoredAnchor[];

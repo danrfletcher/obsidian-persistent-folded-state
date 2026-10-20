@@ -1,0 +1,192 @@
+/**
+ * E5/E6/G15 — `src/baseline.ts`'s pure(ish) baseline builder. Uses a real CM6 `EditorState` (via
+ * `state.update()`, never a view) to seed live fold state, exactly like
+ * tests/integration/first-open-baseline.test.ts does at the CM6-glue level — this file focuses
+ * on `buildBaseline` itself across every anchor kind, nesting, "no folds" and an unbuildable
+ * range.
+ */
+import { describe, expect, it } from "vitest";
+import { EditorState } from "@codemirror/state";
+import { codeFolding, foldEffect } from "@codemirror/language";
+import { buildBaseline } from "../../src/baseline";
+import { buildAnchors, anchorKey, type AnchorKind } from "../../src/anchors";
+import { hashText } from "../../src/fold-store";
+import { MAX_FOLDS } from "../../src/matcher";
+
+/** End of line `n` (1-indexed) in `text` — the same "end of first line -> end of last line" CM6
+ * fold-range convention src/fold-restorer.ts's `foldEffectFor` uses. */
+function lineEnd(text: string, n: number): number {
+	const lines = text.split("\n");
+	let offset = 0;
+	for (let i = 0; i < n - 1; i++) offset += lines[i].length + 1;
+	return offset + lines[n - 1].length;
+}
+
+function stateWithFolds(text: string, foldRanges: { from: number; to: number }[]): EditorState {
+	let state = EditorState.create({ doc: text, extensions: [codeFolding()] });
+	if (foldRanges.length > 0) state = state.update({ effects: foldRanges.map((r) => foldEffect.of(r)) }).state;
+	return state;
+}
+
+describe("buildBaseline: no live folds (G15)", () => {
+	it("returns an empty anchors array (still a valid baseline, never half-stored)", () => {
+		const text = "## Tuesday\n- [ ] Draft proposal\n";
+		const state = stateWithFolds(text, []);
+		const baseline = buildBaseline(state, text);
+		expect(baseline).toEqual({ contentHash: hashText(text), anchors: [] });
+	});
+});
+
+describe("buildBaseline: one fold of every anchor kind (E13)", () => {
+	const rows: { label: string; kind: AnchorKind; text: string }[] = [
+		{ label: "heading", kind: "heading", text: "## Tuesday\n- [ ] Draft proposal\n" },
+		{ label: "task", kind: "task", text: "## Tuesday\n- [ ] Draft proposal\n  - [ ] Sub task\n" },
+		{ label: "callout", kind: "callout", text: "> [!note] Callout\n> Content line\n- [ ] Other\n" },
+		{ label: "frontmatter", kind: "frontmatter", text: "---\ntags: [test]\n---\n## Tuesday\n" },
+		{ label: "code block", kind: "code", text: "## Tuesday\n```ts\ncode line\n```\n- [ ] Other\n" },
+	];
+
+	for (const { label, kind, text } of rows) {
+		it(`${label}: adopts the live fold as the matching anchor`, () => {
+			const blocks = buildAnchors(text);
+			const target = blocks.find((b) => b.anchor.kind === kind);
+			expect(target).toBeDefined();
+
+			const range = { from: lineEnd(text, target!.range.startLine), to: lineEnd(text, target!.range.endLine) };
+			const state = stateWithFolds(text, [range]);
+			const baseline = buildBaseline(state, text);
+
+			expect(baseline.contentHash).toBe(hashText(text));
+			expect(baseline.anchors).toHaveLength(1);
+			expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(target!.anchor));
+		});
+	}
+});
+
+describe("buildBaseline: nesting", () => {
+	it("a nested anchor (indent > 0, non-empty parentChain) and an independent top-level anchor are both adopted", () => {
+		const text = "- [ ] Draft proposal\n  - [ ] Sub task\n    - [ ] Grandchild\n- [ ] Another task\n  - [ ] Another sub\n";
+		const blocks = buildAnchors(text);
+		const nested = blocks.find((b) => b.anchor.text === "sub task")!;
+		const topLevel = blocks.find((b) => b.anchor.text === "another task")!;
+		expect(nested.anchor.indent).toBeGreaterThan(0);
+		expect(nested.anchor.parentChain.length).toBeGreaterThan(0);
+
+		// These two ranges don't overlap (the nested block's parent, "Draft proposal", is left
+		// unfolded, so its body — including "Sub task" — is still visible on its own line).
+		const nestedRange = { from: lineEnd(text, nested.range.startLine), to: lineEnd(text, nested.range.endLine) };
+		const topRange = { from: lineEnd(text, topLevel.range.startLine), to: lineEnd(text, topLevel.range.endLine) };
+		const state = stateWithFolds(text, [nestedRange, topRange]);
+		const baseline = buildBaseline(state, text);
+
+		const keys = baseline.anchors.map(anchorKey).sort();
+		expect(keys).toEqual([anchorKey(nested.anchor), anchorKey(topLevel.anchor)].sort());
+	});
+});
+
+describe("buildBaseline: an unbuildable range is skipped, not half-stored (E5)", () => {
+	it("a live-folded span that doesn't land on any candidate's exact range is ignored", () => {
+		const text = "## Tuesday\n- [ ] Draft proposal\n- [ ] Send invoices\n";
+		// Folds half of the heading's own line range only (from < its line end) — not a span
+		// `buildAnchors` would ever produce for any candidate.
+		const oddRange = { from: 2, to: lineEnd(text, 2) - 1 };
+		const state = stateWithFolds(text, [oddRange]);
+		const baseline = buildBaseline(state, text);
+		expect(baseline.anchors).toEqual([]);
+	});
+});
+
+describe("buildBaseline: T1 — a fold ending at EOF agrees with buildAnchors' endLine", () => {
+	it("a trailing heading (the last block in the file) folded to doc.length is still adopted", () => {
+		// Every real note ends in a single trailing newline, so CM6's live fold for the last
+		// foldable block always has `to === state.doc.length`, landing one line past
+		// buildAnchors' own endLine for that block (which never counts a trailing blank line —
+		// see anchors.ts's splitLines). Before T1 this range never matched any candidate and the
+		// heading fold was silently skipped as "unbuildable" even though it was representable.
+		const text = "## Tuesday\n\nNotes for Tuesday.\n";
+		const blocks = buildAnchors(text);
+		const heading = blocks.find((b) => b.anchor.kind === "heading")!;
+		expect(heading).toBeDefined();
+
+		// The live range CM6 actually reports: from the start of the heading's line to the very
+		// end of the document (not `lineEnd(text, heading.range.endLine)`, which is the point).
+		const range = { from: 0, to: text.length };
+		const state = stateWithFolds(text, [range]);
+		const baseline = buildBaseline(state, text);
+
+		expect(baseline.anchors).toHaveLength(1);
+		expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(heading.anchor));
+	});
+
+	it("a document with no trailing newline needs no adjustment", () => {
+		const text = "## Tuesday\n\nNotes for Tuesday."; // no trailing \n
+		const blocks = buildAnchors(text);
+		const heading = blocks.find((b) => b.anchor.kind === "heading")!;
+
+		const range = { from: 0, to: text.length };
+		const state = stateWithFolds(text, [range]);
+		const baseline = buildBaseline(state, text);
+
+		expect(baseline.anchors).toHaveLength(1);
+		expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(heading.anchor));
+	});
+});
+
+describe("buildBaseline: T22 — a live fold narrower than its candidate by a trailing blank separator line is still adopted", () => {
+	it("a click-folded list item (narrower CM6 range) still resolves to buildAnchors' wider candidate", () => {
+		// tests/fixtures/tasks-before.md's own shape: "Plain list item" (line 1) has a nested
+		// child (line 2) and is followed by a blank separator line (line 3) before its next
+		// sibling, a task, at line 4. buildAnchors' closeFramesAbove swallows that blank line
+		// into the list item's own candidate range (1:3), but a live fold made by directly
+		// clicking the list item's own fold indicator only ever covers its own content (1:2) —
+		// it has no notion of what blank line follows it.
+		const text = "- Plain list item\n\t- A nested list item\n\n- [ ] Draft proposal\n";
+		const blocks = buildAnchors(text);
+		const listItem = blocks.find((b) => b.anchor.kind === "list" && b.anchor.text === "plain list item")!;
+		expect(listItem).toBeDefined();
+		expect(listItem.range).toEqual({ startLine: 1, endLine: 3 });
+
+		// The live range CM6 actually reports for a direct-click fold: only through the nested
+		// child's own line (2), not the trailing blank separator (3) buildAnchors swallows.
+		const narrowRange = { from: lineEnd(text, 1), to: lineEnd(text, 2) };
+		const state = stateWithFolds(text, [narrowRange]);
+		const baseline = buildBaseline(state, text);
+
+		expect(baseline.anchors).toHaveLength(1);
+		expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(listItem.anchor));
+	});
+
+	it("never widens a live range that is already wider than or equal to its candidate", () => {
+		// A frontmatter-style fixed range: the live fold already lands exactly on the
+		// candidate, so the T22 fallback must never fire (and must never narrow anything).
+		const text = "---\ntags: [test]\n---\n## Tuesday\n";
+		const blocks = buildAnchors(text);
+		const frontmatter = blocks.find((b) => b.anchor.kind === "frontmatter")!;
+		const range = { from: lineEnd(text, frontmatter.range.startLine), to: lineEnd(text, frontmatter.range.endLine) };
+		const state = stateWithFolds(text, [range]);
+		const baseline = buildBaseline(state, text);
+		expect(baseline.anchors).toHaveLength(1);
+		expect(anchorKey(baseline.anchors[0])).toBe(anchorKey(frontmatter.anchor));
+	});
+});
+
+describe("buildBaseline: E6 cap", () => {
+	it("never adopts more than MAX_FOLDS anchors even if more blocks are live-folded", () => {
+		const lines: string[] = [];
+		for (let i = 0; i < MAX_FOLDS + 20; i++) {
+			lines.push(`- [ ] Task ${i}`);
+			lines.push(`  - [ ] Sub ${i}`); // gives each top-level task a real (non-zero) fold span
+		}
+		const text = lines.join("\n") + "\n";
+		const blocks = buildAnchors(text);
+		const topTasks = blocks.filter((b) => b.anchor.kind === "task" && b.anchor.indent === 0);
+		expect(topTasks.length).toBe(MAX_FOLDS + 20);
+
+		const ranges = topTasks
+			.map((block) => ({ from: lineEnd(text, block.range.startLine), to: lineEnd(text, block.range.endLine) }))
+			.sort((a, b) => a.from - b.from);
+		const state = stateWithFolds(text, ranges);
+		const baseline = buildBaseline(state, text);
+		expect(baseline.anchors.length).toBeLessThanOrEqual(MAX_FOLDS);
+	});
+});

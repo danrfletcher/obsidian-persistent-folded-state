@@ -45,15 +45,56 @@
  * `restoreSettledChange` resolving to an empty deferred list and dispatching nothing — those are
  * the only cases left that make a run itself obsolete, as opposed to merely needing its
  * candidates re-anchored (R1, above).
+ *
+ * PR-6 adds two more branches to this same pass, both driven off the one `store.get(path)` read
+ * at the top:
+ *  - No entry at all (E5/G15): there is nothing to match against, so this run adopts a baseline
+ *    instead (src/baseline.ts) — read the folds already live in `view.state`, store them with
+ *    the content hash, dispatch nothing. The active-fold/dormant machinery below never runs for
+ *    this call.
+ *  - An entry exists: the stored anchors are matched exactly as before, *and* the file's
+ *    `dormant` list (still-fresh survivors only — src/dormant.ts's `freshDormantAnchors`) is
+ *    folded into the *same* `matchAnchors` call as the active anchors (R1) — not a second,
+ *    independent call, which is what let a dormant retry claim a candidate the active pass had
+ *    already matched this round, folding one block twice and storing two anchors for it.
+ *    Sharing one call's `consumed` tracking means a dormant anchor can only ever win a
+ *    candidate the active pass didn't already take (never-break rule 4, enforced the same way
+ *    it already is between two active anchors). A dormant anchor that matches folds through the
+ *    same `planRestore`/`dispatchFoldTargets` path as an active one (a second `planRestore`
+ *    call, with `liveAnchorKeys: null` since dormant membership was already decided by the
+ *    shared match above, not by `src/restore-plan.ts`'s own E3 check) and is promoted back into
+ *    `folds` — whether `planRestore` actually dispatched it this round (folded it now, or
+ *    deferred it for G13) or it was already folded live for some other reason (T13: real
+ *    Obsidian's own native per-session fold memory can re-apply a line range as a side effect of
+ *    reloading an externally-changed file, before this pass ever runs; `alreadyFolded` can't
+ *    tell that apart from the user folding the exact same block, but it doesn't need to — the
+ *    true G6 "one fold only" duplicate, an active anchor and a dormant anchor both confidently
+ *    targeting the same candidate, is already resolved earlier in this function by the shared
+ *    `matchAnchors` call's own candidate-claiming plus `dropDormantClaimedByActive`, so nothing
+ *    that reaches this matched list can actually be that duplicate). A previously-active anchor the matcher now reports "no match" for is demoted
+ *    into `dormant` via `addDormant` instead of just being dropped. Both bookkeeping steps are
+ *    applied as a delta against a *fresh* read of the store (R4-style, not the stale
+ *    top-of-function snapshot), so a fold or unfold the user made during the match is never
+ *    clobbered (E3).
  */
-import { foldEffect, foldedRanges } from "@codemirror/language";
+import { foldEffect } from "@codemirror/language";
 import { Text, type ChangeDesc, type ChangeSet } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
+import { liveFoldedLineRanges } from "./live-folds";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
-import { planRestore } from "./restore-plan";
+import { planRestore, type FoldTarget } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
 import { hashText, type FoldStore } from "./fold-store";
+import {
+	addDormant,
+	dropDormantClaimedByActive,
+	freshDormantAnchors,
+	splitDormantResults,
+	survivorsStillDormant,
+} from "./dormant";
+import { buildBaseline } from "./baseline";
+import type { StoredAnchor } from "./types";
 
 /** G13's deferred queue, kept across updates by src/editor-watcher.ts. Positions, not line
  * numbers (R2): `from`/`to` are character offsets covering the whole block (the start of its
@@ -96,14 +137,15 @@ export interface RestoreRunDeps {
 	 * Omitted entirely by a direct unit-test caller that never lets its view diverge from `text`
 	 * — candidates are then used exactly as `buildAnchors(text)` produced them. */
 	getChangesSinceSnapshot?: () => ChangeSet;
+	/** PR-6 (G6): clock used for `dormantSince`/age checks. Defaults to `Date.now`; overridable
+	 * so a test can drive dormancy and expiry with a fake clock instead of real wall time. */
+	now?: () => number;
 }
 
+/** T1: delegates to `src/live-folds.ts` so this agrees with `src/baseline.ts` on the same
+ * EOF-boundary convention `buildAnchors` uses — see that module's file comment. */
 function currentFoldedLineRanges(view: EditorView): LineRange[] {
-	const ranges: LineRange[] = [];
-	foldedRanges(view.state).between(0, view.state.doc.length, (from, to) => {
-		ranges.push({ startLine: view.state.doc.lineAt(from).number, endLine: view.state.doc.lineAt(to).number });
-	});
-	return ranges;
+	return liveFoldedLineRanges(view.state);
 }
 
 function cursorLineOf(view: EditorView): number | null {
@@ -217,7 +259,19 @@ export async function restoreSettledChange(
 	deps: RestoreRunDeps,
 ): Promise<DeferredFoldTarget[]> {
 	const snapshot = deps.store.get(path);
-	if (!snapshot || snapshot.folds.length === 0) return [];
+	if (!snapshot) {
+		// E5/G15: a never-before-seen file — there is nothing to match against, so adopt
+		// Obsidian's current folds as the baseline instead. Dispatches nothing at all (no fold
+		// or unfold effect, no transaction): the editor looks exactly as it was opened.
+		const baseline = buildBaseline(view.state, text);
+		deps.store.set(path, {
+			contentHash: baseline.contentHash,
+			folds: baseline.anchors as unknown as StoredAnchor[],
+			dormant: [],
+		});
+		return [];
+	}
+	if (snapshot.folds.length === 0 && snapshot.dormant.length === 0) return [];
 
 	// The snapshot (E11/E9): taken once, now, before the possibly-slow matching below starts.
 	const storedAnchors: Anchor[] = [];
@@ -225,14 +279,45 @@ export async function restoreSettledChange(
 		const anchor = parseAnchor(raw);
 		if (anchor) storedAnchors.push(anchor);
 	}
-	if (storedAnchors.length === 0) return [];
 
 	const candidates = buildAnchors(text);
+	const candidateAnchors = candidates.map((c) => c.anchor);
 	const win = deps.window ?? window;
-	const matches: MatchResult[] = await matchAnchors(storedAnchors, candidates.map((c) => c.anchor), {
-		yieldToHost: defaultYieldToHost(win),
-		...deps.matcherOptions,
-	});
+	const matcherOptions: MatcherOptions = { yieldToHost: defaultYieldToHost(win), ...deps.matcherOptions };
+
+	// G6/R1: the same reload that re-matches the active folds also retries whatever's dormant
+	// for this file — against the very same candidates, and in the very same `matchAnchors`
+	// call as the active anchors (not a second, independent call), so a dormant retry can never
+	// be handed a candidate the active pass already claimed this round (never-break rule 4).
+	// Two independent calls — the original bug — each ran their own `consumed` tracking and
+	// could both confidently claim the same block, folding it twice and promoting two anchors
+	// for one block.
+	const now = deps.now?.() ?? Date.now();
+	const dormantSurvivors = freshDormantAnchors(snapshot.dormant, now);
+	const combinedStored = [...storedAnchors, ...dormantSurvivors.map((s) => s.anchor)];
+	const combinedMatches: MatchResult[] =
+		combinedStored.length > 0 ? await matchAnchors(combinedStored, candidateAnchors, matcherOptions) : [];
+	const matches = combinedMatches.slice(0, storedAnchors.length);
+	const dormantMatchResults = combinedMatches.slice(storedAnchors.length);
+	const dormantMatched = splitDormantResults(dormantSurvivors, dormantMatchResults).matched;
+
+	// T3/R6 (G6): a dormant anchor the shared match just reported "no match" for might
+	// genuinely have no matching candidate at all (keep it dormant — the ordinary case), or it
+	// might have lost its only confident candidate to one of the active anchors matched in the
+	// very same round (the user has meanwhile folded that same block: G6's "one fold only, the
+	// dormant entry is dropped"). A plain "none" tier can't tell those apart on its own, so any
+	// loser is re-matched alone (no active anchors competing) against the same candidates; one
+	// that lands on a candidate the active pass already claimed is dropped outright instead of
+	// being carried forward.
+	const activeTargets = new Set<number>();
+	for (const m of matches) if (m.tier !== "none") activeTargets.add(m.target);
+	const losers = survivorsStillDormant(dormantSurvivors, dormantMatchResults);
+	let stillDormant = losers.map((s) => s.raw);
+	if (losers.length > 0 && activeTargets.size > 0) {
+		const soloResults = await matchAnchors(losers.map((s) => s.anchor), candidateAnchors, matcherOptions);
+		stillDormant = dropDormantClaimedByActive(losers, soloResults, activeTargets).kept;
+	}
+	const dormantResult = { matched: dormantMatched, stillDormant };
 
 	if (!view.dom.isConnected) return []; // the pane/view was destroyed while matching ran
 	if (deps.getActivePath(view) !== path) return []; // switched to a different file meanwhile
@@ -244,27 +329,106 @@ export async function restoreSettledChange(
 	// the live document before planning. When nothing has changed this is the identity.
 	const changes = deps.getChangesSinceSnapshot?.();
 	const liveCandidates = changes ? mapCandidatesForward(candidates, text, changes, view.state.doc) : candidates;
+	const alreadyFolded = currentFoldedLineRanges(view);
+	const cursorLine = cursorLineOf(view);
 
 	const plan = planRestore({
 		stored: storedAnchors,
 		matches,
 		candidates: liveCandidates,
-		alreadyFolded: currentFoldedLineRanges(view),
-		cursorLine: cursorLineOf(view),
+		alreadyFolded,
+		cursorLine,
 		liveAnchorKeys: liveAnchorKeySet(deps.store, path),
 	});
 
-	dispatchFoldTargets(view, plan.toFold);
+	// G6: a dormant anchor that matched this retry folds through the same tagged-effect path as
+	// an active match, re-using `planRestore` for its idempotent/G13-cursor handling — but with
+	// `liveAnchorKeys: null`, since "is this dormant match still live" was already decided by
+	// the shared `matchAnchors` call above (dormant membership, and never-break rule 4 against
+	// the active anchors, not by `restore-plan.ts`'s own E3 check).
+	const dormantMatchedAnchors = dormantResult.matched.map((m) => m.anchor);
+	const dormantPlan = planRestore({
+		stored: dormantMatchedAnchors,
+		matches: dormantResult.matched.map((m): MatchResult => ({ tier: "exact", target: m.candidateIndex })),
+		candidates: liveCandidates,
+		alreadyFolded,
+		cursorLine,
+		liveAnchorKeys: null,
+	});
 
-	// "After each settled restore the note's stored content hash is refreshed with hashText of
-	// the settled text" — refresh only the hash. `folds`/`dormant` are read fresh (not from
-	// `snapshot`) so a fold or unfold the user made during the match isn't clobbered (E3).
+	dispatchFoldTargets(view, [...plan.toFold, ...dormantPlan.toFold]);
+
+	// Folds/dormant bookkeeping (G6) is applied as a *delta*, against a fresh read of the store
+	// taken right now — not the stale top-of-function `snapshot` — so a fold or unfold the user
+	// made while the match above was running is never clobbered (E3), same discipline as the
+	// contentHash-only update this replaces.
 	const latest = deps.store.get(path);
-	if (latest) deps.store.set(path, { ...latest, contentHash: hashText(text) });
+	if (latest) {
+		const activeFolds = new Map<string, StoredAnchor>();
+		for (const raw of latest.folds) {
+			const anchor = parseAnchor(raw);
+			if (anchor) activeFolds.set(anchorKey(anchor), raw);
+		}
 
-	return plan.deferred
+		let dormantList = dormantResult.stillDormant;
+		for (let i = 0; i < storedAnchors.length; i++) {
+			if (matches[i]?.tier !== "none") continue;
+			const key = anchorKey(storedAnchors[i]);
+			if (!activeFolds.has(key)) continue; // E3: the user already removed it meanwhile
+			activeFolds.delete(key);
+			dormantList = addDormant(dormantList, storedAnchors[i], now);
+		}
+
+		// R1/G6: a dormant match the plan actually acted on (folding it now, or deferring it
+		// for G13) is promoted to the active list — the "successful retry" the matcher found.
+		// T13: a match the plan left out because its target is already folded live right now
+		// is promoted too, not dropped — `alreadyFolded` is read before this pass's own
+		// dispatch, so "already live" here can mean the plan's own idempotent skip, another
+		// anchor's dispatch in this same pass, or (in real Obsidian) its own native
+		// per-session fold memory re-applying the range as a side effect of reloading,
+		// independent of this plugin entirely. None of those is the true G6 "one fold only"
+		// duplicate (an active anchor and this dormant anchor both confidently wanting the
+		// same candidate) — that case is already resolved earlier in this function, before
+		// `dormantResult.matched` is ever built (the shared `matchAnchors` call's own
+		// candidate-claiming, plus `dropDormantClaimedByActive`'s loser recheck) — so there is
+		// nothing here left to distinguish "the user independently folded this" from "it's
+		// already live for some unrelated reason", and dropping it anyway only threw away the
+		// plugin's own tracking of a fold that is genuinely still there. A match left out for
+		// any other reason (e.g. its matched block collapsed to a single line and is no
+		// longer foldable) stays dormant with its original `dormantSince` instead of being
+		// silently lost.
+		const actedDormantIdx = new Set<number>([...dormantPlan.toFold, ...dormantPlan.deferred].map((t) => t.anchorIndex));
+		for (let i = 0; i < dormantResult.matched.length; i++) {
+			const match = dormantResult.matched[i];
+			if (actedDormantIdx.has(i)) {
+				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				continue;
+			}
+			const candidate = liveCandidates[match.candidateIndex];
+			const alreadyLive =
+				candidate !== undefined &&
+				alreadyFolded.some((r) => r.startLine === candidate.range.startLine && r.endLine === candidate.range.endLine);
+			if (alreadyLive) {
+				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+			} else {
+				dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
+			}
+		}
+
+		deps.store.set(path, {
+			contentHash: hashText(text),
+			folds: Array.from(activeFolds.values()),
+			dormant: dormantList,
+		});
+	}
+
+	const activeDeferred = plan.deferred
 		.map((target) => toDeferredFoldTarget(view, storedAnchors[target.anchorIndex], target.range))
 		.filter((target): target is DeferredFoldTarget => target !== null);
+	const dormantDeferred = dormantPlan.deferred
+		.map((target: FoldTarget) => toDeferredFoldTarget(view, dormantMatchedAnchors[target.anchorIndex], target.range))
+		.filter((target): target is DeferredFoldTarget => target !== null);
+	return [...activeDeferred, ...dormantDeferred];
 }
 
 /** R2: maps every still-deferred target's character span forward through one update's own

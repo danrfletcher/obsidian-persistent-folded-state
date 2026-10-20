@@ -109,4 +109,61 @@ describe("R3: plugin.events exposes the settled-non-user-change event for real",
 		document.body.replaceChildren();
 		vi.useRealTimers();
 	});
+
+	it(
+		"T2: onload() calls Workspace.updateOptions() after registering, so a pane already open " +
+			"across a disable/re-enable cycle is reconfigured onto the fresh store rather than " +
+			"left running the stale extension from before the disable",
+		async () => {
+			const app = new App();
+			const plugin = new PersistentFoldedStatePlugin(app, manifest);
+			const registerEditorExtension = vi.spyOn(plugin, "registerEditorExtension");
+			const updateOptions = vi.spyOn(app.workspace, "updateOptions");
+
+			// First enable.
+			await plugin.onload();
+			expect(updateOptions).toHaveBeenCalledTimes(1);
+			const extensionBeforeDisable = registerEditorExtension.mock.calls[0][0];
+			const storeBeforeDisable = plugin.store;
+
+			// Disable, then re-enable — the same plugin object, the same already-open pane's
+			// extension (`extensionBeforeDisable`) is what real Obsidian would need to swap out
+			// for `app.workspace.updateOptions()` to have any effect on that pane.
+			plugin.unload();
+			await plugin.onload();
+			expect(updateOptions).toHaveBeenCalledTimes(2); // called again on re-enable, not just once ever
+			const extensionAfterReenable = registerEditorExtension.mock.calls[1][0];
+			expect(extensionAfterReenable).not.toBe(extensionBeforeDisable); // a genuinely fresh extension
+			expect(plugin.store).not.toBe(storeBeforeDisable); // and a genuinely fresh store
+
+			// Simulate what calling `updateOptions()` is documented to cause: Obsidian swaps the
+			// already-open pane from `extensionBeforeDisable` onto `extensionAfterReenable`. A
+			// settled non-user change through that reconfigured pane must land in the plugin's
+			// *current* store, not the one the stale pre-disable extension closed over.
+			vi.useFakeTimers();
+			const view = new EditorView({
+				state: EditorState.create({
+					doc: "# Heading\nbody",
+					extensions: [
+						codeFolding(),
+						extensionAfterReenable as never,
+						editorInfoField.init(() => ({ file: { path: "Tasks.md", extension: "md" } })),
+					],
+				}),
+				parent: document.body,
+			});
+			view.dispatch({
+				changes: { from: 0, to: 0, insert: "<!-- external write after re-enable -->\n" },
+				annotations: Transaction.userEvent.of("set"),
+			});
+			await vi.advanceTimersByTimeAsync(150);
+
+			expect(plugin.store.get("Tasks.md")).toBeDefined(); // the fresh store saw the change
+			expect(storeBeforeDisable.get("Tasks.md")).toBeUndefined(); // the orphaned old store never does
+
+			view.destroy();
+			document.body.replaceChildren();
+			vi.useRealTimers();
+		},
+	);
 });

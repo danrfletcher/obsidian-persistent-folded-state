@@ -122,7 +122,10 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 		// Our own code never calls dispatch — the one call recorded is the external write above.
 		expect(dispatchSpy).toHaveBeenCalledTimes(1);
 		expect(foldedRanges(view.state).size).toBe(before);
-		expect(store.get(NOTE_PATH)).toBeUndefined();
+		// G15: `makeView` itself already adopted an empty baseline for this never-before-seen
+		// path when the view was constructed (PR-6) — it is no longer left with no entry at
+		// all, but the external write above still recorded no fold/unfold of its own.
+		expect(store.get(NOTE_PATH)).toEqual({ contentHash: expect.any(String), folds: [], dormant: [] });
 	});
 
 	it("E3: a fold made while the settle timer is pending is recorded immediately and survives settling", async () => {
@@ -178,7 +181,10 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 				annotations: OWN_FOLD_ANNOTATION.of(true),
 			});
 
-			expect(store.get(NOTE_PATH)).toBeUndefined();
+			// G15: baseline adoption at construction already created an empty entry for this
+			// path (PR-6) — the tagged fold effect above must still leave `folds` empty, i.e.
+			// it was not recorded as a user fold.
+			expect(store.get(NOTE_PATH)).toEqual({ contentHash: expect.any(String), folds: [], dormant: [] });
 		});
 
 		it("the same effect, untagged, is recorded as a user fold", () => {

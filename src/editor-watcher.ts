@@ -52,12 +52,65 @@
  * "md") are ignored entirely: neither the settle timer, the fold recorder nor the restore ever
  * runs for them (F3: no fold is ever applied outside a Markdown editor).
  *
+ * PR-6 (E5/G15, first-open baseline): a brand-new pane's `EditorView` already has its full
+ * initial `EditorState` — including whatever CM6 fold state that state was constructed with —
+ * before this plugin's `update()` ever runs for it (CM6 builds a `ViewPlugin`'s initial value in
+ * the view's constructor, with no transaction involved). So the constructor below checks once,
+ * synchronously, for "a Markdown file with no store entry at all" and adopts a baseline
+ * (`src/baseline.ts`) right there if so — dispatching nothing, same as the settled-change path's
+ * own no-entry branch (`src/fold-restorer.ts`) handles the other real-world trigger for the same
+ * case: navigating to a never-before-opened file in a pane Obsidian reuses (no new `ViewPlugin`,
+ * but a "set"-annotated transaction the settle path already treats as a reload). Both paths
+ * share the same "store has no entry" guard, so whichever runs first wins and the other is a
+ * no-op.
+ *
+ * T20: that synchronous read is not the end of the story. Real Obsidian has been observed, when
+ * reconfiguring an *already-open* pane's CM6 extensions (the re-enable-over-an-open-pane path
+ * src/main.ts's own `updateOptions()` call exists to exercise), to leave a live fold that was
+ * genuinely already on screen missing from this first read, with nothing afterwards dispatching
+ * a transaction that would let `src/fold-recorder.ts`'s own recording pick it up either.
+ * `scheduleFirstOpenGraceRecheck` guards against that: a short grace period after adopting a
+ * baseline, it re-reads the view's *live* fold state directly (not via any transaction) and
+ * merges in — never removes — anything the first read missed. Because `EditorView.setState`
+ * (unlike `dispatch`) recreates every `ViewPlugin` instance fresh rather than calling `update()`
+ * on it, that recheck deliberately keys its liveness check off `view.dom.isConnected`, not
+ * `this.destroyed`: this specific instance may already have been quietly replaced by the time
+ * the timer fires, even though the pane itself, and the one long-lived `EditorView` it wraps,
+ * never closed.
+ *
  * "Added": a thrown error inside the classifier, recorder or deferred-fold recheck is caught and
  * logged per-update, so one bad transaction can never block the rest of the batch, and a bug
  * here can never stop typing or folding in the editor itself. The restore pass itself is async
  * and runs detached from `update()` (dispatching happens once the match resolves, not
  * synchronously) — a rejection there is caught and logged the same way, never left as an
  * unhandled promise rejection.
+ *
+ * R14: the grace-recheck timer `scheduleFirstOpenGraceRecheck` schedules checks a shared
+ * `disposed` flag (`EditorWatcherDeps.disposed`) first, before anything else, and bails out if
+ * set. main.ts sets `disposed.current = true` once, from its own `onunload()`, when the whole
+ * plugin unloads. Without that check, disabling the plugin within the ~150ms grace window would
+ * leave the timer armed against the old `FoldStore` — if the plugin were re-enabled in that same
+ * short window, the stale timer firing later could call `store.set` on a `FoldStore` instance
+ * nothing else still uses, clobbering whatever the new instance already wrote on its next
+ * debounced save. This is deliberately a flag shared across every `ViewPlugin` instance one
+ * `createEditorWatcher` call creates, not any one instance's own `this.destroyed` — that already
+ * goes true on an ordinary single-pane CM6 reconfigure (T20, directly above), which must NOT
+ * suppress this recheck. The recheck also re-checks `activeMarkdownPath(this.view) === path`
+ * right before merging (not just the doc-text check already there), so a pane that has since
+ * switched to a *different* file whose text happens to match `textAtAdoption` exactly is never
+ * merged into the wrong store entry.
+ *
+ * T22: the grace recheck's own candidate lookup (and the constructor's synchronous `buildBaseline`
+ * call above it) used to require an *exact* `{startLine,endLine}` match between a live fold and
+ * a `buildAnchors` candidate. That missed a live fold made by directly clicking its own fold
+ * indicator (never closed/reopened since) whenever the block is followed by a blank separator
+ * line before its next sibling: `buildAnchors`' own `closeFramesAbove` swallows that blank run
+ * into the block's own candidate range (anchors.ts), but a click-to-fold action only ever covers
+ * the block's own content, with no notion of what follows it. `resolveCandidateForLiveRange`
+ * (src/live-folds.ts) now falls back, once the exact match fails, to widening the live range
+ * forward over nothing but blank lines to reach such a candidate — used by both this recheck and
+ * `src/baseline.ts`'s own lookup, so the constructor's first synchronous read and this grace
+ * recheck agree on the same candidate for the same live fold either way.
  */
 import { ChangeSet } from "@codemirror/state";
 import { ViewPlugin, type EditorView, type ViewUpdate, type PluginValue } from "@codemirror/view";
@@ -72,8 +125,12 @@ import {
 	mapDeferredTargets,
 	type DeferredFoldTarget,
 } from "./fold-restorer";
-import type { MatcherOptions } from "./matcher";
+import { buildBaseline } from "./baseline";
+import { groupCandidatesByStartLine, liveFoldedLineRanges, resolveCandidateForLiveRange } from "./live-folds";
+import { anchorKey, buildAnchors, parseAnchor } from "./anchors";
+import { MAX_FOLDS, type MatcherOptions } from "./matcher";
 import type { FoldStore } from "./fold-store";
+import type { StoredAnchor } from "./types";
 
 export interface EditorWatcherDeps {
 	store: FoldStore;
@@ -88,6 +145,23 @@ export interface EditorWatcherDeps {
 	/** Passed through to the matcher for the restore pass (PR-5); overridable only for tests
 	 * (e.g. to shrink the caps/thresholds, or to spy on `yieldToHost`). */
 	matcherOptions?: MatcherOptions;
+	/** PR-6 (G6): clock passed through to `restoreSettledChange`'s dormant handling. Defaults to
+	 * `Date.now`; overridable so a test can drive dormancy/expiry with a fake clock. */
+	now?: () => number;
+	/** T20: how long after a first-open baseline adoption the constructor's grace re-check
+	 * (`scheduleFirstOpenGraceRecheck`) waits before merging in any live fold that wasn't
+	 * captured by the synchronous read. Overridable only for tests; defaults to the same
+	 * 150ms E9 already treats as "settled" elsewhere in this file. */
+	firstOpenGraceMs?: number;
+	/** R14: a flag shared across every `ViewPlugin` instance this `createEditorWatcher` call
+	 * creates (one `deps` object per call — see the file comment). main.ts sets
+	 * `.current = true` from its own `onunload()`, once, when the whole plugin unloads, so a
+	 * grace-recheck timer still pending at that moment (see
+	 * `scheduleFirstOpenGraceRecheck`) becomes a no-op rather than writing to a `FoldStore`
+	 * instance a freshly re-enabled plugin has already replaced. Deliberately not derived
+	 * from any one `ViewPlugin` instance's own `destroyed` flag, which also goes true on an
+	 * ordinary single-pane CM6 reconfigure (T20) that must NOT suppress this recheck. */
+	disposed?: { current: boolean };
 }
 
 function activeMarkdownPath(view: EditorView): string | null {
@@ -131,6 +205,114 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				deps.flushDelayMs ?? 150,
 				deps.window ?? window
 			);
+
+			// E5/G15: a brand-new pane for a Markdown file the store has never seen — adopt
+			// Obsidian's current fold state as the baseline, synchronously, before any
+			// transaction runs. See the file comment for why this is only one of the two
+			// places this same "no entry" case is handled.
+			try {
+				const path = activeMarkdownPath(view);
+				if (path && !deps.store.get(path)) {
+					const text = view.state.doc.toString();
+					const baseline = buildBaseline(view.state, text);
+					deps.store.set(path, {
+						contentHash: baseline.contentHash,
+						folds: baseline.anchors as unknown as StoredAnchor[],
+						dormant: [],
+					});
+					// T20: when this ViewPlugin instance is created by Obsidian reconfiguring
+					// an *already-open* pane's CM6 extensions (the re-enable-over-an-open-pane
+					// path src/main.ts's T2 fix exists to exercise) rather than by a brand-new
+					// EditorView's own initial construction, a live fold that was genuinely
+					// already on screen at the moment of enabling has been observed missing
+					// from this synchronous read against real Obsidian (not reproducible
+					// against jsdom/CM6 directly, where a reconfigure's own fold state is
+					// already consistent by the time this constructor runs — see the T20
+					// issue). A short grace-period re-check, reading the view's live state
+					// again shortly afterwards and merging in (never removing) any live fold
+					// this first read didn't capture, guards against that without changing
+					// anything about the ordinary, already-reliable brand-new-pane path (there
+					// is nothing left to merge there).
+					this.scheduleFirstOpenGraceRecheck(path, text);
+				}
+			} catch (err) {
+				console.error("persistent-folded-state: first-open baseline failed", err);
+			}
+		}
+
+		/** T20: scheduled once, from the constructor, right after a first-open baseline was
+		 * just adopted for `path`. Re-reads the view's *live* fold state after a short grace
+		 * period and merges in (never removes) any live fold the synchronous constructor-time
+		 * read didn't capture — see the constructor's own comment for why this exists. A no-op
+		 * once the document itself has changed (no longer "the text as opened"), once the
+		 * store entry for `path` has been removed entirely (e.g. "Forget stored folds for this
+		 * note"), or once there is nothing left to merge (the common case). */
+		private scheduleFirstOpenGraceRecheck(path: string, textAtAdoption: string): void {
+			const win = deps.window ?? window;
+			const view = this.view;
+			win.setTimeout(() => {
+				// R14: the whole Obsidian plugin may have unloaded since this timer was
+				// scheduled — checked first, ahead of any other liveness check. This is
+				// deliberately a flag shared (via `deps`) across every `ViewPlugin` instance
+				// this one `createEditorWatcher` call ever creates, not `this.destroyed`:
+				// `this.destroyed` (and CM6 itself, via `EditorView.setState`/reconfigure —
+				// see below) already goes true whenever just *this one pane* is reconfigured
+				// while the plugin stays loaded, which must NOT cancel this recheck (that's
+				// the whole point of T20, directly below). Only main.ts's own `onunload` sets
+				// `deps.disposed.current`, so this is the one check that's actually scoped to
+				// "the plugin itself went away", guarding against a late `store.set` landing on
+				// a `FoldStore` instance a freshly re-enabled plugin has already replaced.
+				if (deps.disposed?.current) return;
+				// Deliberately not `this.destroyed`: real Obsidian (and `EditorView.setState`,
+				// which CM6 treats as "recreate every ViewPlugin fresh" rather than as an
+				// incremental update — see T20) can tear down and replace *this* ViewPlugin
+				// instance for the same, still-open pane before this timer fires, without the
+				// underlying `EditorView`/pane itself ever closing. `view` is still the one,
+				// long-lived object either way, so its `.dom.isConnected` is the right liveness
+				// check — unlike `this.destroyed`, it still reflects reality once a
+				// reconfigure/setState has quietly replaced this specific instance.
+				if (!view.dom.isConnected) return;
+				try {
+					if (this.view.state.doc.toString() !== textAtAdoption) return;
+					// R14: the pane may since have navigated to a *different* file whose text
+					// happens to match `textAtAdoption` exactly (e.g. two notes seeded from the
+					// same template) — only merge if it's still showing the file this baseline
+					// was adopted for.
+					if (activeMarkdownPath(this.view) !== path) return;
+					const latest = deps.store.get(path);
+					if (!latest) return;
+
+					const liveFolds = liveFoldedLineRanges(this.view.state);
+					if (liveFolds.length === 0) return;
+
+					const candidates = buildAnchors(textAtAdoption);
+					const candidatesByStart = groupCandidatesByStartLine(candidates);
+
+					const existingKeys = new Set<string>();
+					for (const raw of latest.folds) {
+						const anchor = parseAnchor(raw);
+						if (anchor) existingKeys.add(anchorKey(anchor));
+					}
+
+					const merged = [...latest.folds];
+					let changed = false;
+					for (const range of liveFolds) {
+						if (merged.length >= MAX_FOLDS) break; // E6: respects the PR-4 cap here too
+						const candidate = resolveCandidateForLiveRange(this.view.state, range, candidatesByStart);
+						if (!candidate) continue; // E5: a range the PR-3 builder can't produce stays skipped
+						const key = anchorKey(candidate.anchor);
+						if (existingKeys.has(key)) continue;
+						existingKeys.add(key);
+						merged.push(candidate.anchor as unknown as StoredAnchor);
+						changed = true;
+					}
+					if (changed) {
+						deps.store.set(path, { contentHash: latest.contentHash, folds: merged, dormant: latest.dormant });
+					}
+				} catch (err) {
+					console.error("persistent-folded-state: first-open baseline grace recheck failed", err);
+				}
+			}, deps.firstOpenGraceMs ?? 150);
 		}
 
 		private runRestore(path: string, text: string): void {
@@ -142,6 +324,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				getActivePath: activeMarkdownPath,
 				isSuperseded: () => this.generation !== startGeneration,
 				getChangesSinceSnapshot: () => this.changesSinceSnapshot ?? ChangeSet.empty(this.view.state.doc.length),
+				now: deps.now,
 			})
 				.then((deferred) => {
 					if (this.destroyed) return;
