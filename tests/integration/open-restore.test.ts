@@ -278,6 +278,61 @@ describe("open-restore via the plugin's file-open handler", () => {
 		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1: only fold state changed, never the text
 	}, 10000);
 
+	it("T8: scheduleNativeRestoreGuard re-resolves the live EditorView fresh at each check (resolveView), and its onLayoutReady-triggered check corrects a native restore that lands only once Obsidian's own layout-ready event fires, not just at the two fixed delays", async () => {
+		const app = new App();
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } },
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+
+		// Same TEXT_V3 reorder as the T1 test above: equal line count, "## Tuesday" moved to
+		// lines 3-4. The pane that was active at file-open time (viewA) gets restoreOnOpen's
+		// own correct initial dispatch; nothing ever folds anything stale on it directly.
+		const viewA = makeView(TEXT_V3);
+		openFile(app, NOTE_PATH, viewA);
+		await settle();
+		expect(liveFoldedLineRanges(viewA)).toEqual([{ startLine: 3, endLine: 4 }]);
+
+		// Simulate real Obsidian swapping the pane's own editor for a different EditorView
+		// instance showing the same file (T8's own theory for why the old, fixed-delay-only
+		// guard was found never correcting anything live against a real relaunch: the one
+		// `view` reference it closed over at file-open time had gone stale by the time any
+		// check actually ran). The workspace's active editor now resolves to viewB, not the
+		// original viewA.
+		const viewB = makeView(TEXT_V3);
+		const replacementPane = new MockMarkdownView();
+		replacementPane.file = new MockTFile(NOTE_PATH);
+		replacementPane.editor = new MockEditor(viewB);
+		(app.workspace as unknown as MockWorkspace).setActiveView(replacementPane);
+
+		// The late native restore lands on viewB (the replacement), as an untagged
+		// transaction — never on viewA, which nothing in this scenario ever touches again.
+		const staleFrom = viewB.state.doc.line(1).to;
+		const staleTo = viewB.state.doc.line(2).to;
+		viewB.dispatch({ effects: foldEffect.of({ from: staleFrom, to: staleTo }) });
+		expect(liveFoldedLineRanges(viewB)).toEqual([{ startLine: 1, endLine: 2 }]); // stale, uncorrected so far
+
+		// Obsidian's own "layout is actually ready" event — what scheduleNativeRestoreGuard's
+		// onLayoutReady-triggered check is tied to. It was registered the moment restoreOnOpen
+		// ran above, queued (not yet fired) since the mock workspace starts with layout not
+		// ready — exactly like a real relaunch, where layout only becomes ready partway
+		// through startup, potentially well after file-open already fired for a restored pane.
+		(app.workspace as unknown as MockWorkspace).triggerLayoutReady();
+
+		// Without T8's fix, this check would still be looking at the stale viewA reference
+		// (already correct, so a no-op) and viewB's stale fold would never be touched. With
+		// resolveView re-resolving the *current* active editor, the check corrects viewB
+		// instead.
+		expect(liveFoldedLineRanges(viewB)).toEqual([{ startLine: 3, endLine: 4 }]);
+		// viewA, never touched again, is untouched by this correction.
+		expect(liveFoldedLineRanges(viewA)).toEqual([{ startLine: 3, endLine: 4 }]);
+	}, 10000);
+
 	it("G8 hash changed: several stored folds that match nothing all go dormant, leaving the note fully unfolded, without throwing", async () => {
 		const app = new App();
 		(app.vault as unknown as MockVault).setExists(NOTE_PATH);

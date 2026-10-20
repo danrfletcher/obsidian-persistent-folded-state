@@ -92,6 +92,27 @@ export interface OpenRestoreDeps {
 	window?: Window;
 	/** Clock used for `dormantSince`/age checks. Defaults to `Date.now`. */
 	now?: () => number;
+	/** T8: re-resolves the live CM6 `EditorView` for `path`, fresh, each time
+	 * `scheduleNativeRestoreGuard` checks — not just once, up front, the way the `view` this
+	 * function was originally called with is. Real Obsidian relaunch testing found the guard
+	 * never correcting a late native restore at all, no matter how long afterwards it was
+	 * checked; a `view` captured once at file-open time and never re-resolved is the one part
+	 * of the guard that has no way to recover from Obsidian quietly replacing the pane's
+	 * editor sometime during a slow startup (deferred-leaf resolution, see T20's own precedent
+	 * in src/editor-watcher.ts) — every later check against the stale reference would silently
+	 * bail at its very first liveness check (`view.dom.isConnected`) forever after. Called with
+	 * `path`; returning `null` falls back to the originally-captured `view` (every existing
+	 * caller and test that doesn't pass this). `src/main.ts` supplies a real one, re-reading
+	 * `app.workspace.activeEditor` the same way it resolves `cm` at file-open time. */
+	resolveView?: (path: string) => EditorView | null;
+	/** T8: Obsidian's own "the initial layout, including every deferred leaf's view, has
+	 * finished resolving" signal — the same one `main.ts`'s own orphan-prune (R1) already
+	 * waits on. `scheduleNativeRestoreGuard`'s own fixed delays are a guess at "long enough";
+	 * a real relaunch's native restore has been observed arriving well past them. This adds
+	 * one more guard check tied to an actual Obsidian-reported event instead of another guess,
+	 * firing immediately if layout is already ready (the common, already-fast case) or once it
+	 * becomes ready otherwise. Optional — omitted by every test that has no workspace to ask. */
+	onLayoutReady?: (cb: () => void) => void;
 }
 
 function isFoldable(range: LineRange): boolean {
@@ -153,7 +174,19 @@ function dispatchFoldAndUnfold(view: EditorView, toFold: readonly LineRange[], t
  * all) once the live state already agrees with `matched` — the ordinary, already-synchronous
  * case this guards against never fires a second dispatch. Bails out (without touching the view
  * or the store) once the pane has gone away or moved on to different text, so a guard scheduled
- * for one open can never act against a later one in the same pane. */
+ * for one open can never act against a later one in the same pane.
+ *
+ * T8: against a real Obsidian relaunch (not just a same-session reopen), these two fixed delays
+ * were observed never correcting anything at all — not because the reconciliation itself is
+ * wrong, but because both checks can run, find nothing stale yet (native restore hasn't landed),
+ * and nothing ever checks again afterwards. There is no single delay that is "long enough" for
+ * every machine and every startup — a deferred leaf's real editor can resolve an unpredictable
+ * amount of time into a slow relaunch. Rather than guess a third, longer number, the
+ * `onLayoutReady` check added below `scheduleNativeRestoreGuard` ties the backstop check to an
+ * actual Obsidian-reported event (the same one `main.ts`'s own orphan-prune already waits on)
+ * instead of a guess, and `resolveView` re-resolves the live `EditorView` fresh at every check
+ * rather than trusting the one reference captured at file-open time, in case that's what was
+ * silently going stale and bailing out the old checks for good. */
 const NATIVE_RESTORE_GUARD_DELAYS_MS: readonly number[] = [50, 300];
 
 /** T1: the one concrete side effect a late, untagged native-restore transaction has been
@@ -204,18 +237,29 @@ function scheduleNativeRestoreGuard(
 	store: FoldStore,
 	path: string,
 	win: Window,
+	resolveView?: (path: string) => EditorView | null,
+	onLayoutReady?: (cb: () => void) => void,
 	delaysMs: readonly number[] = NATIVE_RESTORE_GUARD_DELAYS_MS,
 ): void {
+	const check = (): void => {
+		// T8: re-resolve fresh every time rather than trusting the closed-over `view` — see
+		// this function's own file comment (T8) for why.
+		const live = resolveView?.(path) ?? view;
+		if (!live.dom.isConnected) return; // the pane was destroyed since this open
+		if (live.state.doc.toString() !== expectedText) return; // moved on (edit, or a different file)
+		const nativeFolded = liveFoldedLineRanges(live.state);
+		const { toFold, toUnfold } = reconcileNativeRestore(nativeFolded, matched);
+		dispatchFoldAndUnfold(live, toFold, toUnfold);
+		cleanupSpuriousNativeFolds(store, path, candidates, toUnfold);
+	};
 	for (const delay of delaysMs) {
-		win.setTimeout(() => {
-			if (!view.dom.isConnected) return; // the pane was destroyed since this open
-			if (view.state.doc.toString() !== expectedText) return; // moved on (edit, or a different file)
-			const nativeFolded = liveFoldedLineRanges(view.state);
-			const { toFold, toUnfold } = reconcileNativeRestore(nativeFolded, matched);
-			dispatchFoldAndUnfold(view, toFold, toUnfold);
-			cleanupSpuriousNativeFolds(store, path, candidates, toUnfold);
-		}, delay);
+		win.setTimeout(check, delay);
 	}
+	// T8: one more check tied to Obsidian's own "layout (including every deferred leaf) is
+	// actually ready" event, rather than a third guessed delay — see this function's own file
+	// comment. Fires immediately if layout is already ready (redundant with, but no more
+	// costly than, the 300ms check above in that case).
+	onLayoutReady?.(check);
 }
 
 /** G8 (hash unchanged): applies `folds` as stored, with no matching at all — content is
@@ -277,7 +321,17 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 		// T1: native restore for this pane can still land after this handler already
 		// returned — see scheduleNativeRestoreGuard's own comment. Nothing is ever matched
 		// here, so every guard check keeps unfolding anything native that shows up late.
-		scheduleNativeRestoreGuard(view, text, buildAnchors(text), [], deps.store, path, deps.window ?? window);
+		scheduleNativeRestoreGuard(
+			view,
+			text,
+			buildAnchors(text),
+			[],
+			deps.store,
+			path,
+			deps.window ?? window,
+			deps.resolveView,
+			deps.onLayoutReady
+		);
 		return;
 	}
 
@@ -350,7 +404,7 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 	// synchronous snapshot, and real Obsidian has been observed applying its own native
 	// restore for this exact pane *after* it, clobbering this dispatch. Re-checks the same
 	// `matchedRanges` decision a couple more times shortly afterwards.
-	scheduleNativeRestoreGuard(view, text, candidates, matchedRanges, deps.store, path, win);
+	scheduleNativeRestoreGuard(view, text, candidates, matchedRanges, deps.store, path, win, deps.resolveView, deps.onLayoutReady);
 
 	// Bookkeeping delta against a fresh store read (E3) — same discipline as restoreSettledChange.
 	const latest = deps.store.get(path);

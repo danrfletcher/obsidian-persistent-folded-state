@@ -168,7 +168,19 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 					const cm = (info.editor as unknown as { cm?: EditorView } | undefined)?.cm;
 					if (!cm) return;
 					const text = cm.state.doc.toString();
-					restoreOnOpen(cm, file.path, text, { store: this.store }).catch((err: unknown) => {
+					restoreOnOpen(cm, file.path, text, {
+						store: this.store,
+						// T8: resolved fresh on every scheduleNativeRestoreGuard check, not
+						// just once here — see src/open-restore.ts's OpenRestoreDeps comment
+						// for why a view captured only at file-open time was found, live,
+						// never correcting a late native restore after a real relaunch.
+						resolveView: (path) => {
+							const current = this.app.workspace.activeEditor;
+							if (!current || current.file?.path !== path) return null;
+							return (current.editor as unknown as { cm?: EditorView } | undefined)?.cm ?? null;
+						},
+						onLayoutReady: (cb) => this.app.workspace.onLayoutReady(cb),
+					}).catch((err: unknown) => {
 						console.error("persistent-folded-state: open restore failed", err);
 					});
 				} catch (err) {
