@@ -258,6 +258,17 @@ export async function restoreSettledChange(
 	text: string,
 	deps: RestoreRunDeps,
 ): Promise<DeferredFoldTarget[]> {
+	// R2 (PR-7): a settle timer captures `path` when it's first triggered (src/editor-watcher.ts),
+	// but by the time it actually fires, a rename may have already landed (real Obsidian mutates
+	// a renamed file's own TFile.path in place, so the pane's own active path reflects the rename
+	// immediately — src/fold-store.ts's `handleRename` has already re-keyed the store entry away
+	// from `path` too). Checked here, before the E5/G15 "no entry" branch below, so a stale
+	// `path` can never fall into that branch and have `buildBaseline` create a brand-new store
+	// entry under a key nothing on disk answers to any more. The later, narrower check further
+	// down (after the possibly-slow match) still applies for the case where the rename arrives
+	// *during* that match.
+	if (deps.getActivePath(view) !== path) return [];
+
 	const snapshot = deps.store.get(path);
 	if (!snapshot) {
 		// E5/G15: a never-before-seen file — there is nothing to match against, so adopt

@@ -15,10 +15,19 @@
  * PR-6 (G6/E7): a dormant anchor old enough is forgotten "at plugin load, or when the store is
  * flushed" — both pruned here via `expireDormant` (src/dormant.ts), using the injectable `now`
  * option so this stays testable with a fake clock rather than `Date.now()`.
+ *
+ * PR-7 (G9/G10): `handleRename`/`handleDelete` are the thin wrappers `main.ts`'s own
+ * `vault.on("rename"/"delete", ...)` listeners call into; `pruneOrphans` is called once from
+ * `onload()` after `load()` (G9's "renamed outside Obsidian: not in v1 — pruned at plugin
+ * load"). All three flush at once, same as `forget`/`forgetAll` and for the same reason (E12).
+ * The actual re-key/removal/prune logic is pure and lives in `src/vault-lifecycle.ts`; this file
+ * only converts between its own `Map` and that module's plain-object shape and handles the
+ * dirty/flush bookkeeping.
  */
 import type { FileFoldRecord, StoreData } from "./types";
 import { parseAnchor } from "./anchors";
 import { expireDormant, parseDormantAnchor } from "./dormant";
+import { deleteFiles, pruneOrphanFiles, renameFiles } from "./vault-lifecycle";
 
 /** Bumped only if a later PR needs to migrate an incompatible on-disk shape. An unrecognised
  * version is treated the same as a corrupt file (E8): start empty rather than guess. */
@@ -213,6 +222,59 @@ export class FoldStore {
 		this.dirty = true;
 		this.flushAndLog();
 		return count;
+	}
+
+	/** G9 (PR-7): re-keys `oldPath` (and, for a folder rename/move, every entry nested beneath
+	 * it) to `newPath`, carrying `contentHash` and `dormant` along unchanged — nothing here
+	 * re-matches, since the file's own content didn't change, only where it lives. Flushes at
+	 * once, same as `forget`/`forgetAll`: a rename arriving while a debounced flush is still
+	 * pending for the old key must never let a later write land under that old key (flushing
+	 * here, after the in-memory map has already been re-keyed, means even a *stale* pending
+	 * timer firing afterwards reads the already-renamed map, not the old key). Returns whether
+	 * anything was actually found under `oldPath`; a miss is a no-op that never reaches
+	 * `saveData`. */
+	handleRename(oldPath: string, newPath: string): boolean {
+		if (oldPath === newPath) return false;
+		const before = Object.fromEntries(this.files);
+		const prefix = `${oldPath}/`;
+		if (!(oldPath in before) && !Object.keys(before).some((p) => p.startsWith(prefix))) return false;
+		const after = renameFiles(before, oldPath, newPath);
+		this.files = new Map(Object.entries(after));
+		this.dirty = true;
+		this.flushAndLog();
+		return true;
+	}
+
+	/** G10 (PR-7): removes `path` (and, for a folder delete, every entry nested beneath it).
+	 * Flushes at once, for the same reason `forget` does. Returns whether anything was actually
+	 * removed; a miss is a no-op that never reaches `saveData`. */
+	handleDelete(path: string): boolean {
+		const before = Object.fromEntries(this.files);
+		const prefix = `${path}/`;
+		if (!(path in before) && !Object.keys(before).some((p) => p.startsWith(prefix))) return false;
+		const after = deleteFiles(before, path);
+		this.files = new Map(Object.entries(after));
+		this.dirty = true;
+		this.flushAndLog();
+		return true;
+	}
+
+	/** G9 ("renamed outside Obsidian: not in v1"): called once from `main.ts`'s own `onload()`,
+	 * right after `load()`, so an orphan left behind by a rename, move or delete that happened
+	 * outside Obsidian (or while it wasn't running) is pruned at the next plugin load rather
+	 * than kept forever. `exists` is injected (rather than this file depending on `app.vault`
+	 * itself — see the file comment) so this stays testable without a real vault. Flushes at
+	 * once if anything was actually pruned; a no-op (and no flush) otherwise. Returns the
+	 * number of entries removed. */
+	pruneOrphans(exists: (path: string) => boolean): number {
+		const before = Object.fromEntries(this.files);
+		const after = pruneOrphanFiles(before, exists);
+		const removed = Object.keys(before).length - Object.keys(after).length;
+		if (removed === 0) return 0;
+		this.files = new Map(Object.entries(after));
+		this.dirty = true;
+		this.flushAndLog();
+		return removed;
 	}
 
 	/** Immediate flush, bypassing the debounce window. Safe to call even with nothing pending
