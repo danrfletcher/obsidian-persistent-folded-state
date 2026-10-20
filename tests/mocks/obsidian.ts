@@ -11,6 +11,22 @@
  *   `tests/integration/data-json.test.ts` points them at real files instead.
  */
 
+// --- CM6 interop (Obsidian's own StateFields, real @codemirror/state) ----------------------------
+import { StateField } from "@codemirror/state";
+
+/** Real obsidian exports `editorInfoField: StateField<MarkdownFileInfo>`; this mock defines the
+ * exact same kind of field (a plain passthrough `StateField`, backed by the real
+ * `@codemirror/state` package the editor watcher is also built against) so a test can set a
+ * file for a given `EditorState` with `editorInfoField.init(() => ({ file }))`, the same way
+ * real Obsidian wires a `MarkdownView`'s file into its CM6 state. */
+export interface MockMarkdownFileInfo {
+	file: { path: string; extension: string } | null;
+}
+export const editorInfoField = StateField.define<MockMarkdownFileInfo>({
+	create: () => ({ file: null }),
+	update: (value) => value,
+});
+
 // --- DOM helpers (Obsidian's HTMLElement extensions) ---------------------------------------------
 interface CreateOpts {
 	text?: string;
@@ -117,6 +133,41 @@ export class Notice {
 }
 
 export class Scope {}
+
+/** Real Obsidian's `Events` base class (used by `Vault`/`Workspace`/`MetadataCache`): `on`
+ * registers a listener and returns a ref `off`/`offref` can later remove; `trigger` calls every
+ * listener for that name, in registration order, catching nothing itself (a throwing listener
+ * propagates, same as real Obsidian's documented "executing all the listeners in order even if
+ * some of them throw" — this mock keeps that simple rather than exactly replicating the
+ * async-rethrow wording, which no test here depends on). R3 (`src/main.ts`) is this PR's only
+ * user: the "settled non-user change" subscription point. */
+export interface EventRef {
+	name: string;
+	callback: (...data: unknown[]) => unknown;
+}
+
+export class Events {
+	private listeners = new Map<string, Set<(...data: unknown[]) => unknown>>();
+
+	on(name: string, callback: (...data: unknown[]) => unknown): EventRef {
+		let set = this.listeners.get(name);
+		if (!set) {
+			set = new Set();
+			this.listeners.set(name, set);
+		}
+		set.add(callback);
+		return { name, callback };
+	}
+	off(name: string, callback: (...data: unknown[]) => unknown): void {
+		this.listeners.get(name)?.delete(callback);
+	}
+	offref(ref: EventRef): void {
+		this.off(ref.name, ref.callback);
+	}
+	trigger(name: string, ...data: unknown[]): void {
+		for (const callback of this.listeners.get(name) ?? []) callback(...data);
+	}
+}
 
 /** Base `Modal`: a real jsdom DOM, closing on Escape and on a backdrop click, same as real
  * Obsidian — so every subclass (just `ForgetAllFoldsModal` in this PR) gets that for free. */
@@ -341,6 +392,12 @@ export class Plugin {
 		el.addEventListener(type, cb);
 		this.domListeners.push({ el, type, cb });
 	}
+
+	/** Real Obsidian applies the extension to every open (and later-opened) CM6 editor and tears
+	 * it back out on unload; this mock only needs to not throw when `onload()` calls it — the
+	 * editor-watcher's own CM6-level tests exercise the extension directly against a real
+	 * `EditorState`/`EditorView`, which is where its actual attach/detach behaviour is proven. */
+	registerEditorExtension(_extension: unknown): void {}
 
 	/** Real Obsidian's own `Component.unload()`: called when the plugin is disabled. Runs
 	 * `onunload()`, then detaches every `registerDomEvent` listener (E7/E12: "gone after

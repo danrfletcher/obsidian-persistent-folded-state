@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, Plugin, type PluginManifest } from "obsidian";
+import type { Plugin as MockPlugin } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
 import { FORGET_NOTE_FOLDS_COMMAND_ID } from "../../src/commands";
 
@@ -36,6 +37,10 @@ describe("lifecycle: onload/onunload flush", () => {
 		expect(addCommand).toHaveBeenCalledTimes(1);
 		expect(addCommand.mock.calls[0][0].id).toBe(FORGET_NOTE_FOLDS_COMMAND_ID);
 		expect(addSettingTab).toHaveBeenCalledTimes(1);
+		// F10: no debug command — the registered command list is exactly this one.
+		expect((plugin as unknown as MockPlugin).getCommands().map((command) => command.id)).toEqual([
+			FORGET_NOTE_FOLDS_COMMAND_ID,
+		]);
 	});
 
 	it("onunload flushes pending state at once", async () => {
