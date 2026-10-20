@@ -464,6 +464,69 @@ describe("open-restore via the plugin's file-open handler", () => {
 		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1
 	}, 10000);
 
+	it(
+		"T19/T20/T22: a native restore that replaces the pane's whole fold state (unfolding the matched target and folding a stale offset, in the same transaction) well after the guard's first check already found nothing stale is still corrected, and the spurious anchor it plants is cleaned up",
+		async () => {
+			const app = new App();
+			(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+			const stored = {
+				value: {
+					version: 1,
+					files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } },
+				},
+			};
+			const plugin = makePlugin(app, stored);
+			// T19: real production delays (NATIVE_RESTORE_GUARD_DELAYS_MS) run out to 16s so a
+			// slow, real relaunch's native restore has time to arrive — shrunk here so the test
+			// runs in milliseconds. The first check (10ms) still finds nothing stale, the same
+			// one chance the "never unfolds..." test above exercises, well before the late
+			// native restore below lands; only a *later* check (40ms) can catch it.
+			plugin.guardDelaysMs = [10, 40];
+			await plugin.onload();
+
+			// Same wiring as the T1/T8 tests above: the real createEditorWatcher extension, so
+			// the spurious-anchor side effect (src/fold-recorder.ts recording the stale fold as
+			// a fresh user fold) is exercised for real.
+			const watcher = createEditorWatcher({ store: plugin.store, window });
+			const state = EditorState.create({
+				doc: TEXT_V3,
+				extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+			});
+			const view = new EditorView({ state, parent: document.body });
+
+			openFile(app, NOTE_PATH, view);
+			// Past the 10ms check, which finds "## Tuesday" (lines 3-4) correctly live and
+			// nothing else — the guard's simple one-shot decision is already spent here,
+			// finding nothing to correct.
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+
+			// Real Obsidian has been observed, live, replacing a pane's whole fold state well
+			// after this guard's first check already ran: the plugin's own correctly-matched
+			// fold is undone and a stale offset from the file's old (pre-edit) line numbering
+			// is applied instead, both in one untagged transaction.
+			const staleFrom = view.state.doc.line(1).to;
+			const staleTo = view.state.doc.line(2).to;
+			const tuesdayFrom = view.state.doc.line(3).to;
+			const tuesdayTo = view.state.doc.line(4).to;
+			view.dispatch({
+				effects: [unfoldEffect.of({ from: tuesdayFrom, to: tuesdayTo }), foldEffect.of({ from: staleFrom, to: staleTo })],
+			});
+			expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 2 }]); // stale, uncorrected so far
+
+			// Past the 40ms check — the correlated "target missing + new stale fold" signal
+			// (nativeChurn) corrects it even though the simple one-shot already decided.
+			await new Promise((resolve) => setTimeout(resolve, 60));
+
+			expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+			const after = plugin.store.get(NOTE_PATH);
+			expect(after?.folds).toHaveLength(1);
+			expect((after?.folds[0] as unknown as { text: string }).text).toBe("tuesday");
+			expect(view.state.doc.toString()).toBe(TEXT_V3); // F1: only fold state changed, never the text
+		},
+		10000
+	);
+
 	it("G8 hash changed: several stored folds that match nothing all go dormant, leaving the note fully unfolded, without throwing", async () => {
 		const app = new App();
 		(app.vault as unknown as MockVault).setExists(NOTE_PATH);

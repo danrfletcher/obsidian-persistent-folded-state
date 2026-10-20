@@ -101,6 +101,11 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	/** R14: shared with every `createEditorWatcher`-created `ViewPlugin` instance; set once
 	 * `onunload()` runs. See the file comment. */
 	private readonly editorWatcherDisposed = { current: false };
+	/** T19/T20/T22: test-only override for `scheduleNativeRestoreGuard`'s check schedule
+	 * (`src/open-restore.ts`'s `NATIVE_RESTORE_GUARD_DELAYS_MS`), which is deliberately several
+	 * seconds long in production to give a slow, real relaunch's native restore time to arrive.
+	 * Set before calling `onload()`; left `undefined` (the default) in production. */
+	guardDelaysMs?: readonly number[];
 
 	async onload(): Promise<void> {
 		this.store = new FoldStore({
@@ -180,6 +185,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 							return (current.editor as unknown as { cm?: EditorView } | undefined)?.cm ?? null;
 						},
 						onLayoutReady: (cb) => this.app.workspace.onLayoutReady(cb),
+						guardDelaysMs: this.guardDelaysMs,
 					}).catch((err: unknown) => {
 						console.error("persistent-folded-state: open restore failed", err);
 					});
