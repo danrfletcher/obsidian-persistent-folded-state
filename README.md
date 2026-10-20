@@ -5,23 +5,32 @@ tasks are collapsed or expanded) across the kind of external file modification t
 normally reset them: an AI agent editing the file, a sync tool, a git pull, or anything else that
 touches the file outside Obsidian's own editor.
 
-## Status: PR-1
+## Status: PR-5
 
-This PR builds the persistence layer every later PR sits on, and a minimal UI so it's usable and
-testable on its own:
+Restore is wired in: on a settled external edit, the plugin snapshots the stored anchors for
+that note, matches them against the new text (PR-4's matcher), and dispatches tagged CM6 fold
+effects for whatever matched — in every open pane, one settle timer and one restore pass per
+pane, all reading and writing the one shared `FoldStore`.
 
-- **`src/fold-store.ts`** — an in-memory map of per-file fold records, flushed to Obsidian's own
-  `data.json`. Debounces an ordinary change 150ms after the last one; flushes at once for a
-  user-triggered forget or on unload/visibility-hidden/pagehide. Never throws on load, however
-  corrupt or missing the on-disk file is — it just starts empty.
-- **`src/types.ts`** — the on-disk/in-memory shapes. The contents of a single fold entry
-  (anchor kind, indent, text, …) are deliberately left opaque here; a later PR defines that.
-- **The "Forget stored folds for this note" command** — clears the active note's stored folds.
-  Only visible with a Markdown editor open on a real file.
-- **The settings tab** — one button, "Forget all stored folds", behind a confirmation modal.
+- **`src/fold-restorer.ts`** — the CM6-level restore pass: snapshots stored anchors at settle
+  time, matches with a real (not no-op) yielding scheduler, dispatches tagged fold effects, and
+  refreshes the note's stored content hash afterwards.
+- **`src/restore-plan.ts`** — the pure planning step from (the matcher's own decision, live
+  folded ranges, cursor position, which anchors the store still holds) to (ranges to fold now,
+  ranges deferred until the cursor leaves them).
+- **`src/describe-fold.ts`** — now builds a real `Anchor` (PR-3's `buildAnchors`) instead of
+  PR-2's line-local guess; a PR-2-era raw-text record is discarded on load rather than matched.
+- **`src/editor-watcher.ts`** — wires the restore pass into the settle timer and re-checks
+  deferred (cursor-inside) targets on every later update.
 
-Not in this PR: actually recording a fold when you fold something, the reload hook that restores
-folds, anchors, matching text that moved, or the dormant-anchor reprieve. Those land in later PRs.
+Earlier PRs: PR-1 built the persistence layer (`src/fold-store.ts`) and a minimal UI (the
+"Forget stored folds for this note" command, the settings tab's "Forget all stored folds"
+button). PR-2 added the editor watcher, fold recording and the settle timer. PR-3 added the pure
+anchor builder (`src/anchors.ts`, `src/normalize.ts`). PR-4 added the pure matcher
+(`src/matcher.ts`, `src/similarity.ts`).
+
+Not in this PR: the dormant-fold retry window and first-open baseline adoption (PR-6), restore
+on reopen/restart/rename/delete (PR-7).
 
 ## Fold state is per device
 

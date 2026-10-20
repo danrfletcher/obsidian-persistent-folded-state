@@ -91,7 +91,8 @@ export interface MatcherOptions {
 	/** E6: `yieldToHost()` is awaited at least this often, counted in comparisons. */
 	chunkSize?: number;
 	/** Injected so this stays a pure, timer-free module (F1/F8): awaited at least every
-	 * `chunkSize` comparisons. Defaults to a no-op — a later PR injects the real scheduler. */
+	 * `chunkSize` comparisons. Defaults to a no-op — PR-5's restore pass (src/fold-restorer.ts)
+	 * injects the real scheduler (a plain `window.setTimeout`-based yield) when it calls this. */
 	yieldToHost?: () => Promise<void> | void;
 }
 
@@ -104,7 +105,8 @@ export const MAX_COMPARISONS = 5000;
 export const CHUNK_SIZE = 250;
 
 async function defaultYieldToHost(): Promise<void> {
-	// No real host to yield to in a pure module — a later PR injects the real scheduler.
+	// No real host to yield to in a pure module — PR-5's restore pass (src/fold-restorer.ts)
+	// injects the real one.
 }
 
 interface ResolvedOptions {

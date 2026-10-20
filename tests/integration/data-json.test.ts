@@ -47,13 +47,17 @@ describe("data.json integration: round trip through real files", () => {
 		const { dataPath, loadData, saveData } = await makeTempVault();
 		const store = new FoldStore({ loadData, saveData });
 		await store.load();
-		store.set("Projects/Quarry/Tasks.md", { contentHash: "abc", folds: [{ kind: "heading", text: "## Tuesday" }], dormant: [] });
+		// PR-5: a fold entry must round-trip as a real Anchor (src/anchors.ts) — a bare
+		// {kind, text} pair is a PR-2-era shape and is discarded by FoldStore's own load-time
+		// validation (see tests/unit/load-sanitise.test.ts for that behaviour directly).
+		const anchor = { kind: "heading", indent: 0, text: "tuesday", siblingIndex: 0, parentChain: [] };
+		store.set("Projects/Quarry/Tasks.md", { contentHash: "abc", folds: [anchor], dormant: [] });
 		await store.flush();
 
 		const onDisk = JSON.parse(await readFile(dataPath, "utf8"));
 		expect(onDisk).toEqual({
 			version: 1,
-			files: { "Projects/Quarry/Tasks.md": { contentHash: "abc", folds: [{ kind: "heading", text: "## Tuesday" }], dormant: [] } },
+			files: { "Projects/Quarry/Tasks.md": { contentHash: "abc", folds: [anchor], dormant: [] } },
 		});
 
 		const reloaded = new FoldStore({ loadData, saveData });

@@ -122,7 +122,13 @@ describe("lifecycle: disable then re-enable keeps the map (E7)", () => {
 		first.loadData = sharedLoadData;
 		first.saveData = sharedSaveData;
 		await first.onload();
-		first.store.set("Tasks.md", { contentHash: "abc", folds: [{ kind: "heading" }], dormant: [] });
+		// PR-5: a fold entry must be a real Anchor (src/anchors.ts) to survive FoldStore's
+		// load-time validation — a bare {kind: "heading"} is a PR-2-era shape and is discarded.
+		first.store.set("Tasks.md", {
+			contentHash: "abc",
+			folds: [{ kind: "heading", indent: 0, text: "tuesday", siblingIndex: 0, parentChain: [] }],
+			dormant: [],
+		});
 		await first.store.flush();
 
 		first.unload(); // "disable": must not clear, rewrite or delete the stored data
@@ -134,7 +140,11 @@ describe("lifecycle: disable then re-enable keeps the map (E7)", () => {
 		await second.onload(); // "re-enable"
 
 		expect(JSON.stringify(stored)).toBe(afterDisable); // bytes identical across disable/re-enable
-		expect(second.store.get("Tasks.md")).toEqual({ contentHash: "abc", folds: [{ kind: "heading" }], dormant: [] });
+		expect(second.store.get("Tasks.md")).toEqual({
+			contentHash: "abc",
+			folds: [{ kind: "heading", indent: 0, text: "tuesday", siblingIndex: 0, parentChain: [] }],
+			dormant: [],
+		});
 	});
 });
 

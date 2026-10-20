@@ -7,8 +7,8 @@
  * PR-2 adds the editor watcher (`src/editor-watcher.ts`): a CM6 extension, registered once here
  * through `registerEditorExtension`, that records the user's own fold/unfold effects into the
  * store (G1) and classifies every other transaction as a user or non-user document change (E9).
- * It never dispatches anything itself (observe-only) and never touches the vault — restore lands
- * in PR-5.
+ * At that point it never dispatched anything itself (observe-only) and never touched the vault —
+ * restore was deferred to PR-5.
  *
  * R3: deliverable (1), the "settled non-user change" event, needs a subscription point a later
  * PR (and the real-Obsidian E10 probe) can actually observe from outside the editor watcher.
@@ -16,6 +16,13 @@
  * `MetadataCache` already use — rather than a bespoke emitter, so `plugin.events.on(...)` behaves
  * exactly like every other Obsidian event. No command and no UI are added for it (F10); it is
  * wired to the editor watcher's `onSettledNonUserChange` callback below and nowhere else.
+ *
+ * PR-5: the editor watcher's own extension now also runs the restore pass on every settled
+ * non-user change (src/fold-restorer.ts, driven from inside src/editor-watcher.ts) — snapshot
+ * the stored anchors, match them against the settled text, dispatch tagged fold effects. That
+ * restore is wired entirely inside `createEditorWatcher`'s own `ViewPlugin`, keyed off the same
+ * `store` already passed in below, so nothing changes here in main.ts: no new dependency, no
+ * new event, no new command (F10 still holds — the registered command list is unchanged).
  */
 import { Events, Plugin } from "obsidian";
 import { FoldStore } from "./fold-store";

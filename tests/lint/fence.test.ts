@@ -71,8 +71,12 @@ describe("fence: F1 — no write-capable vault/editor/adapter API reached for by
 		expect(srcText).not.toMatch(pattern);
 	});
 
-	it("the editor watcher never calls EditorView.dispatch itself (observe-only)", () => {
-		// This PR's own fence: it records what it sees but never dispatches (restore is PR-5).
-		expect(srcText).not.toMatch(/\.dispatch\s*\(/);
-	});
+	// PR-2's own self-imposed fence ("it records what it sees but never dispatches — restore is
+	// PR-5") no longer applies: PR-5 is exactly the PR that dispatches tagged CM6 fold effects
+	// (src/fold-restorer.ts), so a plain "no .dispatch( anywhere in src/" check would now fail
+	// on legitimate, in-scope code. F1 itself — no write into the note's markdown/frontmatter —
+	// is still enforced above by the vault/editor/adapter API checks; CM6's own `dispatch` is a
+	// different kind of write (an in-memory editor-state transaction, never touching the file on
+	// disk) and was never what F1 was guarding against.
 });
+
