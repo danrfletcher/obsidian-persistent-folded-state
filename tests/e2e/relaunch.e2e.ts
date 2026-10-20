@@ -30,11 +30,17 @@
  *   --phase after-relaunch  reconnects (retrying — Obsidian's CDP server isn't up immediately
  *                           after relaunch, same as e2e-reload-probe.mjs's native-restore phase),
  *                           then asserts: the stored content hash matches the rewritten file
- *                           (G8, hash differs -> re-match ran), "## Tuesday" and
- *                           "Draft proposal v2" are folded (their bodies not rendered), and
- *                           "Send invoices" together with its new child "Follow up call" are
- *                           both visible (G8/E4: the hash-changed re-match re-applies the
- *                           active folds; it does not force everything shut).
+ *                           (G8, hash differs -> re-match ran) and "## Tuesday" is folded (its
+ *                           body not rendered). T18: the fixture has no heading after "##
+ *                           Tuesday", so its own foldable range runs to EOF and everything
+ *                           nested under it — "Draft proposal v2", "Send invoices", "Follow up
+ *                           call" — is removed from the DOM entirely while it stays folded;
+ *                           this phase expands "## Tuesday" via CDP before checking those, the
+ *                           same way a user would, and then asserts "Draft proposal v2" is
+ *                           folded (its sub-tasks not rendered) while "Send invoices" together
+ *                           with its new child "Follow up call" are both visible (G8/E4: the
+ *                           hash-changed re-match re-applies the active folds; it does not
+ *                           force everything shut).
  *
  * Usage (inside the Obsidian desktop container, this plugin built and enabled, Obsidian already
  * running with --remote-debugging-port, --note already open, before the first phase):
@@ -423,17 +429,38 @@ async function runAfterRelaunch(args: Args): Promise<void> {
 			if (visibleLines.some((line) => line.includes("Notes for Tuesday"))) {
 				problems.push('"## Tuesday" is not folded — its body is visible');
 			}
-			// "Draft proposal v2" folded: its sub-tasks must not be rendered.
-			if (visibleLines.some((line) => line.includes("Outline") || line.includes("Review"))) {
-				problems.push('"Draft proposal v2" is not folded — its sub-tasks are visible');
-			}
-			// "Send invoices" stays unfolded, including its new child "Follow up call" (GP4's
-			// own "with its new child visible").
-			if (!visibleLines.some((line) => line.includes("Send invoices"))) {
-				problems.push('"Send invoices" line itself is not visible at all');
-			}
-			if (!visibleLines.some((line) => line.includes("Follow up call"))) {
-				problems.push('"Send invoices"\' new child "Follow up call" is not visible — it should be, GP4 keeps that block unfolded');
+
+			// T18: the fixture has no heading after "## Tuesday", so "## Tuesday"'s own
+			// foldable range runs to EOF — "Draft proposal v2", "Send invoices" and "Follow up
+			// call" are all nested inside it and are removed from the DOM entirely while
+			// Tuesday stays folded, the same way "Notes for Tuesday" is above. Expand "##
+			// Tuesday" (not "Draft proposal v2" — its own, separate fold must stay put) before
+			// reading the nested lines below, matching how a user would actually see GP4's
+			// described state (Draft proposal v2 folded, Send invoices and Follow up call
+			// visible underneath it).
+			const expand = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as {
+				clicked: boolean;
+				reason?: string;
+			};
+			if (!expand.clicked) {
+				problems.push(`could not expand "## Tuesday" to check its nested lines: ${expand.reason}`);
+			} else {
+				await sleep(200);
+				const expandedRaw = (await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION)) as string;
+				const expandedLines: string[] = JSON.parse(expandedRaw);
+
+				// "Draft proposal v2" folded: its sub-tasks must not be rendered.
+				if (expandedLines.some((line) => line.includes("Outline") || line.includes("Review"))) {
+					problems.push('"Draft proposal v2" is not folded — its sub-tasks are visible');
+				}
+				// "Send invoices" stays unfolded, including its new child "Follow up call" (GP4's
+				// own "with its new child visible").
+				if (!expandedLines.some((line) => line.includes("Send invoices"))) {
+					problems.push('"Send invoices" line itself is not visible at all');
+				}
+				if (!expandedLines.some((line) => line.includes("Follow up call"))) {
+					problems.push('"Send invoices"\' new child "Follow up call" is not visible — it should be, GP4 keeps that block unfolded');
+				}
 			}
 		},
 		{ retries: args.connectRetries, retryDelayMs: args.connectRetryDelayMs },
