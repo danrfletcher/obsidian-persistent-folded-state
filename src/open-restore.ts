@@ -49,7 +49,10 @@
  * mistaken for a fresh user unfold and fed back into the map). T1: that one synchronous capture
  * is not reliably the end of native restore's own story for this pane — see
  * `scheduleNativeRestoreGuard`'s own comment, further down this file, for the late-arrival case
- * and the short guard window that re-corrects it.
+ * and the short guard window that re-corrects it. R8: that guard does *not* get handed this same
+ * `matched` list to decide what to (re)fold on its later checks — only what it must never
+ * unfold. What it (re)folds is the narrower `plan.toFold`/`dormantPlan.toFold` set below, the
+ * only ranges the initial pass actually decided to fold.
  *
  * G13 on open: `cursorLineOf` is still read and passed through to `planRestore`, so a block the
  * cursor already sits inside (Obsidian restores cursor position too) is deferred rather than
@@ -171,22 +174,43 @@ function dispatchFoldAndUnfold(view: EditorView, toFold: readonly LineRange[], t
  * view's whole state) wins, clobbering the correction. This re-runs the same reconciliation at a
  * couple of short delays afterwards so a late arrival still gets corrected instead of silently
  * standing. Each check is independent and a no-op (dispatches nothing, touches the store not at
- * all) once the live state already agrees with `matched` — the ordinary, already-synchronous
- * case this guards against never fires a second dispatch. Bails out (without touching the view
- * or the store) once the pane has gone away or moved on to different text, so a guard scheduled
- * for one open can never act against a later one in the same pane.
+ * all) once the live state already agrees with the matched set — the ordinary, already-
+ * synchronous case this guards against never fires a second dispatch. Bails out (without
+ * touching the view or the store) once the pane has gone away or moved on to different text, so
+ * a guard scheduled for one open can never act against a later one in the same pane.
  *
  * T8: against a real Obsidian relaunch (not just a same-session reopen), these two fixed delays
  * were observed never correcting anything at all — not because the reconciliation itself is
  * wrong, but because both checks can run, find nothing stale yet (native restore hasn't landed),
- * and nothing ever checks again afterwards. There is no single delay that is "long enough" for
+ * and nothing ever checks again afterwards. There is no single delay that is long enough for
  * every machine and every startup — a deferred leaf's real editor can resolve an unpredictable
  * amount of time into a slow relaunch. Rather than guess a third, longer number, the
  * `onLayoutReady` check added below `scheduleNativeRestoreGuard` ties the backstop check to an
  * actual Obsidian-reported event (the same one `main.ts`'s own orphan-prune already waits on)
  * instead of a guess, and `resolveView` re-resolves the live `EditorView` fresh at every check
  * rather than trusting the one reference captured at file-open time, in case that's what was
- * silently going stale and bailing out the old checks for good. */
+ * silently going stale and bailing out the old checks for good.
+ *
+ * R8: the first shape of this guard re-ran `reconcileNativeRestore(nativeFolded, matchedRanges)`
+ * on every check and dispatched its `toFold` — but `matchedRanges` is everything the match
+ * decided on, deliberately including G13-deferred blocks and dormant matches `planRestore` chose
+ * not to act on. Folding those around the cursor (breaking G13/F5) the moment `onLayoutReady`
+ * fires synchronously (the normal case for any open after startup) was a straight regression, not
+ * a timing edge case. The guard now takes two separate inputs instead of one: `foldTargets` is
+ * exactly what the initial pass already decided to fold (`plan.toFold`/`dormantPlan.toFold`,
+ * never a deferred or merely-matched range) — the only thing any check ever (re)folds, and only
+ * once it re-checks the live cursor line still isn't inside it. `protectedRanges` is the original
+ * `matchedRanges` — used only to decide what must never be unfolded, never to decide what to
+ * fold. A `foldTargets` entry the guard has folded once and later finds unfolded again is treated
+ * as the user undoing it, not native restore, and is never refolded. The unfold side has its own
+ * matching problem: a late, untagged native-restore transaction and a user folding some unrelated
+ * block the plugin has never heard of look identical to CM6 (`liveFoldedLineRanges` can't tell
+ * them apart — see `knownLiveAtOpen` below). Rather than guess wrong on every later check (R8's
+ * own bug unfolded any block the user folded during the whole window, every single check, and
+ * deleted its freshly-recorded anchor with it), the stale-offset correction runs at most once per
+ * open — on the first check that finds the pane live and showing the expected text — which is
+ * still exactly what T1/T8 need (native restore's own late arrival shows up once, early) without
+ * re-litigating the live fold state against every check for the rest of the window. */
 const NATIVE_RESTORE_GUARD_DELAYS_MS: readonly number[] = [50, 300];
 
 /** T1: the one concrete side effect a late, untagged native-restore transaction has been
@@ -226,14 +250,34 @@ function cleanupSpuriousNativeFolds(
 	}
 }
 
+function rangeKey(r: LineRange): string {
+	return `${r.startLine}:${r.endLine}`;
+}
+
 /** T1: schedules `NATIVE_RESTORE_GUARD_DELAYS_MS`'s own re-checks — see that constant's comment
- * for why this exists. `matched` and `candidates` are exactly what the caller already computed
- * for its own (possibly too-early) reconciliation; this just re-applies the same decision later. */
+ * for why this exists, and R8 for why the fold and unfold decisions each take their own input.
+ *
+ * `foldTargets` is exactly what the initial pass decided to fold (never a G13-deferred or
+ * merely-matched range) — the only thing any check ever (re)folds, skipping any target whose
+ * range currently contains the cursor and never re-folding a target it has already folded once
+ * and later found unfolded again (treated as the user undoing it).
+ *
+ * `protectedRanges` is every range the match actually decided on (active or dormant, deferred
+ * included) — used only to decide what must never be unfolded.
+ *
+ * `knownLiveAtOpen` is every range that was already live right after the initial dispatch this
+ * guard follows (native folds that dispatch didn't unfold, plus `foldTargets` itself). The
+ * unfold side only ever acts once, on the first check that finds the pane live and showing the
+ * expected text, correcting exactly the ranges that are live now but were neither protected nor
+ * already known live at open — a late native-restore arrival. It can't run on every check: CM6
+ * gives no way to tell that apart from a user folding some unrelated block during the window. */
 function scheduleNativeRestoreGuard(
 	view: EditorView,
 	expectedText: string,
 	candidates: readonly AnchoredBlock[],
-	matched: readonly LineRange[],
+	foldTargets: readonly LineRange[],
+	protectedRanges: readonly LineRange[],
+	knownLiveAtOpen: readonly LineRange[],
 	store: FoldStore,
 	path: string,
 	win: Window,
@@ -241,16 +285,63 @@ function scheduleNativeRestoreGuard(
 	onLayoutReady?: (cb: () => void) => void,
 	delaysMs: readonly number[] = NATIVE_RESTORE_GUARD_DELAYS_MS,
 ): void {
+	// Fold side: seeded with every target the preceding dispatch already left live on `view`
+	// itself (the usual case) — a target that later drops out of "live" after having been seen
+	// live is the user unfolding it, never refolded again once that's noticed.
+	const everLive = new Set<string>(foldTargets.map(rangeKey));
+	const reverted = new Set<string>();
+	// Unfold side: see this function's own doc comment for why this only ever runs once.
+	let unfoldDecided = false;
+	// T8: the view a later check resolves to can be a wholly different EditorView instance
+	// than `view` (Obsidian replaced the pane). That replacement never received this guard's
+	// own initial dispatch, so nothing about it is "known live" or "already decided" yet —
+	// reset all of the above the first time a check sees a different view than the last one,
+	// so it's treated as a fresh pane to correct rather than one whose folds might have been
+	// user-undone.
+	let lastView: EditorView = view;
+
 	const check = (): void => {
 		// T8: re-resolve fresh every time rather than trusting the closed-over `view` — see
 		// this function's own file comment (T8) for why.
 		const live = resolveView?.(path) ?? view;
 		if (!live.dom.isConnected) return; // the pane was destroyed since this open
 		if (live.state.doc.toString() !== expectedText) return; // moved on (edit, or a different file)
+		if (live !== lastView) {
+			lastView = live;
+			everLive.clear();
+			reverted.clear();
+			unfoldDecided = false;
+		}
 		const nativeFolded = liveFoldedLineRanges(live.state);
-		const { toFold, toUnfold } = reconcileNativeRestore(nativeFolded, matched);
+		const cursorLine = cursorLineOf(live);
+
+		for (const target of foldTargets) {
+			const key = rangeKey(target);
+			if (reverted.has(key)) continue;
+			const isLive = nativeFolded.some((n) => sameRange(n, target));
+			if (isLive) everLive.add(key);
+			else if (everLive.has(key)) reverted.add(key); // was live, now isn't — the user undid it
+		}
+
+		const toFold = foldTargets.filter((target) => {
+			const key = rangeKey(target);
+			if (reverted.has(key)) return false; // never refold what the user just unfolded
+			if (nativeFolded.some((n) => sameRange(n, target))) return false; // already live
+			// G13 holds at check time too, not just at open time — re-read the live cursor.
+			if (cursorLine !== null && target.startLine <= cursorLine && cursorLine <= target.endLine) return false;
+			return true;
+		});
+
+		let toUnfold: LineRange[] = [];
+		if (!unfoldDecided) {
+			unfoldDecided = true;
+			toUnfold = nativeFolded.filter(
+				(n) => !protectedRanges.some((p) => sameRange(p, n)) && !knownLiveAtOpen.some((k) => sameRange(k, n))
+			);
+		}
+
 		dispatchFoldAndUnfold(live, toFold, toUnfold);
-		cleanupSpuriousNativeFolds(store, path, candidates, toUnfold);
+		if (toUnfold.length > 0) cleanupSpuriousNativeFolds(store, path, candidates, toUnfold);
 	};
 	for (const delay of delaysMs) {
 		win.setTimeout(check, delay);
@@ -319,12 +410,16 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 		dispatchFoldAndUnfold(view, [], nativeFolded);
 		deps.store.set(path, { contentHash: currentHash, folds: [], dormant: [] });
 		// T1: native restore for this pane can still land after this handler already
-		// returned — see scheduleNativeRestoreGuard's own comment. Nothing is ever matched
-		// here, so every guard check keeps unfolding anything native that shows up late.
+		// returned — see scheduleNativeRestoreGuard's own comment. Nothing is matched or
+		// folded here, and nothing was left live by the dispatch above (R8: foldTargets,
+		// protectedRanges and knownLiveAtOpen are all empty), so the guard's one-shot unfold
+		// check corrects anything native that shows up late.
 		scheduleNativeRestoreGuard(
 			view,
 			text,
 			buildAnchors(text),
+			[],
+			[],
 			[],
 			deps.store,
 			path,
@@ -400,11 +495,26 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 	const { toUnfold } = reconcileNativeRestore(nativeFolded, matchedRanges);
 	const toFold = [...plan.toFold, ...dormantPlan.toFold].map((t) => t.range);
 	dispatchFoldAndUnfold(view, toFold, toUnfold);
-	// T1: see scheduleNativeRestoreGuard's own comment — the capture above is a single
-	// synchronous snapshot, and real Obsidian has been observed applying its own native
-	// restore for this exact pane *after* it, clobbering this dispatch. Re-checks the same
-	// `matchedRanges` decision a couple more times shortly afterwards.
-	scheduleNativeRestoreGuard(view, text, candidates, matchedRanges, deps.store, path, win, deps.resolveView, deps.onLayoutReady);
+	// R8: what the guard must still treat as live right after this dispatch — the native
+	// folds it didn't unfold (protected or already matching), plus everything just folded.
+	// `matchedRanges` (protectedRanges) is passed through separately: the guard must never
+	// use it to decide what to *fold* (it includes G13-deferred and dormant-not-acted-on
+	// ranges), only what must never be unfolded. See scheduleNativeRestoreGuard's own doc
+	// comment and the T1/T8/R8 comments above `NATIVE_RESTORE_GUARD_DELAYS_MS`.
+	const knownLiveAtOpen: LineRange[] = [...nativeFolded.filter((n) => !toUnfold.some((u) => sameRange(u, n))), ...toFold];
+	scheduleNativeRestoreGuard(
+		view,
+		text,
+		candidates,
+		toFold,
+		matchedRanges,
+		knownLiveAtOpen,
+		deps.store,
+		path,
+		win,
+		deps.resolveView,
+		deps.onLayoutReady
+	);
 
 	// Bookkeeping delta against a fresh store read (E3) — same discipline as restoreSettledChange.
 	const latest = deps.store.get(path);

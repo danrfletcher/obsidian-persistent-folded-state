@@ -10,7 +10,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding, foldEffect, foldedRanges } from "@codemirror/language";
+import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { App, type PluginManifest } from "obsidian";
 import {
 	Editor as MockEditor,
@@ -331,6 +331,137 @@ describe("open-restore via the plugin's file-open handler", () => {
 		expect(liveFoldedLineRanges(viewB)).toEqual([{ startLine: 3, endLine: 4 }]);
 		// viewA, never touched again, is untouched by this correction.
 		expect(liveFoldedLineRanges(viewA)).toEqual([{ startLine: 3, endLine: 4 }]);
+	}, 10000);
+
+	it("R8: a matched block with the cursor already inside it at open stays unfolded (G13) through the whole native-restore-guard window, with no fold effect dispatched around the cursor", async () => {
+		const app = new App();
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } },
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+
+		// TEXT_V3: "## Tuesday" is now lines 3-4. Put the cursor inside that block (line 4,
+		// Tuesday's own body) before file-open ever fires — G13's "already inside" case.
+		const view = makeView(TEXT_V3);
+		const cursorPos = view.state.doc.line(4).from;
+		view.dispatch({ selection: { anchor: cursorPos } });
+
+		openFile(app, NOTE_PATH, view);
+
+		// Deferred at open (G13): nothing folded yet.
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+
+		// R8's own bug folded this anyway, around the cursor, the moment the native-restore
+		// guard's onLayoutReady-triggered check ran — because that check reused `matchedRanges`
+		// (which deliberately includes G13-deferred ranges) to decide what to fold. Firing
+		// onLayoutReady immediately, *and* letting the two fixed-delay checks run too, exercises
+		// every one of the guard's checks against this same cursor position.
+		(app.workspace as unknown as MockWorkspace).triggerLayoutReady();
+		expect(liveFoldedLineRanges(view)).toEqual([]); // still unfolded right after the immediate check
+		await settle();
+		expect(liveFoldedLineRanges(view)).toEqual([]); // and after the 50ms/300ms checks too
+		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1
+	}, 10000);
+
+	it("R8: the guard never refolds a matched block the user unfolds inside its window", async () => {
+		const app = new App();
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } },
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+
+		// Same wiring as the T1/T8 tests above: the real createEditorWatcher extension, so a
+		// genuinely untagged (no OWN_FOLD_ANNOTATION) unfold dispatched below is recorded by
+		// src/fold-recorder.ts exactly the way a real user unfold would be.
+		const watcher = createEditorWatcher({ store: plugin.store, window });
+		const state = EditorState.create({
+			doc: TEXT_V3,
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		const view = new EditorView({ state, parent: document.body });
+
+		openFile(app, NOTE_PATH, view);
+		// restoreOnOpen's own initial dispatch folds "## Tuesday" (lines 3-4) synchronously —
+		// give it a moment to settle before the user acts, same as the T1 test above.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+
+		// The user manually unfolds it, well inside the guard's own window — untagged, exactly
+		// like a real click on the fold indicator.
+		const from = view.state.doc.line(3).to;
+		const to = view.state.doc.line(4).to;
+		view.dispatch({ effects: unfoldEffect.of({ from, to }) });
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+
+		await settle();
+
+		// R8's own bug re-folded this on the guard's very next check, because a target the
+		// guard had never explicitly tracked as "live, then not" was simply refolded again.
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1
+	}, 10000);
+
+	it("R8: the guard never unfolds, or deletes the stored anchor for, a block the user folds inside its window that the plugin never matched", async () => {
+		const app = new App();
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } },
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+
+		const watcher = createEditorWatcher({ store: plugin.store, window });
+		const state = EditorState.create({
+			doc: TEXT_V3,
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		const view = new EditorView({ state, parent: document.body });
+
+		openFile(app, NOTE_PATH, view);
+		// Let the initial dispatch, and the guard's first (50ms) check, both run and find
+		// nothing stale — this is the guard's one real chance to correct a late native-restore
+		// arrival (see scheduleNativeRestoreGuard's own doc comment for why the unfold side only
+		// ever acts once per open: CM6 gives no way to tell a late native restore apart from a
+		// genuine user fold of something the plugin never matched).
+		await new Promise((resolve) => setTimeout(resolve, 70));
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]); // "## Tuesday" only
+
+		// The user folds "## Wednesday" (lines 1-2) — a real, legitimate fold of a block the
+		// plugin has no stored anchor for at all, well inside the guard's own 300ms window.
+		const from = view.state.doc.line(1).to;
+		const to = view.state.doc.line(2).to;
+		view.dispatch({ effects: foldEffect.of({ from, to }) });
+		expect(liveFoldedLineRanges(view)).toEqual([
+			{ startLine: 1, endLine: 2 },
+			{ startLine: 3, endLine: 4 },
+		]);
+
+		// Past the guard's remaining (300ms) check.
+		await new Promise((resolve) => setTimeout(resolve, 260));
+
+		// R8's own bug unfolded this on the very next check (it wasn't "known live at open" and
+		// wasn't in the matched/protected set either) and deleted the anchor fold-recorder had
+		// just planted for it.
+		expect(liveFoldedLineRanges(view)).toEqual([
+			{ startLine: 1, endLine: 2 },
+			{ startLine: 3, endLine: 4 },
+		]);
+		const after = plugin.store.get(NOTE_PATH);
+		expect((after?.folds as unknown as { text: string }[]).some((f) => f.text === "wednesday")).toBe(true);
+		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1
 	}, 10000);
 
 	it("G8 hash changed: several stored folds that match nothing all go dormant, leaving the note fully unfolded, without throwing", async () => {
