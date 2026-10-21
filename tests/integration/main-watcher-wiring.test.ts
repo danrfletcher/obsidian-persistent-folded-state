@@ -166,4 +166,25 @@ describe("R3: plugin.events exposes the settled-non-user-change event for real",
 			vi.useRealTimers();
 		},
 	);
+
+	it("R9 (PR-2): main.ts registers the watcher exactly once per onload, before updateOptions(), and unload registers nothing", async () => {
+		const app = new App();
+		const plugin = new PersistentFoldedStatePlugin(app, manifest);
+		const order: string[] = [];
+		const registerEditorExtension = vi.spyOn(plugin, "registerEditorExtension").mockImplementation(() => {
+			order.push("register");
+		});
+		vi.spyOn(app.workspace, "updateOptions").mockImplementation(() => {
+			order.push("updateOptions");
+		});
+
+		await plugin.onload();
+		expect(registerEditorExtension).toHaveBeenCalledTimes(1);
+		// a real CM6 extension value (createEditorWatcher's ViewPlugin), not undefined/a stub
+		expect(registerEditorExtension.mock.calls[0][0]).toBeTruthy();
+		expect(order).toEqual(["register", "updateOptions"]);
+
+		plugin.unload();
+		expect(registerEditorExtension).toHaveBeenCalledTimes(1);
+	});
 });

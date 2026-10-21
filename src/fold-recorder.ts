@@ -35,6 +35,12 @@
  * `tr.state` (not `tr.startState`) is both correct and necessary: for a transaction that folds a
  * range and changes the document in the same dispatch, `tr.startState.doc.lineAt(...)` would
  * either name the wrong block or throw past the old document's end.
+ *
+ * R12 (PR-2): this only re-snapshots on a transaction that carries a fold/unfold effect. When a
+ * document change silently drops or moves a live fold, CM6 emits no unfold effect, so the
+ * stored list can lag the live fold set after an external rewrite until the next fold or
+ * unfold. Anything that reads the store right after such a rewrite (restore, open-restore)
+ * should expect that.
  */
 import { Annotation } from "@codemirror/state";
 import type { Transaction } from "@codemirror/state";
