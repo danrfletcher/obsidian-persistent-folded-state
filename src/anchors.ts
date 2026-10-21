@@ -150,7 +150,13 @@ const HEADING_LINE = /^(#{1,6})\s/;
  * one-character link label such as `- [a](http://x) foo` is a list item, not a task. */
 const TASK_LINE = /^(?:[-*+]|\d+[.)])\s+\[[^\]]\](?=\s|$)/;
 const LIST_LINE = /^(?:[-*+]|\d+[.)])\s+/;
-const FENCE_OPEN = /^(`{3,}|~{3,})(.*)$/;
+/** R1 (PR-3) / T59 (PR-1): CommonMark (and Obsidian) don't let a backtick fence's info string
+ * contain a backtick, so "```inline``` text" is inline code, not a fence. That rule lives in the
+ * pattern itself — the backtick alternative takes `[^`]*` for its info string, so the whole line
+ * fails to match — rather than in a check made after matching. Tilde fences have no such
+ * restriction. Group 1 is the backtick marker or group 3 the tilde marker; 2 and 4 are the
+ * matching info strings. */
+const FENCE_OPEN = /^(?:(`{3,})([^`]*)|(~{3,})(.*))$/;
 const QUOTE_LINE = /^>/;
 const QUOTE_PREFIX = /^>\s*/;
 /** A callout type may contain hyphens (`[!my-type]`, like Obsidian's own custom callouts). */
@@ -176,12 +182,9 @@ interface Fence {
 function matchFenceOpen(trimmed: string): Fence | null {
 	const match = FENCE_OPEN.exec(trimmed);
 	if (match === null) return null;
-	const marker = match[1];
-	// R1 (PR-3): CommonMark (and Obsidian) don't let a backtick fence's info string contain a
-	// backtick — "```inline``` text" is inline code, not a fence that swallows the rest of the
-	// file. Tilde fences have no such restriction.
-	if (marker[0] === "`" && match[2].includes("`")) return null;
-	return { char: marker[0], length: marker.length, info: match[2] };
+	const marker = match[1] ?? match[3];
+	const info = match[1] !== undefined ? match[2] : match[4];
+	return { char: marker[0], length: marker.length, info };
 }
 
 /** Index (0-indexed) of the line that closes `fence`, scanning from `fromIndex`, or -1 if the

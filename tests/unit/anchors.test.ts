@@ -248,6 +248,18 @@ describe("buildAnchors: R1-R3 (PR-3) regressions", () => {
 		expect(tilde[0].range).toEqual({ startLine: 1, endLine: 3 });
 	});
 
+	it("T59: the backtick rule is in the fence pattern itself, so every inline-code spelling is rejected and a longer fence still opens", () => {
+		for (const line of ["```inline``` text", "````a`b", "``` `x`", "```js```"]) {
+			const blocks = buildAnchors([line, "# H"].join("\n"));
+			expect(blocks.map((b) => b.anchor.kind), line).toEqual(["other", "heading"]);
+		}
+		// A fence with an info string and no backtick in it, at three and at four backticks.
+		for (const open of ["```js title=\"a\"", "````md"]) {
+			const blocks = buildAnchors([open, "x", open.startsWith("````") ? "````" : "```", "# H"].join("\n"));
+			expect(blocks.map((b) => b.anchor.kind), open).toEqual(["code", "heading"]);
+		}
+	});
+
 	it("R2: a one-character link label is a list item, not a task", () => {
 		const [block] = buildAnchors("- [a](http://x) foo");
 		expect(block.anchor.kind).toBe("list");

@@ -3,7 +3,7 @@
  * `normalizeText` in `src/normalize.ts` — this module doesn't normalize anything itself, it
  * just compares whatever text it's handed), returns a single 0..1 score blending token overlap
  * with edit distance. No Obsidian, CodeMirror, DOM, file or network imports — text in, a number
- * out (fence: F1/F8/F9, enforced by `tests/unit/matcher-purity.test.ts`).
+ * out (fence: F1/F8, enforced by `tests/unit/matcher-purity.test.ts`).
  *
  * Two components, averaged evenly (`TOKEN_WEIGHT`):
  * - Token overlap: a Jaccard coefficient (shared / (|tokens(a)| + |tokens(b)| - shared)) over

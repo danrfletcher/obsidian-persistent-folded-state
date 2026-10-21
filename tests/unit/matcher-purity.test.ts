@@ -71,6 +71,12 @@ describe("purity (F1/F8): src/similarity.ts and src/matcher.ts have no I/O or ti
 		});
 	}
 
+	it("T60: the files cite only the fences the spec's purity criterion names (F1 and F8), not F9", () => {
+		for (const { file, text } of sources) {
+			expect(text, file).not.toMatch(/F1\/F8\/F9|\bF9\b/);
+		}
+	});
+
 	it("src/matcher.ts imports similarity only from ./similarity and the Anchor type only from ./anchors", () => {
 		const matches = sources[1].text.match(/^import[^;]+;/gm) ?? [];
 		for (const line of matches) {
