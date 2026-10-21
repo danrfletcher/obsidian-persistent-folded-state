@@ -7,7 +7,7 @@
  * compare, re-match, E4 native-restore replacement), not just `src/open-restore.ts`'s pure
  * decision logic in isolation.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
@@ -24,6 +24,7 @@ import PersistentFoldedStatePlugin from "../../src/main";
 import { createEditorWatcher } from "../../src/editor-watcher";
 import { buildAnchors } from "../../src/anchors";
 import { hashText } from "../../src/fold-store";
+import { OWN_FOLD_ANNOTATION } from "../../src/fold-recorder";
 import type { FileFoldRecord } from "../../src/types";
 
 const NOTE_PATH = "Projects/Quarry/Tasks.md";
@@ -343,6 +344,9 @@ describe("open-restore via the plugin's file-open handler", () => {
 			},
 		};
 		const plugin = makePlugin(app, stored);
+		// R11 (PR-7)/T133: a short multi-check schedule, so every check of the guard window runs
+		// inside this test (the production schedule runs to 16 s; this test waits ~300 ms).
+		plugin.guardDelaysMs = [30, 60, 90, 120];
 		await plugin.onload();
 
 		// TEXT_V3: "## Tuesday" is now lines 3-4. Put the cursor inside that block (line 4,
@@ -352,6 +356,7 @@ describe("open-restore via the plugin's file-open handler", () => {
 		view.dispatch({ selection: { anchor: cursorPos } });
 
 		openFile(app, NOTE_PATH, view);
+		const dispatchSpy = vi.spyOn(view, "dispatch");
 
 		// Deferred at open (G13): nothing folded yet.
 		expect(liveFoldedLineRanges(view)).toEqual([]);
@@ -359,12 +364,13 @@ describe("open-restore via the plugin's file-open handler", () => {
 		// R8's own bug folded this anyway, around the cursor, the moment the native-restore
 		// guard's onLayoutReady-triggered check ran — because that check reused `matchedRanges`
 		// (which deliberately includes G13-deferred ranges) to decide what to fold. Firing
-		// onLayoutReady immediately, *and* letting the two fixed-delay checks run too, exercises
-		// every one of the guard's checks against this same cursor position.
+		// onLayoutReady immediately, *and* letting all four timed checks (30-120 ms) run too,
+		// exercises every one of the guard's checks against this same cursor position.
 		(app.workspace as unknown as MockWorkspace).triggerLayoutReady();
 		expect(liveFoldedLineRanges(view)).toEqual([]); // still unfolded right after the immediate check
 		await settle();
-		expect(liveFoldedLineRanges(view)).toEqual([]); // and after the 50ms/300ms checks too
+		expect(liveFoldedLineRanges(view)).toEqual([]); // and after every timed check too
+		expect(dispatchSpy).not.toHaveBeenCalled(); // no fold or unfold effect at all in the window
 		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1
 	}, 10000);
 
@@ -378,6 +384,9 @@ describe("open-restore via the plugin's file-open handler", () => {
 			},
 		};
 		const plugin = makePlugin(app, stored);
+		// R11 (PR-7): a short multi-check schedule, so every check of the window runs inside the
+		// test (the production schedule runs to 16 s and would leave most checks unexercised).
+		plugin.guardDelaysMs = [30, 60, 90, 120];
 		await plugin.onload();
 
 		// Same wiring as the T1/T8 tests above: the real createEditorWatcher extension, so a
@@ -403,7 +412,7 @@ describe("open-restore via the plugin's file-open handler", () => {
 		view.dispatch({ effects: unfoldEffect.of({ from, to }) });
 		expect(liveFoldedLineRanges(view)).toEqual([]);
 
-		await settle();
+		await new Promise((resolve) => setTimeout(resolve, 200)); // past the last check (120ms)
 
 		// R8's own bug re-folded this on the guard's very next check, because a target the
 		// guard had never explicitly tracked as "live, then not" was simply refolded again.
@@ -421,6 +430,7 @@ describe("open-restore via the plugin's file-open handler", () => {
 			},
 		};
 		const plugin = makePlugin(app, stored);
+		plugin.guardDelaysMs = [20, 60, 100, 140]; // R11 (PR-7): several checks, all run below
 		await plugin.onload();
 
 		const watcher = createEditorWatcher({ store: plugin.store, window });
@@ -436,7 +446,7 @@ describe("open-restore via the plugin's file-open handler", () => {
 		// arrival (see scheduleNativeRestoreGuard's own doc comment for why the unfold side only
 		// ever acts once per open: CM6 gives no way to tell a late native restore apart from a
 		// genuine user fold of something the plugin never matched).
-		await new Promise((resolve) => setTimeout(resolve, 70));
+		await new Promise((resolve) => setTimeout(resolve, 35)); // past the first (20ms) check
 		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]); // "## Tuesday" only
 
 		// The user folds "## Wednesday" (lines 1-2) — a real, legitimate fold of a block the
@@ -449,8 +459,8 @@ describe("open-restore via the plugin's file-open handler", () => {
 			{ startLine: 3, endLine: 4 },
 		]);
 
-		// Past the guard's remaining (300ms) check.
-		await new Promise((resolve) => setTimeout(resolve, 260));
+		// Past every remaining check (60, 100 and 140ms).
+		await new Promise((resolve) => setTimeout(resolve, 200));
 
 		// R8's own bug unfolded this on the very next check (it wasn't "known live at open" and
 		// wasn't in the matched/protected set either) and deleted the anchor fold-recorder had
@@ -674,4 +684,203 @@ describe("open-restore via the plugin's file-open handler", () => {
 		expect(() => (app.workspace as unknown as MockWorkspace).trigger("file-open", null)).not.toThrow();
 		await settle();
 	});
+});
+
+describe("open-restore guard, layout already ready at file-open (PR-7 R9/R10)", () => {
+	function seededPlugin(app: App): { plugin: PersistentFoldedStatePlugin } {
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } },
+			},
+		};
+		return { plugin: makePlugin(app, stored) };
+	}
+
+	async function openReady(guardDelays: readonly number[]): Promise<{ app: App; plugin: PersistentFoldedStatePlugin; view: EditorView }> {
+		const app = new App();
+		const { plugin } = seededPlugin(app);
+		plugin.guardDelaysMs = guardDelays;
+		await plugin.onload();
+		(app.workspace as unknown as MockWorkspace).triggerLayoutReady(); // layout is ready BEFORE file-open
+		const watcher = createEditorWatcher({ store: plugin.store, window });
+		const view = new EditorView({
+			state: EditorState.create({
+				doc: TEXT_V3,
+				extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+			}),
+			parent: document.body,
+		});
+		openFile(app, NOTE_PATH, view);
+		return { app, plugin, view };
+	}
+
+	const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+	const wednesday = (view: EditorView): { from: number; to: number } => ({ from: view.state.doc.line(1).to, to: view.state.doc.line(2).to });
+	const tuesday = (view: EditorView): { from: number; to: number } => ({ from: view.state.doc.line(3).to, to: view.state.doc.line(4).to });
+	const folds = (plugin: PersistentFoldedStatePlugin): string[] =>
+		((plugin.store.get(NOTE_PATH)?.folds ?? []) as unknown as { text: string }[]).map((f) => f.text).sort();
+
+	it("R9 (c): a native fold of a stale line landing after a layout-ready open is unfolded, and no anchor is kept for it", async () => {
+		const { plugin, view } = await openReady([40, 80, 120]);
+		await wait(5); // restoreOnOpen's own dispatch
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+
+		await wait(5);
+		view.dispatch({ effects: foldEffect.of(wednesday(view)) }); // untagged native restore at +10ms
+		await wait(200);
+
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+		expect(folds(plugin)).toEqual(["tuesday"]); // no 'wednesday' planted by the recorder
+		expect(view.state.doc.toString()).toBe(TEXT_V3);
+	}, 10000);
+
+	it("R9 (b): a native restore that unfolds the matched block and folds a stale one is corrected back, tuesday stays recorded", async () => {
+		const { plugin, view } = await openReady([40, 80, 120]);
+		await wait(10);
+		view.dispatch({ effects: [unfoldEffect.of(tuesday(view)), foldEffect.of(wednesday(view))] });
+		await wait(200);
+
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+		expect(folds(plugin)).toEqual(["tuesday"]);
+	}, 10000);
+
+	it("R9 (d): a native replace that lands after an earlier check already passed is corrected too", async () => {
+		const { plugin, view } = await openReady([20, 60, 100, 140]);
+		await wait(40); // the first timed check has run and found nothing
+		view.dispatch({ effects: [unfoldEffect.of(tuesday(view)), foldEffect.of(wednesday(view))] });
+		await wait(200);
+
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+		expect(folds(plugin)).toEqual(["tuesday"]);
+	}, 10000);
+
+	it("R10 probe 1: user folds Wednesday, a check passes, then the user unfolds Tuesday — both actions stand and wednesday stays recorded", async () => {
+		const { plugin, view } = await openReady([10, 40, 80, 120]);
+		await wait(20);
+		view.dispatch({ effects: foldEffect.of(wednesday(view)) });
+		await wait(40); // the 40ms check runs with Wednesday live
+		view.dispatch({ effects: unfoldEffect.of(tuesday(view)) });
+		await wait(200);
+
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 2 }]);
+		expect(folds(plugin)).toContain("wednesday");
+	}, 10000);
+});
+
+describe("open-restore guard: live folds are trimmed, candidate ranges are not (PR-1 R4)", () => {
+	// `buildAnchors` closes a task/heading lazily, so its range includes the blank separator line
+	// after the block (candidate 2-4 below); a fold the plugin restores, and a click-made or
+	// relaunch-restored native fold, ends at the block's last content line (live 2-3). Every
+	// comparison between the two has to treat them as the same block.
+	const cases = [
+		{
+			kind: "task",
+			doc: "# Notes\n- [ ] Draft proposal\n\t- sub item\n\n- [ ] Send invoices\n",
+			match: (c: { anchor: { kind: string; text: string } }) => c.anchor.kind === "task" && c.anchor.text === "draft proposal",
+			candidate: { startLine: 2, endLine: 4 },
+			live: { startLine: 2, endLine: 3 },
+		},
+		{
+			kind: "heading",
+			doc: "# Notes\nbody line\n\n# Other\nmore text\n",
+			match: (c: { anchor: { kind: string; text: string } }) => c.anchor.kind === "heading" && c.anchor.text === "notes",
+			candidate: { startLine: 1, endLine: 3 },
+			live: { startLine: 1, endLine: 2 },
+		},
+	];
+	const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+	const GUARD = [20, 40, 60, 80];
+
+	async function setup(c: (typeof cases)[number], match = c.match, range = c.candidate) {
+		const candidate = buildAnchors(c.doc).find(match);
+		if (!candidate) throw new Error("fixture must contain the anchored block");
+		expect(candidate.range).toEqual(range); // the untrimmed range the matcher works in
+		const app = new App();
+		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+		const stored = {
+			value: {
+				version: 1,
+				// A stale hash: the note changed while closed, so the open re-matches (not verbatim).
+				files: { [NOTE_PATH]: { contentHash: "stale-hash", folds: [candidate.anchor], dormant: [] } },
+			},
+		};
+		const plugin = makePlugin(app, stored);
+		plugin.guardDelaysMs = GUARD;
+		await plugin.onload();
+		const watcher = createEditorWatcher({ store: plugin.store, window });
+		const view = new EditorView({
+			state: EditorState.create({
+				doc: c.doc,
+				selection: { anchor: c.doc.length }, // cursor clear of the block
+				extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+			}),
+			parent: document.body,
+		});
+		return { app, plugin, view, candidate };
+	}
+
+	const keys = (plugin: PersistentFoldedStatePlugin): string[] =>
+		((plugin.store.get(NOTE_PATH)?.folds ?? []) as unknown as { text: string }[]).map((f) => f.text);
+
+	it.each(cases)("a restored $kind fold is still live after every guard check, and its stored anchor is kept", async (c) => {
+		const { app, plugin, view, candidate } = await setup(c);
+		openFile(app, NOTE_PATH, view);
+		await wait(5);
+		expect(liveFoldedLineRanges(view)).toEqual([c.live]); // restored, ending at the last content line
+
+		// One sample between and after every check of the [20, 40, 60, 80] ms schedule.
+		for (let i = 0; i < GUARD.length + 1; i++) {
+			await wait(25);
+			expect(liveFoldedLineRanges(view)).toEqual([c.live]);
+		}
+		expect(keys(plugin)).toEqual([(candidate.anchor as { text: string }).text]);
+		expect(view.state.doc.toString()).toBe(c.doc);
+	}, 10000);
+
+	it.each(cases)("a narrow native $kind fold on a matched block is kept, not unfolded at open or by the guard", async (c) => {
+		const { app, plugin, view, candidate } = await setup(c);
+		// Obsidian's own restore (or the plugin's trimmed fold re-applied after a relaunch) got there first.
+		// Tagged so the recorder does not write it to the store (and re-hash the entry): it must
+		// reach restoreOnOpen as a native fold the stored, stale-hash entry knows nothing about.
+		view.dispatch({
+			effects: foldEffect.of({ from: view.state.doc.line(c.live.startLine).to, to: view.state.doc.line(c.live.endLine).to }),
+			annotations: OWN_FOLD_ANNOTATION.of(true),
+		});
+		expect(liveFoldedLineRanges(view)).toEqual([c.live]);
+
+		openFile(app, NOTE_PATH, view);
+		await wait(5);
+		expect(liveFoldedLineRanges(view)).toEqual([c.live]); // not put in toUnfold at open
+
+		for (let i = 0; i < GUARD.length + 1; i++) {
+			await wait(25);
+			expect(liveFoldedLineRanges(view)).toEqual([c.live]);
+		}
+		expect(keys(plugin)).toEqual([(candidate.anchor as { text: string }).text]);
+	}, 10000);
+
+	it("a stale native fold next to a matched trimmed block is still unfolded, and the matched fold stays", async () => {
+		const c = cases[1]; // "# Notes" is matched (candidate 1-3, live 1-2); "# Other" (4-5) has no stored anchor
+		const { app, view } = await setup(c);
+		const doc = view.state.doc;
+		view.dispatch({ effects: foldEffect.of({ from: doc.line(4).to, to: doc.line(5).to }), annotations: OWN_FOLD_ANNOTATION.of(true) });
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 4, endLine: 5 }]);
+		openFile(app, NOTE_PATH, view);
+		await wait(150);
+		expect(liveFoldedLineRanges(view)).toEqual([c.live]);
+	}, 10000);
+
+	it("a stale native fold that runs through the trailing blank line is unfolded with its own exact span", async () => {
+		const c = cases[1]; // stored anchor: "# Other" (4-5, live == candidate). "# Notes" (1-3) is the stale native fold.
+		const other = (x: { anchor: { kind: string; text: string } }): boolean => x.anchor.kind === "heading" && x.anchor.text === "other";
+		const { app, view } = await setup(c, other, { startLine: 4, endLine: 5 });
+		const doc = view.state.doc;
+		view.dispatch({ effects: foldEffect.of({ from: doc.line(1).to, to: doc.line(3).to }), annotations: OWN_FOLD_ANNOTATION.of(true) });
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 3 }]);
+		openFile(app, NOTE_PATH, view);
+		await wait(5);
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 4, endLine: 5 }]); // stale 1-3 gone, matched "# Other" folded
+	}, 10000);
 });

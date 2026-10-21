@@ -17,7 +17,7 @@
  * cost of this PR landing, not something this file needs to migrate.
  */
 import type { EditorState } from "@codemirror/state";
-import { buildAnchors, type Anchor } from "./anchors";
+import { buildAnchors, type Anchor, type AnchoredBlock } from "./anchors";
 
 /** Describes the fold/unfold effect at `range` as a real `Anchor` (PR-3), built fresh from
  * `state`'s current document. `range.to` is CM6's own bookkeeping for where the fold closes and
@@ -25,10 +25,18 @@ import { buildAnchors, type Anchor } from "./anchors";
  * matters. Never throws: a `range.from` that doesn't land on any `buildAnchors` segment start
  * (shouldn't happen for a real fold/unfold effect, since every foldable position is itself a
  * segment start) falls back to describing that line alone as a bare, unparented "other" anchor
- * rather than losing the record entirely. */
-export function describeFold(state: EditorState, range: { from: number; to: number }): Anchor {
+ * rather than losing the record entirely.
+ *
+ * R7 (PR-5): `blocks` is `buildAnchors(state.doc.toString())`. Building it walks the whole
+ * document, so a caller describing several folds against one `state` (the recorder, once per
+ * fold/unfold effect in a transaction) builds it once and passes it in, instead of re-parsing
+ * the note for every fold. Omitted, it is built here. */
+export function describeFold(
+	state: EditorState,
+	range: { from: number; to: number },
+	blocks: readonly AnchoredBlock[] = buildAnchors(state.doc.toString()),
+): Anchor {
 	const line = state.doc.lineAt(range.from);
-	const blocks = buildAnchors(state.doc.toString());
 	const match = blocks.find((block) => block.range.startLine === line.number);
 	if (match) return match.anchor;
 

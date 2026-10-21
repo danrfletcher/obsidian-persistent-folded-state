@@ -118,12 +118,18 @@ function sameRange(a: LineRange, b: LineRange): boolean {
  * be folded); an empty `nativeFolded` with a non-empty `matched` folds all of it, with nothing to
  * unfold. A range present in both is left alone (in neither `toFold` nor `toUnfold`) — it is
  * already correctly showing, matching E4's "the plugin adds nothing that was not stored" for the
- * ranges that already agree. */
+ * ranges that already agree.
+ *
+ * PR-1 R4: "the same range" is `covers(native, matched)`, `sameRange` by default. A caller whose
+ * `matched` are `buildAnchors` ranges (blank separators included) but whose `nativeFolded` are
+ * live CM6 folds (ending at the last content line) passes `liveFoldCoversCandidate`, so a
+ * trimmed fold counts as agreeing with its block instead of being unfolded as a stale offset. */
 export function reconcileNativeRestore(
 	nativeFolded: readonly LineRange[],
 	matched: readonly LineRange[],
+	covers: (native: LineRange, matched: LineRange) => boolean = sameRange,
 ): NativeReconcileResult {
-	const toFold = matched.filter((m) => !nativeFolded.some((n) => sameRange(n, m)));
-	const toUnfold = nativeFolded.filter((n) => !matched.some((m) => sameRange(m, n)));
+	const toFold = matched.filter((m) => !nativeFolded.some((n) => covers(n, m)));
+	const toUnfold = nativeFolded.filter((n) => !matched.some((m) => covers(n, m)));
 	return { toFold, toUnfold };
 }

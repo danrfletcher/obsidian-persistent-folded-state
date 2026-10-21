@@ -183,17 +183,18 @@ function childrenOf(parent: Anchor, candidates: Anchor[]): number[] {
  * file comment), so it skips straight from exact text to a single blended bar
  * (`positionalThreshold`) rather than running separate positional/fuzzy tiers — every same-kind
  * candidate in `pool` is already as eligible as a real anchor's "same position" set would be,
- * since there is no position signal available to narrow it further. Not routed through
- * `ComparisonBudget`: like the parent-chain tiebreak elsewhere in this file, resolving an
- * ancestor's own identity is a prerequisite for *finding* a stored anchor's scope, not one of
- * that anchor's own tier-2/tier-3 comparisons, so these calls aren't counted toward the E6
- * comparisons cap/spy. */
-function resolveAncestorMatch(
+ * since there is no position signal available to narrow it further. R12 (PR-4): its
+ * `similarity()` calls go through the run's `ComparisonBudget` like every tier-2/tier-3 call, so
+ * they count toward the E6 comparisons cap (and are memoized and chunk-yielded with the rest).
+ * An exhausted budget means this ancestor reads as unmatched, which sends its children to the
+ * G14 file-wide fallback — the same graceful degradation as any other cap. */
+async function resolveAncestorMatch(
 	ref: { kind: string; text: string },
 	pool: number[],
 	candidates: Anchor[],
 	opts: ResolvedOptions,
-): number | null {
+	budget: ComparisonBudget,
+): Promise<number | null> {
 	const sameKind = pool.filter((i) => candidates[i].kind === ref.kind);
 
 	const exact = sameKind.filter((i) => candidates[i].text === ref.text);
@@ -204,7 +205,8 @@ function resolveAncestorMatch(
 	let bestIdx = -1;
 	let tieCount = 0;
 	for (const i of sameKind) {
-		const score = similarityModule.similarity(ref.text, candidates[i].text);
+		const score = await budget.score(`a\u0000${ref.kind}\u0000${ref.text}\u0000${i}`, ref.text, candidates[i].text);
+		if (score === null) return null; // cap reached: leave this ancestor unresolved
 		if (score > bestScore + TIE_EPSILON) {
 			bestScore = score;
 			bestIdx = i;
@@ -221,20 +223,21 @@ function resolveAncestorMatch(
  * its *last* entry, or `null` if that entry has no match. Recursive and memoized by the chain's
  * own content: resolving `chain[chain.length - 1]` first needs `chain`'s own parent (everything
  * but the last entry) resolved, to know whether to search its children or fall back file-wide. */
-function matchAncestor(
+async function matchAncestor(
 	chain: AnchorParentRef[],
 	candidates: Anchor[],
 	opts: ResolvedOptions,
 	memo: Map<string, number | null>,
-): number | null {
+	budget: ComparisonBudget,
+): Promise<number | null> {
 	const key = chainKeyFromRefs(chain);
 	const cached = memo.get(key);
 	if (cached !== undefined) return cached;
 
 	const parentChain = chain.slice(0, -1);
 	const ref = chain[chain.length - 1];
-	const pool = poolFor(parentChain, candidates, opts, memo);
-	const result = resolveAncestorMatch(ref, pool, candidates, opts);
+	const pool = await poolFor(parentChain, candidates, opts, memo, budget);
+	const result = await resolveAncestorMatch(ref, pool, candidates, opts, budget);
 
 	memo.set(key, result);
 	return result;
@@ -244,14 +247,15 @@ function matchAncestor(
  * file-wide when `chain` is empty (no parent to match or fail) or when `chain`'s own last entry
  * has no match of its own; otherwise the real children of whatever candidate that entry resolved
  * to. */
-function poolFor(
+async function poolFor(
 	chain: AnchorParentRef[],
 	candidates: Anchor[],
 	opts: ResolvedOptions,
 	memo: Map<string, number | null>,
-): number[] {
+	budget: ComparisonBudget,
+): Promise<number[]> {
 	if (chain.length === 0) return allCandidateIndices(candidates);
-	const matched = matchAncestor(chain, candidates, opts, memo);
+	const matched = await matchAncestor(chain, candidates, opts, memo, budget);
 	if (matched === null) return allCandidateIndices(candidates);
 	return childrenOf(candidates[matched], candidates);
 }
@@ -262,15 +266,16 @@ function poolFor(
  * anchor (`parentChain` empty) has no parent to match or fail, so it always searches every
  * candidate — and that is a real (non-fallback) scope, not a fallback one: there is no parent to
  * have failed. */
-function scopeFor(
+async function scopeFor(
 	stored: Anchor,
 	candidates: Anchor[],
 	opts: ResolvedOptions,
 	memo: Map<string, number | null>,
-): { pool: number[]; fallback: boolean } {
+	budget: ComparisonBudget,
+): Promise<{ pool: number[]; fallback: boolean }> {
 	if (stored.parentChain.length === 0) return { pool: allCandidateIndices(candidates), fallback: false };
 
-	const matched = matchAncestor(stored.parentChain, candidates, opts, memo);
+	const matched = await matchAncestor(stored.parentChain, candidates, opts, memo, budget);
 	if (matched === null) return { pool: allCandidateIndices(candidates), fallback: true };
 	return { pool: childrenOf(candidates[matched], candidates), fallback: false };
 }
@@ -304,12 +309,28 @@ function runExactTier(
 	consumed: boolean[],
 	results: MatchResult[],
 ): PendingAnchor[] {
-	const groups = new Map<string, { storedIdxs: number[]; candidateIdxs: number[]; fallback: boolean }>();
+	interface ExactGroup {
+		storedIdxs: number[];
+		candidateIdxs: number[];
+		fallback: boolean;
+		/** `chainKey` of the group's stored anchors (every member shares it). */
+		chain: string;
+		/** Set when a candidate was withheld from this group because it tied with another group
+		 * for it (R14): members left unpaired are `ambiguous`, not `no-candidate`. */
+		contended: boolean;
+	}
+	const groups = new Map<string, ExactGroup>();
 
 	for (const p of pending) {
 		const anchor = stored[p.index];
 		const groupKey = `${chainKey(anchor)}\u0000${anchor.kind}\u0000${anchor.text}`;
-		const group = groups.get(groupKey) ?? { storedIdxs: [], candidateIdxs: [], fallback: p.fallback };
+		const group = groups.get(groupKey) ?? {
+			storedIdxs: [],
+			candidateIdxs: [],
+			fallback: p.fallback,
+			chain: chainKey(anchor),
+			contended: false,
+		};
 		group.storedIdxs.push(p.index);
 		if (!groups.has(groupKey)) {
 			// Every member of a group shares the same (chainKey, kind, text), so any member's
@@ -327,20 +348,53 @@ function runExactTier(
 	}
 
 	const resolvedStoredIdx = new Set<number>();
-	for (const group of groups.values()) {
-		// R8: inside a G14 fallback pool (this group's anchors have no matched parent of their
-		// own), the exact tier must claim only a *unique* file-wide match — two or more
-		// same-text candidates here are genuinely ambiguous (they may sit under two different,
-		// unrelated, both-unresolved parents), never order-paired as if they were true E1
-		// duplicates under one real parent (C18).
-		if (group.fallback && group.candidateIdxs.length > 1) {
-			for (const storedIdx of group.storedIdxs) {
-				results[storedIdx] = { tier: "none", reason: "ambiguous" };
-				resolvedStoredIdx.add(storedIdx);
-			}
-			continue;
+	const markAmbiguous = (group: ExactGroup): void => {
+		for (const storedIdx of group.storedIdxs) {
+			results[storedIdx] = { tier: "none", reason: "ambiguous" };
+			resolvedStoredIdx.add(storedIdx);
 		}
+	};
 
+	// R14 (PR-4): groups are built before anything is consumed, so two groups with different
+	// parent chains can list the same candidate (e.g. `# Home > x` and `# Home base > x` both
+	// resolving into the one remaining `# Home base > x`). One candidate may be claimed by only
+	// one stored anchor (C9), so a contended candidate goes to the group whose ancestry is the
+	// best fit: identical to the candidate's own parent chain beats a real but different scope
+	// (a parent matched through a rename), which beats the G14 file-wide fallback. If the best
+	// fit is itself shared by several groups, nobody takes it — those groups see it as ambiguous.
+	// A fallback group with several same-text candidates is ambiguous outright (R8), judged on
+	// its original candidate list, before contention removes anything from it.
+	for (const group of groups.values()) {
+		if (group.fallback && group.candidateIdxs.length > 1) {
+			group.candidateIdxs = [];
+			markAmbiguous(group);
+		}
+	}
+	const contenders = new Map<number, ExactGroup[]>();
+	for (const group of groups.values()) {
+		for (const c of group.candidateIdxs) {
+			const list = contenders.get(c) ?? [];
+			list.push(group);
+			contenders.set(c, list);
+		}
+	}
+	const fitRank = (group: ExactGroup, c: number): number => {
+		if (group.fallback) return 0;
+		return group.chain === chainKey(candidates[c]) ? 2 : 1;
+	};
+	for (const [c, list] of contenders) {
+		if (list.length < 2) continue;
+		const best = Math.max(...list.map((g) => fitRank(g, c)));
+		const top = list.filter((g) => fitRank(g, c) === best);
+		for (const group of list) {
+			if (top.length === 1 && group === top[0]) continue; // the clear best fit keeps it
+			group.candidateIdxs = group.candidateIdxs.filter((x) => x !== c);
+			if (top.length > 1 && top.includes(group)) group.contended = true;
+		}
+	}
+
+	for (const group of groups.values()) {
+		if (group.storedIdxs.every((i) => resolvedStoredIdx.has(i))) continue;
 		const pairs = new Map<number, number>(); // storedIdx -> candidateIdx
 		const usedCandidates = new Set<number>();
 
@@ -369,19 +423,32 @@ function runExactTier(
 			results[storedIdx] = { tier: "exact", target: candidateIdx };
 			resolvedStoredIdx.add(storedIdx);
 		}
+
+		if (group.contended) {
+			for (const storedIdx of group.storedIdxs) {
+				if (pairs.has(storedIdx)) continue;
+				results[storedIdx] = { tier: "none", reason: "ambiguous" };
+				resolvedStoredIdx.add(storedIdx);
+			}
+		}
 	}
 
 	return pending.filter((p) => !resolvedStoredIdx.has(p.index));
 }
 
-/** Memoized, capped, chunk-yielding source of `similarity()` scores for tiers 2 and 3. Memoized
- * by `(anchorIdx, candidateIdx)` so a pair re-examined across several deferred-acceptance passes
- * (see `runScoredTier`) is never re-counted — the cap and the spy both see one call per pair.
- * Returns `null` once the cap is reached and the pair has never been scored before; callers must
- * stop offering further candidates to that anchor once they see `null`. */
+/** Memoized, capped, chunk-yielding source of every `similarity()` score in a run (R12, PR-4):
+ * tier 2/3 text scores, ancestor resolution and the parent-chain tiebreak all come through
+ * `score`, so the E6 cap and a spy on `similarity` see the same count. Memoized by a caller-built
+ * `key` (distinct per kind of comparison) so a pair re-examined across several
+ * deferred-acceptance passes is never re-counted. Returns `null` once the cap is reached and the
+ * pair has never been scored before; callers must stop offering further candidates to that
+ * anchor once they see `null`. `yieldToHost` is awaited each time `chunkSize` fresh calls have
+ * accumulated since the last yield, so no stretch of consecutive `similarity()` calls is longer
+ * than one chunk. */
 class ComparisonBudget {
 	private readonly memo = new Map<string, number>();
 	private count = 0;
+	private sinceYield = 0;
 	exhausted: boolean;
 
 	constructor(
@@ -392,8 +459,7 @@ class ComparisonBudget {
 		this.exhausted = max <= 0;
 	}
 
-	async score(anchorIdx: number, candidateIdx: number, textA: string, textB: string): Promise<number | null> {
-		const key = `${anchorIdx}:${candidateIdx}`;
+	async score(key: string, textA: string, textB: string): Promise<number | null> {
 		const cached = this.memo.get(key);
 		if (cached !== undefined) return cached;
 		if (this.exhausted) return null;
@@ -401,8 +467,12 @@ class ComparisonBudget {
 		const value = similarityModule.similarity(textA, textB);
 		this.memo.set(key, value);
 		this.count++;
+		this.sinceYield++;
 		if (this.count >= this.max) this.exhausted = true;
-		if (this.count % this.chunkSize === 0) await this.yieldToHost();
+		if (this.sinceYield >= this.chunkSize) {
+			this.sinceYield = 0;
+			await this.yieldToHost();
+		}
 		return value;
 	}
 }
@@ -422,15 +492,23 @@ interface ScoredClaim {
  * similarity (beyond `TIE_EPSILON`) wins outright; if the chain comparison is itself tied, or
  * nothing separates the group, nobody wins (null) — this never raises or invents a text score,
  * it only ever discriminates between options that already tied on one. */
-function breakTieByChain<T>(tied: T[], chainTextFor: (item: T) => string, fixedChainText: string): T | null {
+async function breakTieByChain<T>(
+	tied: T[],
+	chainTextFor: (item: T) => string,
+	fixedChainText: string,
+	budget: ComparisonBudget,
+): Promise<T | null> {
 	if (tied.length === 1) return tied[0];
 
 	let bestChainScore = Number.NEGATIVE_INFINITY;
 	let winners: T[] = [];
 	for (const item of tied) {
-		// Not counted toward the E6 comparisons cap/spy — this is a tiebreak over already-tied
-		// text scores, not a tier-2/tier-3 eligibility comparison (see the file comment).
-		const chainScore = similarityModule.similarity(fixedChainText, chainTextFor(item));
+		// R12: counted toward the E6 comparisons cap through the run's budget (a tiebreak over
+		// already-tied text scores is still a `similarity()` call), and memoized, so the
+		// tiebreak re-running on every deferred-acceptance pass costs nothing the second time.
+		const itemChainText = chainTextFor(item);
+		const chainScore = await budget.score(`c\u0000${fixedChainText}\u0000${itemChainText}`, fixedChainText, itemChainText);
+		if (chainScore === null) return null; // cap reached: nothing separates the tie
 		if (chainScore > bestChainScore + TIE_EPSILON) {
 			bestChainScore = chainScore;
 			winners = [item];
@@ -447,12 +525,17 @@ function breakTieByChain<T>(tied: T[], chainTextFor: (item: T) => string, fixedC
  * reads against the candidate's — and if that is tied too, nobody wins this round. Never used to
  * decide a lone claimant, and never used to compare a lower text score against a higher one —
  * only to break an already-equal text score. */
-function pickWinner(claimants: ScoredClaim[], stored: Anchor[], candidate: Anchor): ScoredClaim | null {
+async function pickWinner(
+	claimants: ScoredClaim[],
+	stored: Anchor[],
+	candidate: Anchor,
+	budget: ComparisonBudget,
+): Promise<ScoredClaim | null> {
 	if (claimants.length === 1) return claimants[0];
 
 	const bestScore = Math.max(...claimants.map((c) => c.score));
 	const atBestScore = claimants.filter((c) => tiedScores(c.score, bestScore));
-	return breakTieByChain(atBestScore, (claim) => chainText(stored[claim.anchorIndex]), chainText(candidate));
+	return breakTieByChain(atBestScore, (claim) => chainText(stored[claim.anchorIndex]), chainText(candidate), budget);
 }
 
 /** One deferred-acceptance pass over `remaining`, repeated until no further progress is made:
@@ -486,7 +569,7 @@ async function runScoredTier(
 			const scored: { candidateIdx: number; score: number }[] = [];
 			for (const c of eligible) {
 				const candidate = candidates[c];
-				const score = await budget.score(p.index, c, anchor.text, candidate.text);
+				const score = await budget.score(`s\u0000${p.index}\u0000${c}`, anchor.text, candidate.text);
 				if (score === null) break; // the budget's own exhausted-check, not a redundant pre-check here
 				if (score >= thresholdFor(anchor, candidate)) scored.push({ candidateIdx: c, score });
 			}
@@ -496,25 +579,37 @@ async function runScoredTier(
 			perAnchorScored.push(scored);
 		}
 
-		const claims: (ScoredClaim | null)[] = remaining.map((p, i) => {
+		const claims: (ScoredClaim | null)[] = [];
+		for (let i = 0; i < remaining.length; i++) {
+			const p = remaining[i];
 			const scored = perAnchorScored[i];
-			if (scored.length === 0) return null;
+			if (scored.length === 0) {
+				claims.push(null);
+				continue;
+			}
 			const best = Math.max(...scored.map((s) => s.score));
 			const atBest = scored.filter((s) => tiedScores(s.score, best));
 			if (atBest.length === 1) {
-				return { anchorIndex: p.index, candidateIdx: atBest[0].candidateIdx, score: best };
+				claims.push({ anchorIndex: p.index, candidateIdx: atBest[0].candidateIdx, score: best });
+				continue;
 			}
 			// E2 forward direction: several candidates tied at this one anchor's own best score.
 			// The parent chain (C14/C20) gets one chance to separate them — fixed on the
 			// anchor's own chain, varying over the tied candidates — before falling back to
 			// ambiguous; it never raises the tied text score, only discriminates between them.
-			const winner = breakTieByChain(atBest, (s) => chainText(candidates[s.candidateIdx]), chainText(stored[p.index]));
+			const winner = await breakTieByChain(
+				atBest,
+				(s) => chainText(candidates[s.candidateIdx]),
+				chainText(stored[p.index]),
+				budget,
+			);
 			if (winner === null) {
 				reasonHint.set(p.index, "ambiguous");
-				return null;
+				claims.push(null);
+				continue;
 			}
-			return { anchorIndex: p.index, candidateIdx: winner.candidateIdx, score: best };
-		});
+			claims.push({ anchorIndex: p.index, candidateIdx: winner.candidateIdx, score: best });
+		}
 
 		const byCandidate = new Map<number, ScoredClaim[]>();
 		for (const claim of claims) {
@@ -526,7 +621,7 @@ async function runScoredTier(
 
 		const confirmed = new Set<number>();
 		for (const [candidateIdx, claimants] of byCandidate) {
-			const winner = pickWinner(claimants, stored, candidates[candidateIdx]);
+			const winner = await pickWinner(claimants, stored, candidates[candidateIdx], budget);
 			if (winner !== null) {
 				consumed[candidateIdx] = true;
 				results[winner.anchorIndex] = { tier, target: candidateIdx };
@@ -600,16 +695,18 @@ export async function matchAnchors(
 	const reasonHint = new Map<number, NoMatchReason>();
 	const ancestorMemo = new Map<string, number | null>();
 
+	// R12: one budget for the whole run — ancestor resolution, the parent-chain tiebreak and the
+	// tier 2/3 scores all draw on the same E6 cap.
+	const budget = new ComparisonBudget(opts.maxComparisons, opts.chunkSize, opts.yieldToHost);
+
 	let pending: PendingAnchor[] = [];
 	for (let i = 0; i < cappedCount; i++) {
-		const scope = scopeFor(stored[i], candidates, opts, ancestorMemo);
+		const scope = await scopeFor(stored[i], candidates, opts, ancestorMemo, budget);
 		pending.push({ index: i, pool: scope.pool, fallback: scope.fallback });
 	}
 
 	pending = runExactTier(pending, stored, candidates, consumed, results);
 	if (pending.length === 0) return results;
-
-	const budget = new ComparisonBudget(opts.maxComparisons, opts.chunkSize, opts.yieldToHost);
 
 	pending = await runScoredTier(
 		pending,

@@ -1,16 +1,13 @@
 #!/usr/bin/env node
 /**
  * T4 (=R2/R7/T10): the real-Obsidian E5/G15 (first-open baseline) + G6 (dormant anchors kept
- * across disable/re-enable) proof the spec names at this literal path, reusing PR-2's own CDP
- * pattern (scripts/e2e-reload-probe.mjs established it first). Deliberately self-contained, not
- * importing a shared helper module: every scripts/e2e-*-probe.mjs already keeps its own copy of
- * this same CDP/data.json plumbing rather than sharing one (see the file comment in
- * e2e-restore-probe.mjs for why), and a `.ts`-extension relative import here would need either
- * `allowImportingTsExtensions` in tsconfig.json (this repo's `moduleResolution: "node"` already
- * resolves an extension-less specifier at compile time, but Node's own ESM loader refuses to
- * resolve one at runtime) or a project-wide config change outside what T4 asks for. Kept
- * runnable as plain Node + type-stripped TypeScript, no build step, same as every other e2e
- * probe in this repo.
+ * across disable/re-enable) proof the spec names at this literal path. T63 (PR-1 polish round 4):
+ * it now reuses the shared e2e helper scripts/e2e-lib.mjs (the CDP client PR-2's
+ * scripts/e2e-reload-probe.mjs established, the data.json helpers, and the page-side fold
+ * helpers) instead of carrying its own copy. An earlier version of this comment said a shared
+ * import was impossible; that was about importing a `.ts` file from Node's ESM loader. The helper
+ * is a plain `.mjs` module, which type-stripped `.ts` scripts import fine at runtime, and tsc
+ * (`allowJs`) resolves it for `npm run build`'s type-check.
  *
  * Runs two cases, both from R7's corrected phase list:
  *
@@ -70,8 +67,14 @@
  *   node tests/e2e/dormant-baseline.e2e.ts
  *   node tests/e2e/dormant-baseline.e2e.ts --cdp-port 9222 --note /config/test-vault/Quarry/Tasks.md
  *
- * Accepts [--cdp-port 9222] [--note <path>] [--vault-path <Quarry/Tasks.md>]
- * [--data <path to this plugin's data.json>] [--wait-ms 1500] [--help].
+ * Accepts [--cdp-port 9222] [--note <path>] [--data <path to this plugin's data.json>]
+ * [--wait-ms 1500] [--help].
+ *
+ * T102: every fold step acts on the *active* editor, and a run used to fold whichever note
+ * happened to be active (not --note), so the reopened --note showed nothing folded and held
+ * only Obsidian's auto-folded frontmatter. The vault key is now derived from the vault root
+ * Obsidian reports (the old --vault-path option is gone), and --note is made the active editor,
+ * and confirmed, before the folds in each case.
  *
  * Not run by `npm test` (vitest's own `include` is `tests/**\/*.test.ts`, which this file's
  * `.e2e.ts` extension deliberately does not match) and not run automatically by this coder
@@ -80,194 +83,33 @@
 import { copyFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	evaluate,
+	foldAndConfirm,
+	hashText,
+	parkCursorOutsideFolds,
+	readPluginData,
+	readVisibleLines,
+	recordFor,
+	sleep,
+	unfoldAll,
+	useNote,
+	visibleLinesInclude,
+	withConnection,
+	writePluginData,
+} from "../../scripts/e2e-lib.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PLUGIN_ID = "persistent-folded-state";
 const DEFAULT_NOTE_PATH = "/config/test-vault/Quarry/Tasks.md";
-const DEFAULT_VAULT_PATH = "Quarry/Tasks.md";
 const DEFAULT_DATA_PATH = `/config/test-vault/.obsidian/plugins/${PLUGIN_ID}/data.json`;
 const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
 
-// --- CDP (own copy — see the file comment above for why) ---------------------------------------
-
-interface CdpTarget {
-	type: string;
-	webSocketDebuggerUrl?: string;
-}
-
-interface CdpConnection {
-	send: (method: string, params?: Record<string, unknown>, opts?: { timeoutMs?: number }) => Promise<unknown>;
-	close: () => void;
-}
-
-async function findDebuggableTarget(cdpPort: number): Promise<CdpTarget> {
-	const res = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
-	if (!res.ok) throw new Error(`CDP target list request failed: HTTP ${res.status}`);
-	const targets = (await res.json()) as CdpTarget[];
-	const target = targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-	if (!target) throw new Error("no debuggable Obsidian window found on that CDP port");
-	return target;
-}
-
-function connectCdp(webSocketDebuggerUrl: string): CdpConnection {
-	const ws = new WebSocket(webSocketDebuggerUrl);
-	let nextId = 1;
-	const pending = new Map<number, { resolve: (value: unknown) => void; reject: (err: Error) => void }>();
-	let closed = false;
-
-	function rejectAllPending(err: Error): void {
-		for (const { reject } of pending.values()) reject(err);
-		pending.clear();
-	}
-
-	ws.addEventListener("message", (event: MessageEvent) => {
-		const message = JSON.parse(String(event.data)) as {
-			id?: number;
-			error?: { message: string };
-			result?: unknown;
-		};
-		if (message.id && pending.has(message.id)) {
-			const entry = pending.get(message.id);
-			pending.delete(message.id);
-			if (!entry) return;
-			if (message.error) entry.reject(new Error(message.error.message));
-			else entry.resolve(message.result);
-		}
-	});
-	ws.addEventListener("close", () => {
-		closed = true;
-		rejectAllPending(new Error("CDP socket closed"));
-	});
-	ws.addEventListener("error", () => rejectAllPending(new Error("CDP socket error")));
-
-	const ready = new Promise<void>((resolve, reject) => {
-		ws.addEventListener("open", () => resolve());
-		ws.addEventListener("error", (err) => reject(err instanceof Error ? err : new Error(String(err))));
-	});
-
-	async function send(
-		method: string,
-		params: Record<string, unknown> = {},
-		opts: { timeoutMs?: number } = {},
-	): Promise<unknown> {
-		const timeoutMs = opts.timeoutMs ?? 10000;
-		await ready;
-		if (closed) throw new Error(`CDP socket already closed, cannot send ${method}`);
-		const id = nextId++;
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				pending.delete(id);
-				reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
-			}, timeoutMs);
-			pending.set(id, {
-				resolve: (value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
-				reject: (err) => {
-					clearTimeout(timer);
-					reject(err);
-				},
-			});
-			ws.send(JSON.stringify({ id, method, params }));
-		});
-	}
-
-	return {
-		send,
-		close: () => {
-			if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
-		},
-	};
-}
-
-async function evaluate(
-	cdp: CdpConnection,
-	expression: string,
-	opts: { awaitPromise?: boolean } = {},
-): Promise<unknown> {
-	await cdp.send("Runtime.enable");
-	const result = (await cdp.send("Runtime.evaluate", {
-		expression,
-		returnByValue: true,
-		awaitPromise: opts.awaitPromise ?? false,
-	})) as { exceptionDetails?: unknown; result: { value: unknown } };
-	if (result.exceptionDetails) throw new Error(`Runtime.evaluate threw: ${JSON.stringify(result.exceptionDetails)}`);
-	return result.result.value;
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withConnection<T>(cdpPort: number, fn: (cdp: CdpConnection) => Promise<T>): Promise<T> {
-	const target = await findDebuggableTarget(cdpPort);
-	if (!target.webSocketDebuggerUrl) throw new Error("debuggable target has no webSocketDebuggerUrl");
-	const cdp = connectCdp(target.webSocketDebuggerUrl);
-	try {
-		return await fn(cdp);
-	} finally {
-		cdp.close();
-	}
-}
-
-// --- this plugin's own data.json (read/written directly from the host filesystem) -------------
-
-/** A stored fold round-trips `src/anchors.ts`'s `Anchor` shape (see `src/types.ts`'s
- * `StoredAnchor` comment) — only `kind` is read here, so this stays loose about the rest. */
-interface StoredAnchorLike {
-	kind?: string;
-}
-
-interface StoredFileRecordLike {
-	contentHash: string;
-	folds: StoredAnchorLike[];
-	dormant: unknown[];
-}
-
-interface StoredDataLike {
-	version: number;
-	files: Record<string, StoredFileRecordLike>;
-}
-
-function readPluginData(dataPath: string): StoredDataLike | null {
-	if (!existsSync(dataPath)) return null;
-	try {
-		return JSON.parse(readFileSync(dataPath, "utf8")) as StoredDataLike;
-	} catch {
-		return null;
-	}
-}
-
-function writePluginData(dataPath: string, data: StoredDataLike): void {
-	writeFileSync(dataPath, JSON.stringify(data), "utf8");
-}
-
-function recordFor(data: StoredDataLike | null, vaultPath: string): StoredFileRecordLike | undefined {
-	return data?.files[vaultPath];
-}
-
-/** Duplicate of src/fold-store.ts's own `hashText` (same literal-duplication precedent as
- * scripts/e2e-dormant-baseline-probe.mjs's own `MAX_DORMANT_AGE_MS`) — kept dependency-free from
- * src/* so this file stays a plain, independently-runnable script with no build step. */
-function hashText(text: string): string {
-	const normalized = text.replace(/\r\n?/g, "\n");
-	let h1 = 0xdeadbeef;
-	let h2 = 0x41c6ce57;
-	for (let i = 0; i < normalized.length; i++) {
-		const ch = normalized.charCodeAt(i);
-		h1 = Math.imul(h1 ^ ch, 2654435761);
-		h2 = Math.imul(h2 ^ ch, 1597334677);
-	}
-	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-	return (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
-}
+type Cdp = Parameters<typeof foldAndConfirm>[0];
 
 interface Args {
 	cdpPort: number;
 	note: string;
-	vaultPath: string;
 	data: string;
 	waitMs: number;
 	help: boolean;
@@ -277,7 +119,6 @@ function parseArgs(argv: string[]): Args {
 	const args: Args = {
 		cdpPort: 9222,
 		note: DEFAULT_NOTE_PATH,
-		vaultPath: DEFAULT_VAULT_PATH,
 		data: DEFAULT_DATA_PATH,
 		waitMs: 1500,
 		help: false,
@@ -286,7 +127,6 @@ function parseArgs(argv: string[]): Args {
 		const arg = argv[i];
 		if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--note") args.note = argv[++i] ?? args.note;
-		else if (arg === "--vault-path") args.vaultPath = argv[++i] ?? args.vaultPath;
 		else if (arg === "--data") args.data = argv[++i] ?? args.data;
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--help" || arg === "-h") args.help = true;
@@ -302,8 +142,7 @@ function printUsage(): void {
 			"Runs both the close+reopen and re-enable-over-an-open-pane first-open-baseline cases",
 			"(T4/R2/R7) against a real, already-running Obsidian.",
 			"",
-			"Options: [--cdp-port 9222] [--note <path>] [--vault-path <Quarry/Tasks.md>]",
-			`         [--data <path>] [--wait-ms 1500]`,
+			"Options: [--cdp-port 9222] [--note <path>] [--data <path>] [--wait-ms 1500]",
 			"",
 			`--note defaults to ${DEFAULT_NOTE_PATH}, --data to ${DEFAULT_DATA_PATH}.`,
 			"Requires a real Obsidian launched with --remote-debugging-port, this plugin built and",
@@ -313,27 +152,6 @@ function printUsage(): void {
 }
 
 // --- page-side expressions ------------------------------------------------------------------
-
-/** Same mechanism scripts/e2e-dormant-baseline-probe.mjs's own fold-click helper uses. */
-function clickFoldIndicatorNearExpression(needle: string): string {
-	return `
-(function () {
-	const needle = ${JSON.stringify(needle)};
-	const lines = Array.from(document.querySelectorAll(".cm-line"));
-	const target = lines.find((el) => el.textContent && el.textContent.includes(needle));
-	if (!target) return { clicked: false, reason: \`no rendered .cm-line contains "\${needle}"\` };
-	const indicator = target.querySelector(".cm-fold-indicator .collapse-indicator") ||
-		target.closest(".cm-line")?.previousElementSibling?.querySelector?.(".cm-fold-indicator .collapse-indicator");
-	if (!indicator) return { clicked: false, reason: \`found the line but no fold-indicator on/near it\` };
-	indicator.click();
-	return { clicked: true };
-})()
-`;
-}
-
-const READ_VISIBLE_LINES_EXPRESSION = `
-JSON.stringify(Array.from(document.querySelectorAll(".cm-line")).map((el) => el.textContent))
-`;
 
 function disablePluginExpression(): string {
 	return `
@@ -349,22 +167,6 @@ function enablePluginExpression(): string {
 (async function () {
 	await app.plugins.enablePlugin(${JSON.stringify(PLUGIN_ID)});
 	return { enabled: true };
-})()
-`;
-}
-
-/** R9(c): `reenableOverOpenPane` reuses the same open pane `closeAndReopen` already ran on, so
- * by the time its own step 3 runs, both target blocks are already folded from the previous
- * case's own baseline adoption — clicking their fold indicators again would *unfold* them
- * instead of setting up a clean "two folds made while disabled" state. Called unconditionally
- * at the start of every case (harmless no-op on a pane with nothing folded yet) so each case's
- * own fold clicks always start from the same unfolded baseline, regardless of what an earlier
- * case left live. */
-function unfoldAllExpression(): string {
-	return `
-(function () {
-	app.commands.executeCommandById("editor:unfold-all");
-	return { unfolded: true };
 })()
 `;
 }
@@ -397,12 +199,17 @@ interface CaseResult {
 }
 
 async function runCase(
-	cdp: CdpConnection,
+	cdp: Cdp,
 	args: Args,
 	name: string,
 	{ reopen }: { reopen: boolean },
 ): Promise<CaseResult> {
 	const problems: string[] = [];
+
+	// 0. T102: make --note the active editor and learn the key the plugin stores it under. Done
+	// before anything else so the unfold/park/fold steps below act on this note, not on
+	// whichever one an earlier case (or the operator) left active.
+	const { vaultPath } = await useNote(cdp, args.note);
 
 	// 1. Disable the plugin.
 	await evaluate(cdp, disablePluginExpression(), { awaitPromise: true });
@@ -411,25 +218,28 @@ async function runCase(
 	// a re-open of a path this test vault has already seen (R7).
 	if (existsSync(args.data)) rmSync(args.data);
 
-	// 2.5. R9(c): guarantee a clean, fully-unfolded starting point for the clicks below,
-	// regardless of whatever an earlier case in this same run left folded live.
-	await evaluate(cdp, unfoldAllExpression());
+	// 2.5. R9(c) / T62: guarantee a clean, fully-unfolded starting point for the folds below,
+	// regardless of whatever an earlier case in this same run left folded live. A fold click on a
+	// block that is still folded would *unfold* it, so wait until the lines the folds will hide
+	// are back in the DOM. (Obsidian's auto-folded frontmatter may stay folded; it is not listed.)
+	const unfold = await unfoldAll(cdp, ["A nested list item", "Outline"], { waitMs: args.waitMs });
+	if (!unfold.unfolded) problems.push(`could not unfold the note first; still hidden: ${JSON.stringify(unfold.missing)}`);
+	const cursor = await parkCursorOutsideFolds(cdp);
+	if (!cursor.parked) problems.push(`could not park the cursor outside the folds: ${cursor.reason ?? "unknown"}`);
+	await sleep(args.waitMs);
 
 	// 3. Fold the task and its sibling list item by hand (native CM6 fold, same as a user
 	// would) — the plugin is disabled, so neither fold is recorded yet; both should still be
 	// adopted as the baseline once it's enabled. T14: these two are siblings under the same
 	// heading, neither nested in the other, so CM6 never collapses one fold into the other the
-	// way it does for a heading and its own nested child (see the file comment).
-	const listClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Plain list item"))) as {
-		clicked: boolean;
-		reason?: string;
-	};
-	if (!listClick.clicked) problems.push(`list fold click failed: ${listClick.reason ?? "unknown"}`);
-	const taskClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"))) as {
-		clicked: boolean;
-		reason?: string;
-	};
-	if (!taskClick.clicked) problems.push(`task fold click failed: ${taskClick.reason ?? "unknown"}`);
+	// way it does for a heading and its own nested child (see the file comment). T62: each step
+	// is confirmed from the DOM (foldAndConfirm), scoped to the active editor, and falls back to
+	// the fold command, so a click that does nothing is reported here as the cause instead of
+	// surfacing later as "0 stored anchors".
+	const listClick = await foldAndConfirm(cdp, "Plain list item", "A nested list item", { waitMs: args.waitMs });
+	if (!listClick.folded) problems.push(`list fold did not take: ${JSON.stringify(listClick)}`);
+	const taskClick = await foldAndConfirm(cdp, "Draft proposal", "Outline", { waitMs: args.waitMs });
+	if (!taskClick.folded) problems.push(`task fold did not take: ${JSON.stringify(taskClick)}`);
 
 	// 4. Enable the plugin.
 	await evaluate(cdp, enablePluginExpression(), { awaitPromise: true });
@@ -437,7 +247,7 @@ async function runCase(
 	// 5. Either close+reopen the note (first case) or leave the already-open pane alone (second
 	// case — R7's "re-enable over an open pane").
 	if (reopen) {
-		const reopened = (await evaluate(cdp, closeAndReopenExpression(args.vaultPath), { awaitPromise: true })) as {
+		const reopened = (await evaluate(cdp, closeAndReopenExpression(vaultPath), { awaitPromise: true })) as {
 			reopened: boolean;
 			reason?: string;
 		};
@@ -448,9 +258,12 @@ async function runCase(
 
 	// 6. Assert: two anchors, the content hash, and both blocks still hidden.
 	const data = readPluginData(args.data);
-	const record = recordFor(data, args.vaultPath);
+	const record = recordFor(data, vaultPath);
 	if (!record) {
-		problems.push("no stored entry for the note at all after enabling the plugin");
+		problems.push(
+			`no stored entry for ${JSON.stringify(vaultPath)} at all after enabling the plugin ` +
+				`(data.json holds: ${JSON.stringify(data ? Object.keys(data.files) : null)})`,
+		);
 		return { name, ok: problems.length === 0, problems };
 	}
 
@@ -479,10 +292,9 @@ async function runCase(
 		problems.push(`unexpected anchor kinds stored: ${JSON.stringify(unexpectedKinds.map((fold) => fold.kind))}`);
 	}
 
-	const visibleLinesRaw = (await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION)) as string;
-	const visibleLines: string[] = JSON.parse(visibleLinesRaw);
+	const visibleLines = await readVisibleLines(cdp);
 	for (const needle of ["A nested list item", "Outline"]) {
-		if (visibleLines.some((line) => line.includes(needle))) {
+		if (visibleLinesInclude(visibleLines, needle)) {
 			problems.push(`"${needle}" is visible in the editor — a folded block leaked into view`);
 		}
 	}

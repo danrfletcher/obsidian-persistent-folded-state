@@ -18,7 +18,7 @@ node scripts/e2e-reload-probe.mjs --phase gutter-fold
 node scripts/e2e-reload-probe.mjs --phase fold-command
 # relaunch Obsidian, then:
 node scripts/e2e-reload-probe.mjs --phase native-restore
-node scripts/e2e-reload-probe.mjs --phase report
+node scripts/e2e-reload-probe.mjs --phase report --write-doc   # rewrites this file; refused for an inconclusive run
 ```
 
 Each phase reconnects over CDP independently and merges its result into this file (see the file

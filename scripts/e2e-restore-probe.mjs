@@ -20,10 +20,12 @@
  *                      ticked, a new child appended under "Send invoices") by writing the file
  *                      from outside Obsidian, then waits for the plugin's settle window plus
  *                      match time.
- *   --phase verify     GP3: reads the DOM again and checks: "## Tuesday" and "Draft proposal v2"
- *                      still have their interior lines hidden; "Send invoices" and its new child
- *                      are both rendered (visible); the file on disk is byte-identical to what
- *                      --phase rewrite wrote (F1 — nothing added).
+ *   --phase verify     GP3: reads the DOM again and checks: "## Tuesday" is still folded; then
+ *                      expands it (T2: "Send invoices" and its new child are nested inside
+ *                      Tuesday's foldable range, so they are only rendered once it is expanded)
+ *                      and checks "Draft proposal v2" still has its own fold while "Send invoices"
+ *                      and its new child are both rendered; the file on disk is byte-identical to
+ *                      what --phase rewrite wrote (F1 — nothing added).
  *   --phase report      (re)writes docs/restore-golden-path.md from the gathered state.
  *   --phase all          setup + rewrite + verify + report in one Obsidian session (the default).
  *
@@ -49,16 +51,32 @@
  *
  * Every phase accepts [--cdp-port 9222] [--wait-ms 1000] [--state <path>].
  */
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { copyFileSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import {
+	clickFoldIndicatorExpression,
+	evaluate,
+	foldAndConfirm,
+	parkCursorOutsideFolds,
+	readPluginData,
+	readVisibleLines,
+	requireRecord,
+	sleep,
+	unfoldAll,
+	useNote,
+	visibleLinesInclude,
+	withConnection,
+} from "./e2e-lib.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPORT_PATH = join(ROOT, "docs", "restore-golden-path.md");
 const DEFAULT_STATE_PATH = join(tmpdir(), "pfs-e2e-restore-probe-state.json");
 const DEFAULT_NOTE_PATH = "/config/test-vault/Tasks.md";
+const DEFAULT_DATA_PATH = "/config/test-vault/.obsidian/plugins/persistent-folded-state/data.json";
 const DEFAULT_AFTER_PATH = join(ROOT, "tests", "fixtures", "tasks-after.md");
+const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
 
 const EXPLICIT_PHASES = ["setup", "rewrite", "verify", "report"];
 const PHASES = ["all", ...EXPLICIT_PHASES];
@@ -70,9 +88,11 @@ function parseArgs(argv) {
 		if (arg === "--phase") args.phase = argv[++i];
 		else if (arg === "--note") args.note = argv[++i];
 		else if (arg === "--after") args.after = argv[++i];
+		else if (arg === "--data") args.data = argv[++i];
 		else if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--state") args.state = argv[++i];
+		else if (arg === "--keep-note") args.keepNote = true;
 		else if (arg === "--help" || arg === "-h") args.help = true;
 	}
 	return args;
@@ -90,7 +110,8 @@ function printUsage() {
 			"  --phase verify  [--note <path>]    GP3: check folded/visible lines + byte-identical file",
 			"  --phase report                     (re)write docs/restore-golden-path.md from --state",
 			"",
-			"Options: [--cdp-port 9222] [--wait-ms 1000] [--state <path>]",
+			"Options: [--cdp-port 9222] [--wait-ms 1000] [--state <path>] [--keep-note] [--data <path to this plugin's data.json>]",
+			"         (setup copies tests/fixtures/tasks-before.md over --note first, so every run starts from the same text; --keep-note skips that)",
 			"",
 			`--note defaults to ${DEFAULT_NOTE_PATH} (the container test vault's copy of tests/fixtures/tasks-before.md).`,
 			"Requires a real Obsidian launched with --remote-debugging-port, this plugin built and",
@@ -112,145 +133,61 @@ function saveState(path, state) {
 	writeFileSync(path, JSON.stringify(state, null, 2), "utf8");
 }
 
-async function findDebuggableTarget(cdpPort) {
-	const res = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
-	if (!res.ok) throw new Error(`CDP target list request failed: HTTP ${res.status}`);
-	const targets = await res.json();
-	const target = targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-	if (!target) throw new Error("no debuggable Obsidian window found on that CDP port");
-	return target;
-}
-
-/** Minimal CDP client — identical shape to scripts/e2e-reload-probe.mjs's `connectCdp` (kept as
- * its own copy here rather than shared, so each probe stays independently runnable/removable). */
-function connectCdp(webSocketDebuggerUrl) {
-	const ws = new WebSocket(webSocketDebuggerUrl);
-	let nextId = 1;
-	const pending = new Map();
-	let closed = false;
-
-	function rejectAllPending(err) {
-		for (const { reject } of pending.values()) reject(err);
-		pending.clear();
-	}
-
-	ws.addEventListener("message", (event) => {
-		const message = JSON.parse(event.data.toString());
-		if (message.id && pending.has(message.id)) {
-			const { resolve, reject } = pending.get(message.id);
-			pending.delete(message.id);
-			if (message.error) reject(new Error(message.error.message));
-			else resolve(message.result);
-		}
-	});
-	ws.addEventListener("close", () => {
-		closed = true;
-		rejectAllPending(new Error("CDP socket closed"));
-	});
-	ws.addEventListener("error", () => rejectAllPending(new Error("CDP socket error")));
-
-	const ready = new Promise((resolve, reject) => {
-		ws.addEventListener("open", () => resolve());
-		ws.addEventListener("error", (err) => reject(err instanceof Error ? err : new Error(String(err))));
-	});
-
-	async function send(method, params = {}, { timeoutMs = 10000 } = {}) {
-		await ready;
-		if (closed) throw new Error(`CDP socket already closed, cannot send ${method}`);
-		const id = nextId++;
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				pending.delete(id);
-				reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
-			}, timeoutMs);
-			pending.set(id, {
-				resolve: (value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
-				reject: (err) => {
-					clearTimeout(timer);
-					reject(err);
-				},
-			});
-			ws.send(JSON.stringify({ id, method, params }));
-		});
-	}
-
-	return { send, close: () => ws.readyState === WebSocket.OPEN && ws.close() };
-}
-
-async function evaluate(cdp, expression, { awaitPromise = false } = {}) {
-	await cdp.send("Runtime.enable");
-	const result = await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise });
-	if (result.exceptionDetails) throw new Error(`Runtime.evaluate threw: ${JSON.stringify(result.exceptionDetails)}`);
-	return result.result.value;
-}
-
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withConnection(cdpPort, fn) {
-	const target = await findDebuggableTarget(cdpPort);
-	const cdp = connectCdp(target.webSocketDebuggerUrl);
-	try {
-		return await fn(cdp);
-	} finally {
-		cdp.close();
-	}
-}
-
-/** Clicks the fold-indicator triangle for the first rendered `.cm-line` whose text matches
- * `needle` (a plain substring, not a regex — kept simple and visible rather than clever). Each
- * foldable line gets its own `.cm-fold-indicator` widget in the left margin (see the file
- * comment in e2e-reload-probe.mjs). Returns `{clicked: boolean, reason?: string}` rather than
- * throwing, so a phase that can't find the line reports why instead of a bare stack trace. */
-function clickFoldIndicatorNearExpression(needle) {
-	return `
-(function () {
-	const needle = ${JSON.stringify(needle)};
-	const lines = Array.from(document.querySelectorAll(".cm-line"));
-	const target = lines.find((el) => el.textContent && el.textContent.includes(needle));
-	if (!target) return { clicked: false, reason: \`no rendered .cm-line contains "\${needle}"\` };
-	const indicator = target.querySelector(".cm-fold-indicator .collapse-indicator") ||
-		target.closest(".cm-line")?.previousElementSibling?.querySelector?.(".cm-fold-indicator .collapse-indicator");
-	if (!indicator) return { clicked: false, reason: \`found the line but no fold-indicator on/near it\` };
-	indicator.click();
-	return { clicked: true };
-})()
-`;
-}
-
-/** The exact rendered-text signal GP3 checks: for each needle, whether a `.cm-line` containing
- * that text is currently present in the DOM at all (CM6 never renders a folded range's interior
- * lines as `.cm-line` elements — see the file comment above). */
-const READ_VISIBLE_LINES_EXPRESSION = `
-JSON.stringify(Array.from(document.querySelectorAll(".cm-line")).map((el) => el.textContent))
-`;
-
-function visibleLinesInclude(visibleLines, needle) {
-	return visibleLines.some((line) => line.includes(needle));
-}
-
 async function runSetup(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
+	// T61: start every run from the same note. A previous run leaves the note holding the
+	// rewritten text and Obsidian (or this plugin) restores the folds it stored, so a fold click
+	// on the next run would *unfold* a block that was already folded. Put the "before" fixture
+	// back, then unfold anything that is still folded, so GP1 always folds from a known state.
+	let reset = { skipped: true };
+	if (!args.keepNote) {
+		copyFileSync(BEFORE_FIXTURE, note);
+		await sleep(Math.max(args.waitMs, 1500)); // the plugin's own settle window + restore
+		reset = { copiedFrom: BEFORE_FIXTURE };
+	}
+	const data = args.data ?? DEFAULT_DATA_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
-		const tuesdayClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"));
+		// T99/T100: every fold step below acts on the *active* editor, and the plugin stores folds
+		// under the note's vault-relative path. Make --note the active editor first, and derive
+		// the key from the vault root Obsidian reports, so this probe folds, rewrites and reads
+		// back one and the same note.
+		const target = await useNote(cdp, note);
 		await sleep(args.waitMs);
-		const draftClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"));
+		// Only lines inside the two blocks GP1 folds: Obsidian may keep the frontmatter folded.
+		const unfold = await unfoldAll(cdp, ["Outline", "Notes for Tuesday"], { waitMs: args.waitMs });
+		const cursor = await parkCursorOutsideFolds(cdp);
 		await sleep(args.waitMs);
+		// T1 (PR-5): Draft proposal first, then Tuesday. Tasks.md has no heading after "## Tuesday",
+		// so Tuesday's fold hides every line below it, Draft proposal's included — clicking
+		// Tuesday first leaves nothing to click for the task and GP1 never gets its second fold.
+		// T61: each step is confirmed from the DOM (scripts/e2e-lib.mjs foldAndConfirm), is
+		// scoped to the active editor, skips a block that is already folded, and falls back to
+		// the fold command if the indicator click does not take.
+		const draftClick = await foldAndConfirm(cdp, "Draft proposal", "Outline", { waitMs: args.waitMs });
+		const tuesdayClick = await foldAndConfirm(cdp, "Tuesday", "Notes for Tuesday", { waitMs: args.waitMs });
 
-		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
+		const visibleLines = await readVisibleLines(cdp);
+		// GP1's stored half: both folds must now be in data.json under this note's key. A missing
+		// record throws, naming the key looked up and the keys the file does hold.
+		const record = requireRecord(readPluginData(data), target.vaultPath, data);
+		const kinds = record.folds.map((fold) => fold.kind);
 		state.setup = {
 			note,
+			vaultPath: target.vaultPath,
+			storedKinds: kinds,
+			storedHeadingAndTask: kinds.includes("heading") && kinds.includes("task"),
+			reset,
+			unfold,
+			cursor,
 			tuesdayClick,
 			draftClick,
-			// GP1's own check: Tuesday's and Draft proposal's interior lines are hidden; Send
-			// invoices (never folded) is still rendered.
+			// GP1's own check: Tuesday's and Draft proposal's interior lines are hidden.
 			tuesdayBodyHidden: !visibleLinesInclude(visibleLines, "Notes for Tuesday"),
 			draftChildrenHidden: !visibleLinesInclude(visibleLines, "Outline"),
-			sendInvoicesVisible: visibleLinesInclude(visibleLines, "Send invoices"),
+			// T2 (PR-1 test round 1): "Send invoices" sits inside "## Tuesday"'s foldable range (the
+			// fixture has no later heading), so it is hidden by Tuesday's own fold and cannot be
+			// asserted visible here. It is checked in --phase verify, after Tuesday is expanded.
+			sendInvoicesHiddenByTuesday: !visibleLinesInclude(visibleLines, "Send invoices"),
 		};
 	});
 }
@@ -272,18 +209,36 @@ async function runRewrite(args, state) {
 async function runVerify(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
-		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
+		// The rewrite went to --note on disk; read the editor that shows --note, not whichever
+		// note happens to be active.
+		const target = await useNote(cdp, note);
+		const foldedLines = await readVisibleLines(cdp);
 		const onDiskText = readFileSync(note, "utf8");
 		const expectedText = state.rewrite?.afterText;
 
+		// T2 (PR-1 test round 1): "Send invoices" and its new child are nested inside "## Tuesday"'s
+		// foldable range (no later heading), so while Tuesday is folded they are not rendered at
+		// all — that is the fold working, not the restore failing. Expand Tuesday (not Draft
+		// proposal v2, whose own fold must stay put) to read the nested lines, the same way a user
+		// would see GP3's described state.
+		const tuesdayStillFolded = !visibleLinesInclude(foldedLines, "Notes for Tuesday");
+		const expand = await evaluate(cdp, clickFoldIndicatorExpression("Tuesday"));
+		await sleep(Math.max(args.waitMs, 500));
+		const expandedLines = expand.clicked ? await readVisibleLines(cdp) : [];
+
 		state.verify = {
 			note,
-			// GP3: Tuesday and "Draft proposal v2" stay folded (interior lines still hidden).
-			tuesdayStillFolded: !visibleLinesInclude(visibleLines, "Notes for Tuesday"),
-			draftProposalV2StillFolded: !visibleLinesInclude(visibleLines, "Outline") && !visibleLinesInclude(visibleLines, "Review"),
-			// Send invoices was never folded and gets no new fold — its new child is visible.
-			sendInvoicesVisible: visibleLinesInclude(visibleLines, "Send invoices"),
-			followUpCallVisible: visibleLinesInclude(visibleLines, "Follow up call"),
+			vaultPath: target.vaultPath,
+			expand,
+			// GP3: Tuesday stays folded across the rewrite (checked before expanding it)...
+			tuesdayStillFolded,
+			// ...and "Draft proposal v2" has its own fold (its sub-tasks stay hidden once Tuesday
+			// is expanded — while Tuesday is folded they are hidden by it, which proves nothing).
+			draftProposalV2StillFolded:
+				expand.clicked && !visibleLinesInclude(expandedLines, "Outline") && !visibleLinesInclude(expandedLines, "Review"),
+			// Send invoices was never folded and gets no new fold — it and its new child render.
+			sendInvoicesVisible: visibleLinesInclude(expandedLines, "Send invoices"),
+			followUpCallVisible: visibleLinesInclude(expandedLines, "Follow up call"),
 			// F1: the file on disk is exactly what --phase rewrite wrote — nothing added.
 			fileByteIdentical: expectedText !== undefined ? onDiskText === expectedText : null,
 		};
@@ -297,12 +252,16 @@ function renderReport(state) {
 	}
 
 	const setupSection = section("GP1 (--phase setup)", state.setup, (d) => [
-		`- Note: \`${d.note}\``,
-		`- Clicked Tuesday's fold indicator: ${JSON.stringify(d.tuesdayClick)}`,
-		`- Clicked Draft proposal's fold indicator: ${JSON.stringify(d.draftClick)}`,
+		`- Note: \`${d.note}\` (vault path \`${d.vaultPath}\`, made the active editor first)`,
+		`- Stored fold kinds for that vault path after folding: ${JSON.stringify(d.storedKinds)}`,
+		`- Note reset to the before-fixture: ${JSON.stringify(d.reset)}`,
+		`- Unfolded anything left folded first: ${JSON.stringify(d.unfold)}`,
+		`- Cursor parked outside every fold: ${JSON.stringify(d.cursor)}`,
+		`- Folded Draft proposal (first): ${JSON.stringify(d.draftClick)}`,
+		`- Folded Tuesday (second): ${JSON.stringify(d.tuesdayClick)}`,
 		`- Tuesday's body hidden: ${d.tuesdayBodyHidden}`,
 		`- Draft proposal's children hidden: ${d.draftChildrenHidden}`,
-		`- Send invoices visible (never folded): ${d.sendInvoicesVisible}`,
+		`- Send invoices hidden by Tuesday's fold (it is nested in Tuesday; not a failure): ${d.sendInvoicesHiddenByTuesday}`,
 	].join("\n"));
 
 	const rewriteSection = section("GP2 (--phase rewrite)", state.rewrite, (d) => [
@@ -313,13 +272,18 @@ function renderReport(state) {
 
 	const verifySection = section("GP3 (--phase verify)", state.verify, (d) => [
 		`- Tuesday still folded: ${d.tuesdayStillFolded}`,
-		`- Draft proposal v2 still folded: ${d.draftProposalV2StillFolded}`,
-		`- Send invoices visible: ${d.sendInvoicesVisible}`,
+		`- Expanded Tuesday to read its nested lines: ${JSON.stringify(d.expand)}`,
+		`- Draft proposal v2 still folded (checked with Tuesday expanded): ${d.draftProposalV2StillFolded}`,
+		`- Send invoices visible (with Tuesday expanded): ${d.sendInvoicesVisible}`,
 		`- "Follow up call" (new child) visible: ${d.followUpCallVisible}`,
 		`- File on disk byte-identical to what --phase rewrite wrote (F1): ${d.fileByteIdentical}`,
 	].join("\n"));
 
 	const overallPass =
+		state.setup &&
+		state.setup.draftClick.folded &&
+		state.setup.tuesdayClick.folded &&
+		state.setup.storedHeadingAndTask &&
 		state.verify &&
 		state.verify.tuesdayStillFolded &&
 		state.verify.draftProposalV2StillFolded &&
@@ -329,7 +293,7 @@ function renderReport(state) {
 
 	return `# GP1-GP3: the golden path, proven against real Obsidian
 
-Outcome: ${state.verify ? (overallPass ? "**pass**" : "**fail — see GP3 below**") : "PENDING — not yet run"}
+Outcome: ${state.verify ? (overallPass ? "**pass**" : "**fail — see GP1/GP3 below**") : "PENDING — not yet run"}
 
 ## How this was captured
 

@@ -10,14 +10,22 @@
  * prefer-window-timers), so a timer started against one popout window's `window` is tracked
  * there, not against Obsidian's main one. The caller passes `win` explicitly for exactly that
  * reason (and so tests can use fake timers without having to install them globally).
+ *
+ * R8 (PR-2): `win` may also be a function, resolved on every `trigger()` rather than once at
+ * construction. The editor watcher needs that: a CM6 `ViewPlugin` is constructed before its
+ * `EditorView.dom` is attached to a popout window's document, so the window that owns the view
+ * is only knowable later. The timer is always cleared against the window it was set on.
  */
 export class SettleDebouncer<T> {
 	private timer: number | null = null;
+	/** The window `timer` was set on, so `cancel()` clears it there even if `win` now resolves
+	 * to a different window. */
+	private timerWin: Window | null = null;
 	private readonly delayMs: number;
-	private readonly win: Window;
+	private readonly win: Window | (() => Window);
 	private readonly onSettle: (payload: T) => void;
 
-	constructor(onSettle: (payload: T) => void, delayMs = 150, win: Window = window) {
+	constructor(onSettle: (payload: T) => void, delayMs = 150, win: Window | (() => Window) = window) {
 		this.onSettle = onSettle;
 		this.delayMs = delayMs;
 		this.win = win;
@@ -27,8 +35,11 @@ export class SettleDebouncer<T> {
 	 * recent call always wins, since each call replaces whatever was scheduled before it. */
 	trigger(payload: T): void {
 		this.cancel();
-		this.timer = this.win.setTimeout(() => {
+		const win = typeof this.win === "function" ? this.win() : this.win;
+		this.timerWin = win;
+		this.timer = win.setTimeout(() => {
 			this.timer = null;
+			this.timerWin = null;
 			this.onSettle(payload);
 		}, this.delayMs);
 	}
@@ -36,8 +47,9 @@ export class SettleDebouncer<T> {
 	/** Clears any pending timer without firing it. Idempotent. */
 	cancel(): void {
 		if (this.timer !== null) {
-			this.win.clearTimeout(this.timer);
+			(this.timerWin ?? window).clearTimeout(this.timer);
 			this.timer = null;
+			this.timerWin = null;
 		}
 	}
 }

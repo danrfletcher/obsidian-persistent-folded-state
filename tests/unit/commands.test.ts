@@ -43,9 +43,9 @@ function getCommand(plugin: PersistentFoldedStatePlugin): Command {
 /** `editorCheckCallback`'s real declared signature takes `(checking, editor, ctx)`, but this
  * command's own implementation only ever reads `checking` (see the file comment in
  * `src/commands.ts`); this loosens the call so tests don't need to fabricate an `Editor`. */
-function check(command: Command, checking: boolean): boolean | void {
-	const callback = command.editorCheckCallback as ((checking: boolean) => boolean | void) | undefined;
-	return callback?.(checking);
+function check(command: Command, checking: boolean, editor?: unknown): boolean | void {
+	const callback = command.editorCheckCallback as ((checking: boolean, editor?: unknown) => boolean | void) | undefined;
+	return callback?.(checking, editor);
 }
 
 describe("forget-note-folds command: visibility (editorCheckCallback)", () => {
@@ -151,18 +151,44 @@ describe("forget-note-folds command: running it (editorCheckCallback with checki
 		expect(saved).toBeNull(); // nothing changed, so nothing was written
 	});
 
-	it("never mutates the editor: the command only touches stored state", async () => {
+	it("never mutates the editor: no fold/unfold/dispatch/setValue call on the view, editor or CM6 view", async () => {
 		const plugin = makePlugin();
 		await plugin.onload();
 		plugin.store.set("Tasks.md", { contentHash: "abc", folds: [{ kind: "heading" }], dormant: [] });
 		const command = getCommand(plugin);
 
+		// A spy editor: every method an editor could use to mutate the document or the fold state,
+		// on both the Obsidian `Editor` and the CM6 `EditorView` behind it (`editor.cm`).
+		const cm = {
+			dispatch: vi.fn(),
+			updateState: vi.fn(),
+			setState: vi.fn(),
+			state: { doc: { toString: () => "# Tuesday\n" } },
+		};
+		const editor = {
+			fold: vi.fn(),
+			unfold: vi.fn(),
+			setValue: vi.fn(),
+			replaceRange: vi.fn(),
+			replaceSelection: vi.fn(),
+			setLine: vi.fn(),
+			transaction: vi.fn(),
+			setCursor: vi.fn(),
+			setSelection: vi.fn(),
+			cm,
+		};
 		const view = new MockMarkdownView();
 		view.file = new MockTFile("Tasks.md");
+		view.editor = editor as unknown as NonNullable<MockMarkdownView["editor"]>;
 		setActiveView(plugin, view);
 
-		// The mock MarkdownView exposes no editor/fold API at all; running the command without
-		// throwing demonstrates it never reaches for one to fold/unfold the open editor.
-		expect(() => check(command, false)).not.toThrow();
+		expect(check(command, true, editor)).toBe(true);
+		expect(check(command, false, editor)).toBe(true);
+		// The command really ran (it forgot the stored record) ...
+		expect(plugin.store.get("Tasks.md")).toBeUndefined();
+		// ... and touched none of the editor's mutating entry points.
+		for (const [name, spy] of Object.entries({ ...editor, ...cm })) {
+			if (typeof spy === "function") expect(spy, name).not.toHaveBeenCalled();
+		}
 	});
 });

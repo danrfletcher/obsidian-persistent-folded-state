@@ -32,11 +32,20 @@ anchor builder (`src/anchors.ts`, `src/normalize.ts`). PR-4 added the pure match
 Not in this PR: the dormant-fold retry window and first-open baseline adoption (PR-6), restore
 on reopen/restart/rename/delete (PR-7).
 
+## Requirements
+
+Obsidian 1.13.0 or newer (`minAppVersion` in `manifest.json`). The settings tab's and the
+confirmation dialog's destructive button use `ButtonComponent.setDestructive()`, which Obsidian
+added in 1.13.0; on an older app that call does not exist, so Obsidian refuses to load the plugin
+instead of loading it half-working.
+
 ## Fold state is per device
 
-Fold state is stored in this plugin's own `data.json`, which (like every Obsidian plugin's
-`data.json`) is local to the vault on this device and is not synced by Obsidian Sync's settings
-sync, nor expected to be portable across devices on its own.
+Fold state is stored in this plugin's own `data.json` in the plugin folder. The plugin itself
+never syncs folds anywhere: it makes no network requests and has no sync feature. If you use
+Obsidian Sync with the option to sync installed community plugins (which syncs plugin folders),
+that folder's `data.json` may be carried across your devices by Sync, not by this plugin. Fold
+state is meant to be per device, so don't rely on it being portable across devices.
 
 ## Development
 

@@ -140,7 +140,8 @@ export interface EditorWatcherDeps {
 	onSettledNonUserChange?: (path: string, text: string) => void;
 	/** Overridable only for tests; defaults to the 150ms the spec fixes for E9. */
 	flushDelayMs?: number;
-	/** Overridable only for tests (fake timers); defaults to the real `window`. */
+	/** Overridable only for tests (fake timers). Defaults to the window that owns the view
+	 * (`view.dom.ownerDocument.defaultView`, i.e. a popout's own window), else the real `window`. */
 	window?: Window;
 	/** Passed through to the matcher for the restore pass (PR-5); overridable only for tests
 	 * (e.g. to shrink the caps/thresholds, or to spy on `yieldToHost`). */
@@ -203,7 +204,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 					this.runRestore(path, text);
 				},
 				deps.flushDelayMs ?? 150,
-				deps.window ?? window
+				() => this.ownerWindow()
 			);
 
 			// E5/G15: a brand-new pane for a Markdown file the store has never seen — adopt
@@ -240,6 +241,15 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			}
 		}
 
+		/** R8 (PR-2): the window that owns this view — a popout's own `window` for a pane
+		 * dragged into one, so its timers are tracked there rather than against the main window.
+		 * `deps.window` (tests) wins; otherwise `view.dom.ownerDocument.defaultView`. Resolved
+		 * on every use, never cached: a `ViewPlugin` is constructed before its view's DOM is
+		 * attached to any document, and a pane can move to a popout later. */
+		private ownerWindow(): Window {
+			return deps.window ?? this.view.dom.ownerDocument.defaultView ?? window;
+		}
+
 		/** T20: scheduled once, from the constructor, right after a first-open baseline was
 		 * just adopted for `path`. Re-reads the view's *live* fold state after a short grace
 		 * period and merges in (never removes) any live fold the synchronous constructor-time
@@ -248,9 +258,8 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 		 * store entry for `path` has been removed entirely (e.g. "Forget stored folds for this
 		 * note"), or once there is nothing left to merge (the common case). */
 		private scheduleFirstOpenGraceRecheck(path: string, textAtAdoption: string): void {
-			const win = deps.window ?? window;
 			const view = this.view;
-			win.setTimeout(() => {
+			this.ownerWindow().setTimeout(() => {
 				// R14: the whole Obsidian plugin may have unloaded since this timer was
 				// scheduled — checked first, ahead of any other liveness check. This is
 				// deliberately a flag shared (via `deps`) across every `ViewPlugin` instance
@@ -320,7 +329,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			restoreSettledChange(this.view, path, text, {
 				store: deps.store,
 				matcherOptions: deps.matcherOptions,
-				window: deps.window ?? window,
+				window: this.ownerWindow(),
 				getActivePath: activeMarkdownPath,
 				isSuperseded: () => this.generation !== startGeneration,
 				getChangesSinceSnapshot: () => this.changesSinceSnapshot ?? ChangeSet.empty(this.view.state.doc.length),
@@ -328,6 +337,11 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			})
 				.then((deferred) => {
 					if (this.destroyed) return;
+					// R9 (PR-5): a run that a newer non-user change has superseded resolves
+					// to [] — it must not overwrite the newer run's own deferred targets
+					// (an E6-sized match can take longer than the 150ms settle, so the
+					// older run may resolve last).
+					if (this.generation !== startGeneration) return;
 					this.pendingDeferred = deferred;
 				})
 				.catch((err: unknown) => {

@@ -72,26 +72,44 @@
  *   node scripts/e2e-reload-probe.mjs --phase gutter-fold
  *   node scripts/e2e-reload-probe.mjs --phase fold-command
  *   node scripts/e2e-reload-probe.mjs --phase native-restore   # run just after relaunching Obsidian
- *   node scripts/e2e-reload-probe.mjs --phase report            # (re)writes docs/reload-shape.md
+ *   node scripts/e2e-reload-probe.mjs --phase report            # renders the report from --state
+ *   node scripts/e2e-reload-probe.mjs --phase report --write-doc  # ...into the tracked docs/reload-shape.md
  *
  * T2/T3: `npm run test:e2e` passes no `--phase`, which now runs `all` — external-write,
  * gutter-fold and fold-command in one Obsidian session, then renders the report — rather than
  * only printing usage and exiting 1. `--note` defaults to the container test vault's fixture note
- * path (`DEFAULT_NOTE_PATH` below) and can be overridden. `native-restore` stays its own explicit
+ * path (`DEFAULT_NOTE_PATH` below) and can be overridden. T130: every capture phase (external-write,
+ * gutter-fold, fold-command) first makes that note the active editor (`useNote`, confirmed, or the
+ * run fails naming the note that is active), because the spy and the fold steps act on the active
+ * editor while the external write goes to the file: a run no longer rewrites one note while
+ * watching another. `native-restore` stays its own explicit
  * phase: it needs a human to actually quit and relaunch Obsidian first, which can't happen inside
  * one non-interactive invocation.
  *
- * Every phase accepts [--cdp-port 9222] [--wait-ms 3000] [--state <path>]; `native-restore` also
+ * T58: the report goes to `--report <path>` (default: a file in the OS temp dir), never to the
+ * tracked docs/reload-shape.md unless `--write-doc` is passed — and `--write-doc` refuses a run
+ * whose external-write phase was inconclusive (the spy logged nothing), so a probe run that could
+ * not observe the reload cannot overwrite the committed, conclusive result.
+ *
+ * Every phase accepts [--cdp-port 9222] [--wait-ms 3000] [--state <path>] [--report <path>]
+ * [--write-doc]; `native-restore` also
  * accepts [--connect-retries 30] [--connect-retry-delay-ms 2000] for reconnecting while Obsidian
  * is still starting back up.
  */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { buildExternalRewrite } from "./e2e-external-rewrite.mjs";
+import { evaluate, sleep, useNote, withConnection } from "./e2e-lib.mjs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const REPORT_PATH = join(ROOT, "docs", "reload-shape.md");
+/** The committed, hand-reviewed report. The probe only writes it when asked to (`--write-doc`),
+ * and then only from a conclusive run (see `docWriteBlocker`). T58: a bare `npm run test:e2e`
+ * used to overwrite this tracked file with whatever that one run happened to see. */
+const TRACKED_REPORT_PATH = join(ROOT, "docs", "reload-shape.md");
+/** Where every other run writes its report: outside the repo, next to the state file. */
+const DEFAULT_REPORT_PATH = join(tmpdir(), "pfs-e2e-reload-shape.md");
 const DEFAULT_STATE_PATH = join(tmpdir(), "pfs-e2e-reload-probe-state.json");
 
 /** T2/T3: the container's test vault always opens the fixture note at this vault-relative path
@@ -125,6 +143,8 @@ function parseArgs(argv) {
 		else if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--state") args.state = argv[++i];
+		else if (arg === "--report") args.report = argv[++i];
+		else if (arg === "--write-doc") args.writeDoc = true;
 		else if (arg === "--connect-retries") args.connectRetries = Number(argv[++i]);
 		else if (arg === "--connect-retry-delay-ms") args.connectRetryDelayMs = Number(argv[++i]);
 		else if (arg === "--help" || arg === "-h") args.help = true;
@@ -142,17 +162,20 @@ function printUsage() {
 			"                                           in one Obsidian session (native-restore excluded: see below)",
 			"  --phase external-write [--note <path>]  external rewrite + E10 outcome for that write",
 			`                                           (--note defaults to ${DEFAULT_NOTE_PATH})`,
-			"  --phase gutter-fold                    click the fold gutter on the open note's first line",
-			"  --phase fold-command                    run Obsidian's fold command at the cursor",
+			"  --phase gutter-fold [--note <path>]    click the fold gutter on the note's first foldable lines",
+			"  --phase fold-command [--note <path>]   run Obsidian's fold command at the cursor",
 			"  --phase native-restore                  attach just after relaunching Obsidian",
-			"  --phase report                          (re)write docs/reload-shape.md from --state",
+			"  --phase report                          render the report from --state",
 			"",
-			"Options: [--cdp-port 9222] [--wait-ms 3000] [--state <path>]",
+			"Options: [--cdp-port 9222] [--wait-ms 3000] [--state <path>] [--report <path>] [--write-doc]",
+			`         (the report goes to ${DEFAULT_REPORT_PATH} unless --report is given; --write-doc writes`,
+			"         the tracked docs/reload-shape.md instead, and only from a conclusive external-write run)",
 			"         [--connect-retries 30] [--connect-retry-delay-ms 2000] (native-restore only)",
 			"",
 			"Requires a real Obsidian launched with --remote-debugging-port=<cdp-port>, this plugin",
-			"built and enabled, and (for external-write/gutter-fold/fold-command) --note already open",
-			"in an editor. See the file comment in this script and docs/reload-shape.md.",
+			"built and enabled, and (for external-write/gutter-fold/fold-command) --note inside the",
+			"vault; each of those phases makes it the active editor first. See the file comment in",
+			"this script and docs/reload-shape.md.",
 			"",
 			"native-restore needs Obsidian to actually be quit and relaunched by hand first, so it is",
 			"never part of the default `all` sequence; run it (then --phase report) separately.",
@@ -173,100 +196,6 @@ function loadState(path) {
 
 function saveState(path, state) {
 	writeFileSync(path, JSON.stringify(state, null, 2), "utf8");
-}
-
-// --- CDP ----------------------------------------------------------------------------------
-
-async function findDebuggableTarget(cdpPort) {
-	const res = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
-	if (!res.ok) throw new Error(`CDP target list request failed: HTTP ${res.status}`);
-	const targets = await res.json();
-	const target = targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-	if (!target) throw new Error("no debuggable Obsidian window found on that CDP port");
-	return target;
-}
-
-/** Retries `findDebuggableTarget` — used by `native-restore`, where Obsidian is still starting
- * back up (its CDP server, and a fresh debuggable target, don't exist yet right after relaunch). */
-async function findDebuggableTargetWithRetry(cdpPort, retries, delayMs) {
-	let lastErr;
-	for (let attempt = 0; attempt < retries; attempt++) {
-		try {
-			return await findDebuggableTarget(cdpPort);
-		} catch (err) {
-			lastErr = err;
-			await sleep(delayMs);
-		}
-	}
-	throw new Error(`no debuggable Obsidian window on port ${cdpPort} after ${retries} retries: ${lastErr}`);
-}
-
-/** Minimal CDP client: one WebSocket, JSON-RPC request/response by id. R2(d): every pending call
- * is rejected (not left hanging) the moment the socket closes or errors, and every call also has
- * its own timeout — so a phase whose Obsidian quits or never responds fails fast and visibly
- * instead of hanging on the final `Runtime.evaluate`, which is what happened before. */
-function connectCdp(webSocketDebuggerUrl) {
-	const ws = new WebSocket(webSocketDebuggerUrl);
-	let nextId = 1;
-	const pending = new Map();
-	let closed = false;
-
-	function rejectAllPending(err) {
-		for (const { reject } of pending.values()) reject(err);
-		pending.clear();
-	}
-
-	ws.addEventListener("message", (event) => {
-		const message = JSON.parse(event.data.toString());
-		if (message.id && pending.has(message.id)) {
-			const { resolve, reject } = pending.get(message.id);
-			pending.delete(message.id);
-			if (message.error) reject(new Error(message.error.message));
-			else resolve(message.result);
-		}
-	});
-	ws.addEventListener("close", () => {
-		closed = true;
-		rejectAllPending(new Error("CDP socket closed"));
-	});
-	ws.addEventListener("error", () => {
-		rejectAllPending(new Error("CDP socket error"));
-	});
-
-	const ready = new Promise((resolve, reject) => {
-		ws.addEventListener("open", () => resolve());
-		ws.addEventListener("error", (err) => reject(err instanceof Error ? err : new Error(String(err))));
-	});
-
-	async function send(method, params = {}, { timeoutMs = 10000 } = {}) {
-		await ready;
-		if (closed) throw new Error(`CDP socket already closed, cannot send ${method}`);
-		const id = nextId++;
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				pending.delete(id);
-				reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
-			}, timeoutMs);
-			pending.set(id, {
-				resolve: (value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
-				reject: (err) => {
-					clearTimeout(timer);
-					reject(err);
-				},
-			});
-			ws.send(JSON.stringify({ id, method, params }));
-		});
-	}
-
-	return {
-		send,
-		close: () => {
-			if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
-		},
-	};
 }
 
 /** Installed once per connection (`window.__pfsProbe`, reset on every call). Patches the *live*
@@ -334,7 +263,10 @@ const READ_LOG_EXPRESSION = "JSON.stringify(window.__pfsProbe ? window.__pfsProb
  * folded. */
 const CLICK_FOLD_GUTTER_EXPRESSION = `
 (function () {
-	const indicators = Array.from(document.querySelectorAll(".cm-fold-indicator .collapse-indicator"));
+	const info = window.app && window.app.workspace && window.app.workspace.activeEditor;
+	const cm = info && info.editor && info.editor.cm;
+	if (!cm) return { clicked: false, reason: "no active markdown editor to click in" };
+	const indicators = Array.from(cm.dom.querySelectorAll(".cm-fold-indicator .collapse-indicator"));
 	if (indicators.length < 2) return { clicked: false, reason: \`found \${indicators.length} fold indicator(s), need at least 2 (the first is the note's own title heading)\` };
 	indicators[1].click();
 	return { clicked: true };
@@ -352,28 +284,67 @@ const RUN_FOLD_COMMAND_EXPRESSION = `
 })()
 `;
 
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function evaluate(cdp, expression, { awaitPromise = false } = {}) {
-	await cdp.send("Runtime.enable");
-	const result = await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise });
-	if (result.exceptionDetails) {
-		throw new Error(`Runtime.evaluate threw: ${JSON.stringify(result.exceptionDetails)}`);
-	}
-	return result.result.value;
-}
-
 async function readLog(cdp) {
 	return JSON.parse(await evaluate(cdp, READ_LOG_EXPRESSION));
 }
 
+/** R7(a): writes the spec's rewrite (a line inserted above, a task renamed, a child appended —
+ * scripts/e2e-external-rewrite.mjs) to the note on disk. `before` is returned so the caller can
+ * put the fixture back afterwards instead of leaving the probe's edits in it on every run. */
 function externallyRewrite(notePath) {
 	const before = readFileSync(notePath, "utf8");
-	const rewritten = `<!-- e2e-reload-probe external write at ${new Date().toISOString()} -->\n${before}`;
-	writeFileSync(notePath, rewritten, "utf8");
-	return { before, after: rewritten };
+	const { after, renamedTask } = buildExternalRewrite(before, new Date().toISOString());
+	writeFileSync(notePath, after, "utf8");
+	return { before, after, renamedTask };
+}
+
+/** True when the rewritten note (`note`, a path on the machine running the vault) is the file the
+ * active editor shows (`activeNotePath`, vault-relative). Compared on whole path segments, so
+ * `Tasks.md` is not mistaken for the active `MyTasks.md`. */
+function isActiveNote(note, activeNotePath) {
+	const n = note.replace(/\\/g, "/");
+	const a = activeNotePath.replace(/\\/g, "/").replace(/^\/+/, "");
+	return n === a || n.endsWith(`/${a}`);
+}
+
+/** T58: what a captured external-write window proves. "emitted": at least one document-changing
+ * transaction. "not emitted": transactions were observed but none changed the document. "inconclusive":
+ * the spy logged nothing at all (or was watching another note), which says nothing about how
+ * Obsidian reloads — the tester's no-argument run hit exactly this and the old report turned it
+ * into "Obsidian appears to replace the editor state/view outright", contradicting the committed
+ * raw log of the same build.
+ *
+ * T130: the active-note check comes FIRST. A document change logged while the editor showed another
+ * note (the tester's default run rewrote Tasks.md while Quarry/Empty.md was active) is that other
+ * note's own transaction, not the reload of the rewritten one, so it can never make a run "emitted".
+ * `expectedActivePath` (the vault-relative key `useNote` activated) makes the comparison exact;
+ * without it the note's path must end in the active path on a whole-segment boundary.
+ * @param {{ transactionCount: number, docChangedCount: number, activeNotePath?: string | null, note?: string, expectedActivePath?: string }} input
+ * @returns {{ outcome: "emitted" | "not emitted" | "inconclusive", reason?: string }} */
+export function classifyExternalWrite({ transactionCount, docChangedCount, activeNotePath, note, expectedActivePath }) {
+	if (activeNotePath && note && !(expectedActivePath ? activeNotePath === expectedActivePath : isActiveNote(note, activeNotePath))) {
+		return {
+			outcome: "inconclusive",
+			reason: `the active editor shows \`${activeNotePath}\`, not the rewritten note \`${note}\`, so the spy was watching a different note`,
+		};
+	}
+	if (docChangedCount > 0) return { outcome: "emitted" };
+	if (transactionCount === 0) {
+		return {
+			outcome: "inconclusive",
+			reason: "the spy logged no CM6 transaction at all in the write window (not even a non-document one), so it cannot tell whether Obsidian reloaded the note, replaced the editor outright, or never noticed the write",
+		};
+	}
+	return { outcome: "not emitted" };
+}
+
+/** Why the tracked docs/reload-shape.md must not be written from this state, or null when it may. */
+export function docWriteBlocker(state) {
+	if (!state.externalWrite) return "the external-write phase has not been run";
+	if (state.externalWrite.outcome === "inconclusive") {
+		return `the external-write phase was inconclusive (${state.externalWrite.reason ?? "no reason recorded"})`;
+	}
+	return null;
 }
 
 function summarizeWindow(entries) {
@@ -398,38 +369,53 @@ function summarizeWindow(entries) {
 
 // --- phases ---------------------------------------------------------------------------------
 
-async function withConnection(cdpPort, fn, { retries = 1, retryDelayMs = 0 } = {}) {
-	const target = retries > 1 ? await findDebuggableTargetWithRetry(cdpPort, retries, retryDelayMs) : await findDebuggableTarget(cdpPort);
-	const cdp = connectCdp(target.webSocketDebuggerUrl);
-	try {
-		return await fn(cdp);
-	} finally {
-		cdp.close();
-	}
-}
-
 async function runExternalWrite(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
+		// T130: the spy watches the ACTIVE editor and the write below goes to `note`, so `note`
+		// has to be the active editor first (confirmed, or this throws naming what is active).
+		const { vaultPath } = await useNote(cdp, note);
 		const install = await evaluate(cdp, INSTALL_SPY_EXPRESSION);
 		if (install.error) throw new Error(install.error);
 
 		const writeStartedAt = Date.now();
-		externallyRewrite(note);
+		const { before, after } = externallyRewrite(note);
 		await sleep(args.waitMs);
 
 		const log = await readLog(cdp);
+		// R7(b), the F1 near-miss check: once the plugin has had its whole settle window to
+		// react, the bytes on disk must still be exactly what the external writer wrote — the
+		// plugin must never write to the vault. Checked on bytes, then the fixture is put back
+		// (R7(a): no residue from the probe in the fixture note on later runs).
+		const onDisk = readFileSync(note);
+		const diskBytesUnchangedByPlugin = onDisk.equals(Buffer.from(after, "utf8"));
+		writeFileSync(note, before, "utf8");
 		const windowEntries = log.filter((e) => e.t >= writeStartedAt);
 		const summary = summarizeWindow(windowEntries);
-		const outcome = summary.docChangedCount > 0 ? "emitted" : "not emitted";
+		const { outcome, reason } = classifyExternalWrite({
+			transactionCount: summary.transactionCount,
+			docChangedCount: summary.docChangedCount,
+			activeNotePath: install.notePath,
+			expectedActivePath: vaultPath,
+			note,
+		});
 
 		state.obsidianVersion = install.obsidianVersion;
-		state.externalWrite = { note, waitMs: args.waitMs, outcome, ...summary };
+		state.externalWrite = {
+			note,
+			activeNotePath: install.notePath ?? null,
+			waitMs: args.waitMs,
+			outcome,
+			reason,
+			diskBytesUnchangedByPlugin,
+			...summary,
+		};
 	});
 }
 
 async function runGutterFold(args, state) {
 	await withConnection(args.cdpPort, async (cdp) => {
+		await useNote(cdp, args.note ?? DEFAULT_NOTE_PATH); // T130: fold the same note the other phases probe
 		const install = await evaluate(cdp, INSTALL_SPY_EXPRESSION);
 		if (install.error) throw new Error(install.error);
 
@@ -446,6 +432,7 @@ async function runGutterFold(args, state) {
 
 async function runFoldCommand(args, state) {
 	await withConnection(args.cdpPort, async (cdp) => {
+		await useNote(cdp, args.note ?? DEFAULT_NOTE_PATH); // T130: the command acts on the active editor
 		const install = await evaluate(cdp, INSTALL_SPY_EXPRESSION);
 		if (install.error) throw new Error(install.error);
 
@@ -523,9 +510,10 @@ async function runNativeRestore(args, state) {
 	);
 }
 
-function renderReport(state) {
+export function renderReport(state) {
 	const outcome = state.externalWrite?.outcome ?? "PENDING — external-write phase not yet run";
-	const outcomeBold = outcome === "emitted" || outcome === "not emitted" ? `**${outcome}**` : outcome;
+	const outcomeBold = ["emitted", "not emitted", "inconclusive"].includes(outcome) ? `**${outcome}**` : outcome;
+	const none = (d) => (d.transactionCount === 0 ? "(none: no transactions were observed at all)" : "(none)");
 
 	function section(title, data, describe) {
 		if (!data) return `### ${title}\n\nNot yet captured.\n`;
@@ -534,26 +522,28 @@ function renderReport(state) {
 
 	const externalWriteSection = section("External write (E10 outcome)", state.externalWrite, (d) => [
 		`- Outcome: ${outcomeBold}`,
-		`- Note probed: \`${d.note}\``,
+		...(d.reason ? [`- Why: ${d.reason}`] : []),
+		`- Note probed: \`${d.note}\`${d.activeNotePath ? ` (active editor: \`${d.activeNotePath}\`)` : ""}`,
 		`- Wait after write before reading the log: ${d.waitMs}ms`,
 		`- Transactions observed in the write window: ${d.transactionCount}`,
 		`- Document-changing transactions in that window: ${d.docChangedCount}`,
+		`- On-disk bytes after the settle window still equal what the external writer wrote (F1 near-miss check): ${d.diskBytesUnchangedByPlugin === undefined ? "not recorded" : d.diskBytesUnchangedByPlugin}`,
 		`- ...of which with no \`userEvent\` annotation: ${d.docChangedNoAnnotationCount}`,
-		`- \`userEvent\` values seen in that window: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : "(none)"}`,
+		`- \`userEvent\` values seen in that window: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : none(d)}`,
 	].join("\n"));
 
 	const gutterSection = section("Gutter-click fold", state.gutterClickFold, (d) => [
 		`- Clicked a fold-gutter marker: ${d.clicked}${d.reason ? ` (${d.reason})` : ""}`,
 		`- Transactions observed in the action window: ${d.transactionCount}`,
 		`- ...carrying any effects: ${d.transactionsWithEffectsCount} (fold/unfold-shaped: ${d.foldShapedEffectCount})`,
-		`- \`userEvent\` values seen: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : "(none)"}`,
+		`- \`userEvent\` values seen: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : none(d)}`,
 	].join("\n"));
 
 	const commandSection = section("Fold command", state.foldCommand, (d) => [
 		`- Command: \`${d.commandId}\` (registered: ${d.existed}, executed: ${d.ran})`,
 		`- Transactions observed in the action window: ${d.transactionCount}`,
 		`- ...carrying any effects: ${d.transactionsWithEffectsCount} (fold/unfold-shaped: ${d.foldShapedEffectCount})`,
-		`- \`userEvent\` values seen: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : "(none)"}`,
+		`- \`userEvent\` values seen: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : none(d)}`,
 	].join("\n"));
 
 	const nativeRestoreSection = section("Native fold restore on open", state.nativeRestoreOnOpen, (d) => [
@@ -562,7 +552,7 @@ function renderReport(state) {
 		`- Caveat: ${d.caveat}`,
 		`- Transactions observed after reconnecting: ${d.transactionCount}`,
 		`- ...carrying any effects: ${d.transactionsWithEffectsCount} (fold/unfold-shaped: ${d.foldShapedEffectCount})`,
-		`- \`userEvent\` values seen: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : "(none)"}`,
+		`- \`userEvent\` values seen: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : none(d)}`,
 	].join("\n"));
 
 	return `# E10: the reload shape, proven against real Obsidian
@@ -585,7 +575,7 @@ node scripts/e2e-reload-probe.mjs --phase gutter-fold
 node scripts/e2e-reload-probe.mjs --phase fold-command
 # relaunch Obsidian, then:
 node scripts/e2e-reload-probe.mjs --phase native-restore
-node scripts/e2e-reload-probe.mjs --phase report
+node scripts/e2e-reload-probe.mjs --phase report --write-doc   # rewrites this file; refused for an inconclusive run
 \`\`\`
 
 Each phase reconnects over CDP independently and merges its result into this file (see the file
@@ -595,8 +585,10 @@ ${
 	outcome === "emitted"
 		? "Obsidian's own reaction to an external write *does* dispatch a document-changing CM6 transaction — it is not a bare, un-annotated one: it carries a `userEvent` annotation of `set` (CM6's own annotation for a whole-buffer `setValue`-style replacement, which is exactly what Obsidian's reload does under the hood; see the `userEvent` values line below and the raw log). R10: `src/transaction-classifier.ts` treats `userEvent: \"set\"` as a non-user change for exactly this reason, so the settled-non-user-change event (E9/E10) fires on a real external write. No vault-modify fallback (F10) is needed."
 		: outcome === "not emitted"
-			? "No document-changing transaction was observed after the external write at all — Obsidian appears to replace the editor state/view outright on an external reload rather than dispatching one. Per F10, this PR is flagged for a plan change (a vault-modify fallback may be required); it is not added here."
-			: "External-write phase has not been run yet."
+			? "Transactions were observed after the external write, but none changed the document, so no document-changing transaction reached the editor on reload. Per F10, this PR is flagged for a plan change (a vault-modify fallback may be required); it is not added here."
+			: outcome === "inconclusive"
+				? `This run could not observe the reload shape and proves nothing about it: ${state.externalWrite?.reason ?? "no reason recorded"}. It is not evidence that Obsidian skips a document-changing transaction. Re-run with the note open and active in the editor; the committed docs/reload-shape.md keeps the last conclusive result.`
+				: "External-write phase has not been run yet."
 }
 
 ${externalWriteSection}
@@ -652,11 +644,23 @@ async function main() {
 
 	saveState(args.state, state);
 	const report = renderReport(state);
-	writeFileSync(REPORT_PATH, report, "utf8");
-	console.log(`Wrote ${REPORT_PATH} (state: ${args.state})`);
+	let reportPath = args.report ?? DEFAULT_REPORT_PATH;
+	if (args.writeDoc) {
+		const blocker = docWriteBlocker(state);
+		if (blocker) {
+			console.error(`Refusing to write ${TRACKED_REPORT_PATH}: ${blocker}. Report written to ${reportPath} instead.`);
+			process.exitCode = 1;
+		} else {
+			reportPath = args.report ?? TRACKED_REPORT_PATH;
+		}
+	}
+	writeFileSync(reportPath, report, "utf8");
+	console.log(`Wrote ${reportPath} (state: ${args.state})`);
 }
 
-main().catch((err) => {
-	console.error("e2e-reload-probe failed:", err);
-	process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+	main().catch((err) => {
+		console.error("e2e-reload-probe failed:", err);
+		process.exitCode = 1;
+	});
+}

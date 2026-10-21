@@ -71,6 +71,12 @@ describe("purity (F1/F8): src/similarity.ts and src/matcher.ts have no I/O or ti
 		});
 	}
 
+	it("T60: the files cite only the fences the spec's purity criterion names (F1 and F8), not F9", () => {
+		for (const { file, text } of sources) {
+			expect(text, file).not.toMatch(/F1\/F8\/F9|\bF9\b/);
+		}
+	});
+
 	it("src/matcher.ts imports similarity only from ./similarity and the Anchor type only from ./anchors", () => {
 		const matches = sources[1].text.match(/^import[^;]+;/gm) ?? [];
 		for (const line of matches) {
@@ -105,6 +111,78 @@ describe("F6: no export, option or result field anywhere refers to a moved block
 		for (const { code } of sources) {
 			expect(code).not.toMatch(movePattern);
 		}
+	});
+});
+
+describe("R13 (PR-4): exports and option/reason names are pinned by snapshot", () => {
+	// A new export, option field or reason name must show up as a snapshot diff someone reviews,
+	// not pass silently through the /move/ regex above.
+	const typeSource = sources[1].code;
+
+	function interfaceFields(name: string): string[] {
+		const body = new RegExp(`export interface ${name} \\{([\\s\\S]*?)\\n\\}`).exec(typeSource)?.[1] ?? "";
+		return [...body.matchAll(/^\t(\w+)\??:/gm)].map((m) => m[1]).sort();
+	}
+
+	function stringUnion(name: string): string[] {
+		const decl = new RegExp(`export type ${name} =([^;]+);`).exec(typeSource)?.[1] ?? "";
+		return [...decl.matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+	}
+
+	it("src/matcher.ts runtime exports", () => {
+		expect(Object.keys(matcherModule).sort()).toMatchInlineSnapshot(`
+			[
+			  "CHUNK_SIZE",
+			  "FUZZY_THRESHOLD_LONG",
+			  "FUZZY_THRESHOLD_SHORT",
+			  "MAX_COMPARISONS",
+			  "MAX_FOLDS",
+			  "POSITIONAL_THRESHOLD",
+			  "SHORT_LONG_SPLIT",
+			  "matchAnchors",
+			]
+		`);
+	});
+
+	it("src/similarity.ts runtime exports", () => {
+		expect(Object.keys(similarityModule).sort()).toMatchInlineSnapshot(`
+			[
+			  "similarity",
+			]
+		`);
+	});
+
+	it("MatcherOptions field names", () => {
+		expect(interfaceFields("MatcherOptions")).toMatchInlineSnapshot(`
+			[
+			  "chunkSize",
+			  "fuzzyThresholdLong",
+			  "fuzzyThresholdShort",
+			  "maxComparisons",
+			  "maxFolds",
+			  "positionalThreshold",
+			  "shortLongSplit",
+			  "yieldToHost",
+			]
+		`);
+	});
+
+	it("MatchTier and NoMatchReason members", () => {
+		expect({ tiers: stringUnion("MatchTier"), reasons: stringUnion("NoMatchReason") }).toMatchInlineSnapshot(`
+			{
+			  "reasons": [
+			    "ambiguous",
+			    "below-threshold",
+			    "capped",
+			    "no-candidate",
+			  ],
+			  "tiers": [
+			    "exact",
+			    "fuzzy",
+			    "positional",
+			  ],
+			}
+		`);
 	});
 });
 

@@ -17,8 +17,13 @@
  *    foldable" edge case — e.g. a heading whose body disappeared, or one that became plain text
  *    and so was never eligible to match as "heading" at all and reads as "no-candidate" instead;
  *    either way there is nothing left to fold).
- *  - the matched range is already folded live in the editor (idempotent re-apply — redispatching
- *    an identical fold effect would be harmless but pointless, so it's left out here instead).
+ *  - the matched block is already folded live in the editor (idempotent re-apply — redispatching
+ *    a fold would be harmless but pointless, so it's left out here instead). R3 (PR-5): "already
+ *    folded" means *any* live fold starting on the block's first line, not one with an identical
+ *    line range: a fold made natively through Obsidian's own fold service can end a blank
+ *    separator short of (or past) the range `buildAnchors` reports, and dispatching a second,
+ *    overlapping fold over it would leave the user unfolding twice. A fold starts at the end of
+ *    its block's first line, so only one fold can ever start on a given line.
  *  - `liveAnchorKeys` is supplied and the stored anchor's key isn't in it (E3: the user unfolded
  *    — or otherwise removed — this exact anchor from the map after the settle snapshot was
  *    taken but before the match finished; the restore pass must not re-fold something the user
@@ -27,7 +32,10 @@
  * A left-out anchor is simply absent from both `toFold` and `deferred` — never specially marked.
  *
  * The one case this module *does* actively redirect, rather than leave out: G13. A match whose
- * block the cursor currently sits inside is moved to `deferred` instead of `toFold` — the caller
+ * block the cursor currently sits inside is moved to `deferred` instead of `toFold`. R5 (PR-5):
+ * "inside" means on a line the fold would hide, i.e. after the block's first line — the fold
+ * starts at the end of that line, so a cursor resting on the heading/task line itself stays
+ * visible and does not defer anything — the caller
  * (src/fold-restorer.ts) re-checks every deferred target on each later update and applies it
  * once the cursor leaves, so it still ends up folded (G13: "applied once the cursor leaves the
  * block"), just not in this pass.
@@ -51,8 +59,8 @@ export interface RestorePlanInput {
 	matches: MatchResult[];
 	/** Every candidate extracted from the new text; `matches[i].target` indexes into this. */
 	candidates: AnchoredBlock[];
-	/** Line ranges already folded live in the editor right now — a target identical to one of
-	 * these is left out of both `toFold` and `deferred` (idempotent re-apply). */
+	/** Line ranges already folded live in the editor right now — a target whose first line any of
+	 * these starts on is left out of both `toFold` and `deferred` (idempotent re-apply). */
 	alreadyFolded: readonly LineRange[];
 	/** 1-indexed line the cursor (or selection head) currently sits on, or `null` when there is
 	 * no meaningful cursor context (e.g. a headless unit test with no live selection). */
@@ -72,12 +80,16 @@ function isFoldable(range: LineRange): boolean {
 	return range.endLine > range.startLine;
 }
 
-function sameRange(a: LineRange, b: LineRange): boolean {
-	return a.startLine === b.startLine && a.endLine === b.endLine;
+/** R3 (PR-5): true when some live fold starts on `range`'s first line — the shared "already
+ * folded" test (also used by src/fold-restorer.ts for its dormant-promotion check). Compares
+ * only the start line, never the end: see the file comment. */
+export function isAlreadyFolded(alreadyFolded: readonly LineRange[], range: LineRange): boolean {
+	return alreadyFolded.some((folded) => folded.startLine === range.startLine);
 }
 
+/** R5 (PR-5): the cursor is "inside" only on the lines the fold would hide — after the first. */
 function cursorInside(range: LineRange, cursorLine: number | null): boolean {
-	return cursorLine !== null && cursorLine >= range.startLine && cursorLine <= range.endLine;
+	return cursorLine !== null && cursorLine > range.startLine && cursorLine <= range.endLine;
 }
 
 /**
@@ -99,7 +111,7 @@ export function planRestore(input: RestorePlanInput): RestorePlan {
 
 		const range = candidate.range;
 		if (!isFoldable(range)) continue; // the block is a single line now — nothing to collapse
-		if (input.alreadyFolded.some((folded) => sameRange(folded, range))) continue; // idempotent
+		if (isAlreadyFolded(input.alreadyFolded, range)) continue; // idempotent
 
 		if (input.liveAnchorKeys !== null) {
 			const stored = input.stored[i];

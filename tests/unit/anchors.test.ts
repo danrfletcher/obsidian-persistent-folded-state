@@ -84,16 +84,21 @@ describe("buildAnchors: G5 — status changes don't move other anchors", () => {
 		expect(anchorKey(afterDraft.anchor)).toBe(anchorKey(beforeDraft.anchor));
 	});
 
-	it("every other block's anchor is unchanged, including siblings after the changed task", () => {
+	it("every block's anchor and range is unchanged, including siblings after the changed task", () => {
 		const beforeBlocks = buildAnchors(before);
 		const afterBlocks = buildAnchors(after);
+		expect(beforeBlocks).toHaveLength(5);
+		expect(afterBlocks).toHaveLength(beforeBlocks.length);
+		// Compare all of them, pairwise by position: a status change must not move any block.
+		afterBlocks.forEach((afterBlock, i) => {
+			expect(afterBlock.anchor, `block ${i}`).toEqual(beforeBlocks[i].anchor);
+			expect(afterBlock.range, `block ${i}`).toEqual(beforeBlocks[i].range);
+		});
+
+		// Spot-check by name too, so a reordering bug can't hide behind the positional comparison.
 		const beforeSendInvoices = findOne(beforeBlocks, (b) => b.anchor.text === "send invoices");
 		const afterSendInvoices = findOne(afterBlocks, (b) => b.anchor.text === "send invoices");
 		expect(afterSendInvoices.anchor).toEqual(beforeSendInvoices.anchor);
-
-		const beforeDraftChild = findOne(beforeBlocks, (b) => b.anchor.text === "draft" && b.anchor.indent === 4);
-		const afterDraftChild = findOne(afterBlocks, (b) => b.anchor.text === "draft" && b.anchor.indent === 4);
-		expect(afterDraftChild.anchor).toEqual(beforeDraftChild.anchor);
 	});
 });
 
@@ -215,6 +220,99 @@ describe("buildAnchors: E13 — callouts and blockquotes use their first line as
 	});
 });
 
+describe("buildAnchors: callout types", () => {
+	it("a callout type with a hyphen (`[!my-type]`) is a callout, not a blockquote", () => {
+		const blocks = buildAnchors(["> [!my-type] Title", "> body"].join("\n"));
+		expect(blocks).toHaveLength(1);
+		expect(blocks[0].anchor.kind).toBe("callout");
+		expect(blocks[0].anchor.text).toBe("[!my-type] title");
+	});
+
+	it("a foldable-marker callout (`[!note]-`) is still a callout, and `[!]` with no type is a blockquote", () => {
+		expect(buildAnchors("> [!note]- Collapsed\n> body")[0].anchor.kind).toBe("callout");
+		expect(buildAnchors("> [!] nothing\n> body")[0].anchor.kind).toBe("blockquote");
+	});
+});
+
+describe("buildAnchors: R1-R3 (PR-3) regressions", () => {
+	it("R1: a backtick fence whose info string contains a backtick is inline code, not a fence that swallows the file", () => {
+		const blocks = buildAnchors(["```inline``` text", "# Heading", "- [ ] task"].join("\n"));
+		expect(blocks.map((b) => b.anchor.kind)).toEqual(["other", "heading", "task"]);
+		expect(blocks.some((b) => b.anchor.kind === "code")).toBe(false);
+	});
+
+	it("R1: a real backtick fence, and a tilde fence with a backtick in its info string, are still code", () => {
+		expect(buildAnchors(["```js", "x", "```", "# H"].join("\n")).map((b) => b.anchor.kind)).toEqual(["code", "heading"]);
+		const tilde = buildAnchors(["~~~ a`b", "x", "~~~", "# H"].join("\n"));
+		expect(tilde.map((b) => b.anchor.kind)).toEqual(["code", "heading"]);
+		expect(tilde[0].range).toEqual({ startLine: 1, endLine: 3 });
+	});
+
+	it("T59: the backtick rule is in the fence pattern itself, so every inline-code spelling is rejected and a longer fence still opens", () => {
+		for (const line of ["```inline``` text", "````a`b", "``` `x`", "```js```"]) {
+			const blocks = buildAnchors([line, "# H"].join("\n"));
+			expect(blocks.map((b) => b.anchor.kind), line).toEqual(["other", "heading"]);
+		}
+		// A fence with an info string and no backtick in it, at three and at four backticks.
+		for (const open of ["```js title=\"a\"", "````md"]) {
+			const blocks = buildAnchors([open, "x", open.startsWith("````") ? "````" : "```", "# H"].join("\n"));
+			expect(blocks.map((b) => b.anchor.kind), open).toEqual(["code", "heading"]);
+		}
+	});
+
+	it("R2: a one-character link label is a list item, not a task", () => {
+		const [block] = buildAnchors("- [a](http://x) foo");
+		expect(block.anchor.kind).toBe("list");
+		expect(block.anchor.text).toBe("[a](http://x) foo");
+	});
+
+	it("R2: a real checkbox is still a task with the status stripped, with and without trailing text", () => {
+		expect(buildAnchors("- [x] foo")[0].anchor).toMatchObject({ kind: "task", text: "foo" });
+		expect(buildAnchors("- [ ]")[0].anchor).toMatchObject({ kind: "task", text: "" });
+		expect(buildAnchors("- [x]foo")[0].anchor.kind).toBe("list");
+	});
+
+	it("R3: frontmatter is not a structural parent of the indented content after it", () => {
+		const blocks = buildAnchors(["---", "a: 1", "---", "", "\t- child"].join("\n"));
+		const child = findOne(blocks, (b) => b.anchor.kind === "list");
+		expect(child.anchor.parentChain).toEqual([]);
+		expect(child.anchor.siblingIndex).toBe(0);
+	});
+
+	it("R3: a code block, a blockquote and a callout are not parents either", () => {
+		for (const head of [["```js", "x", "```"], ["> quote"], ["> [!note] c", "> body"]]) {
+			const blocks = buildAnchors([...head, "\t- child"].join("\n"));
+			const child = findOne(blocks, (b) => b.anchor.kind === "list");
+			expect(child.anchor.parentChain, head[0]).toEqual([]);
+		}
+	});
+
+	it("R3: an `other` paragraph is not a parent; a heading, list and task still are", () => {
+		const para = findOne(buildAnchors("Para\n  - a"), (b) => b.anchor.kind === "list");
+		expect(para.anchor.parentChain).toEqual([]);
+
+		const nested = buildAnchors(["# H", "- item", "\t- [ ] task", "\t\t- leaf"].join("\n"));
+		expect(findOne(nested, (b) => b.anchor.text === "leaf").anchor.parentChain).toEqual([
+			{ kind: "heading", text: "h" },
+			{ kind: "list", text: "item" },
+			{ kind: "task", text: "task" },
+		]);
+	});
+
+	it("R3: sibling counting under a heading skips over a leaf block between two lists' scope", () => {
+		// The paragraph and the code block do not open a scope: both indented lists share the heading's.
+		const blocks = buildAnchors(["# H", "Para", "  - a", "```", "x", "```", "  - b"].join("\n"));
+		const lists = blocks.filter((b) => b.anchor.kind === "list");
+		expect(lists.map((b) => b.anchor.parentChain)).toEqual([[{ kind: "heading", text: "h" }], [{ kind: "heading", text: "h" }]]);
+		expect(lists.map((b) => b.anchor.siblingIndex)).toEqual([0, 1]);
+	});
+
+	it("R4: a lazily closed range includes trailing blank lines (consumers must trim to find a fold end)", () => {
+		const blocks = buildAnchors(["# A", "- x", "", "# B"].join("\n"));
+		expect(findOne(blocks, (b) => b.anchor.text === "x").range).toEqual({ startLine: 2, endLine: 3 });
+	});
+});
+
 describe("buildAnchors: anchor structure", () => {
 	it("heading indent is always 0, and heading nesting comes from the parent chain (nearest shallower heading)", () => {
 		const text = ["# One", "## Two", "### Three", "## Two B"].join("\n");
@@ -235,6 +333,17 @@ describe("buildAnchors: anchor structure", () => {
 		// "Two B" is a sibling of "Two" (same level) — demoted back to directly under "One", not
 		// nested under "Three".
 		expect(twoB.anchor.parentChain).toEqual([{ kind: "heading", text: "one" }]);
+	});
+
+	it("heading sibling index counts same-level headings under the same parent, and restarts under a new parent", () => {
+		const text = ["# One", "## Same", "## Same", "# Two", "## Same"].join("\n");
+		const sames = buildAnchors(text).filter((b) => b.anchor.text === "same");
+		expect(sames.map((b) => b.anchor.siblingIndex)).toEqual([0, 1, 0]);
+		expect(sames.map((b) => b.anchor.parentChain)).toEqual([
+			[{ kind: "heading", text: "one" }],
+			[{ kind: "heading", text: "one" }],
+			[{ kind: "heading", text: "two" }],
+		]);
 	});
 
 	it("indent: nested list items get the right parents at the right indents", () => {

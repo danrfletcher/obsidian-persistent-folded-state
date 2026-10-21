@@ -40,9 +40,10 @@
  *                             (by deleting --data if present) so the next phase is a genuine
  *                             first open, not a re-open of a path this same test vault has seen
  *                             before.
- *   --phase baseline          G15/E5: clicks the fold-indicator triangle for "Draft proposal"
- *                             (the same mechanism a real user, or an earlier session, would have
- *                             used), then disables and re-enables this plugin over CDP — the
+ *   --phase baseline          G15/E5: with the plugin disabled and data.json cleared, folds
+ *                             "Plain list item" and "Draft proposal" (two sibling blocks — see
+ *                             runBaseline for why not the heading), each confirmed from the DOM,
+ *                             then re-enables this plugin over CDP — the
  *                             closest a non-interactive script can get to "the plugin sees an
  *                             already-folded note for the first time" without a full Obsidian
  *                             relaunch — and checks the resulting data.json entry plus the DOM
@@ -87,6 +88,22 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync, copyFileSync } fro
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import {
+	evaluate,
+	foldAndConfirm,
+	hashText,
+	parkCursorOutsideFolds,
+	readPluginData,
+	readVisibleLines,
+	recordFor,
+	resolveNote,
+	sleep,
+	unfoldAll,
+	useNote,
+	visibleLinesInclude,
+	withConnection,
+	writePluginData,
+} from "./e2e-lib.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPORT_PATH = join(ROOT, "docs", "dormant-baseline.md");
@@ -94,9 +111,7 @@ const DEFAULT_STATE_PATH = join(tmpdir(), "pfs-e2e-dormant-baseline-probe-state.
 
 const PLUGIN_ID = "persistent-folded-state";
 const DEFAULT_NOTE_PATH = "/config/test-vault/Quarry/Tasks.md";
-const DEFAULT_NOTE_VAULT_PATH = "Quarry/Tasks.md";
 const DEFAULT_EMPTY_NOTE_PATH = "/config/test-vault/Quarry/Empty.md";
-const DEFAULT_EMPTY_NOTE_VAULT_PATH = "Quarry/Empty.md";
 const DEFAULT_DATA_PATH = `/config/test-vault/.obsidian/plugins/${PLUGIN_ID}/data.json`;
 
 const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
@@ -169,142 +184,6 @@ function saveState(path, state) {
 	writeFileSync(path, JSON.stringify(state, null, 2), "utf8");
 }
 
-// --- this plugin's own data.json (read/written directly from the host filesystem) -------------
-
-function readPluginData(dataPath) {
-	if (!existsSync(dataPath)) return null;
-	try {
-		return JSON.parse(readFileSync(dataPath, "utf8"));
-	} catch {
-		return null;
-	}
-}
-
-function writePluginData(dataPath, data) {
-	writeFileSync(dataPath, JSON.stringify(data), "utf8");
-}
-
-function recordFor(data, vaultPath) {
-	return data && data.files ? data.files[vaultPath] : undefined;
-}
-
-// --- CDP (own copy — see the file comment in e2e-restore-probe.mjs for why each probe keeps
-// one rather than sharing) ----------------------------------------------------------------------
-
-async function findDebuggableTarget(cdpPort) {
-	const res = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
-	if (!res.ok) throw new Error(`CDP target list request failed: HTTP ${res.status}`);
-	const targets = await res.json();
-	const target = targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-	if (!target) throw new Error("no debuggable Obsidian window found on that CDP port");
-	return target;
-}
-
-function connectCdp(webSocketDebuggerUrl) {
-	const ws = new WebSocket(webSocketDebuggerUrl);
-	let nextId = 1;
-	const pending = new Map();
-	let closed = false;
-
-	function rejectAllPending(err) {
-		for (const { reject } of pending.values()) reject(err);
-		pending.clear();
-	}
-
-	ws.addEventListener("message", (event) => {
-		const message = JSON.parse(event.data.toString());
-		if (message.id && pending.has(message.id)) {
-			const { resolve, reject } = pending.get(message.id);
-			pending.delete(message.id);
-			if (message.error) reject(new Error(message.error.message));
-			else resolve(message.result);
-		}
-	});
-	ws.addEventListener("close", () => {
-		closed = true;
-		rejectAllPending(new Error("CDP socket closed"));
-	});
-	ws.addEventListener("error", () => rejectAllPending(new Error("CDP socket error")));
-
-	const ready = new Promise((resolve, reject) => {
-		ws.addEventListener("open", () => resolve());
-		ws.addEventListener("error", (err) => reject(err instanceof Error ? err : new Error(String(err))));
-	});
-
-	async function send(method, params = {}, { timeoutMs = 10000 } = {}) {
-		await ready;
-		if (closed) throw new Error(`CDP socket already closed, cannot send ${method}`);
-		const id = nextId++;
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				pending.delete(id);
-				reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
-			}, timeoutMs);
-			pending.set(id, {
-				resolve: (value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
-				reject: (err) => {
-					clearTimeout(timer);
-					reject(err);
-				},
-			});
-			ws.send(JSON.stringify({ id, method, params }));
-		});
-	}
-
-	return { send, close: () => ws.readyState === WebSocket.OPEN && ws.close() };
-}
-
-async function evaluate(cdp, expression, { awaitPromise = false } = {}) {
-	await cdp.send("Runtime.enable");
-	const result = await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise });
-	if (result.exceptionDetails) throw new Error(`Runtime.evaluate threw: ${JSON.stringify(result.exceptionDetails)}`);
-	return result.result.value;
-}
-
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withConnection(cdpPort, fn) {
-	const target = await findDebuggableTarget(cdpPort);
-	const cdp = connectCdp(target.webSocketDebuggerUrl);
-	try {
-		return await fn(cdp);
-	} finally {
-		cdp.close();
-	}
-}
-
-// --- page-side expressions ----------------------------------------------------------------
-
-/** Same mechanism e2e-restore-probe.mjs's own fold-click helper uses — see that file's comment. */
-function clickFoldIndicatorNearExpression(needle) {
-	return `
-(function () {
-	const needle = ${JSON.stringify(needle)};
-	const lines = Array.from(document.querySelectorAll(".cm-line"));
-	const target = lines.find((el) => el.textContent && el.textContent.includes(needle));
-	if (!target) return { clicked: false, reason: \`no rendered .cm-line contains "\${needle}"\` };
-	const indicator = target.querySelector(".cm-fold-indicator .collapse-indicator") ||
-		target.closest(".cm-line")?.previousElementSibling?.querySelector?.(".cm-fold-indicator .collapse-indicator");
-	if (!indicator) return { clicked: false, reason: \`found the line but no fold-indicator on/near it\` };
-	indicator.click();
-	return { clicked: true };
-})()
-`;
-}
-
-const READ_VISIBLE_LINES_EXPRESSION = `
-JSON.stringify(Array.from(document.querySelectorAll(".cm-line")).map((el) => el.textContent))
-`;
-
-function visibleLinesInclude(visibleLines, needle) {
-	return visibleLines.some((line) => line.includes(needle));
-}
-
 /** Disables then re-enables this plugin through Obsidian's own public `app.plugins` API — the
  * closest a non-interactive script can get, without a full relaunch, to "this plugin sees an
  * already-folded note for the first time": every open pane's `ViewPlugin` (including its
@@ -358,33 +237,108 @@ function runSeed(args, state) {
 	state.seed = { note, emptyNote, data, clearedData };
 }
 
+/** Closes every pane showing `vaultPath` and opens it again in a new tab — the "close and reopen
+ * the note" step, the path where real Obsidian may build the EditorView after the plugin's
+ * constructor-time check has already read an empty state. */
+function closeAndReopenExpression(vaultPath) {
+	return `
+(async function () {
+	const path = ${JSON.stringify(vaultPath)};
+	app.workspace.getLeavesOfType("markdown")
+		.filter((leaf) => leaf.view && leaf.view.file && leaf.view.file.path === path)
+		.forEach((leaf) => leaf.detach());
+	const file = app.vault.getAbstractFileByPath(path);
+	if (!file) return { reopened: false, reason: "file not found: " + path };
+	await app.workspace.getLeaf("tab").openFile(file);
+	return { reopened: true };
+})()
+`;
+}
+
+function disablePluginExpression() {
+	return `(async function () { await app.plugins.disablePlugin(${JSON.stringify(PLUGIN_ID)}); return { disabled: true }; })()`;
+}
+
+function enablePluginExpression() {
+	return `(async function () { await app.plugins.enablePlugin(${JSON.stringify(PLUGIN_ID)}); return { enabled: true }; })()`;
+}
+
+/** R7/T14 (PR-6): the E5/G15 baseline can only run when the plugin has *no* record for the note
+ * and then meets folds that already exist. So: disable the plugin, clear data.json while it is
+ * disabled (a plugin holding its store in memory would just write it back), fold the task and
+ * then its heading *with the plugin off* (task first — the heading's fold hides the task's
+ * line, so the reverse order leaves nothing to click), enable it, reopen the note in a fresh
+ * pane, and read what it adopted. The over-an-open-pane case (re-enable without closing) is the
+ * second scenario, run straight after. */
+/** The stored `contentHash` the plugin should hold for the note's on-disk text. */
+function hashOnDisk(path) {
+	return hashText(readFileSync(path, "utf8"));
+}
+
 async function runBaseline(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	const data = args.data ?? DEFAULT_DATA_PATH;
+	const beforeHash = hashOnDisk(note);
 
-	await withConnection(args.cdpPort, async (cdp) => {
-		const click = await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"));
+	async function scenario(cdp, label, reopen) {
+		// T102: fold --note, not whichever note is active; derive the data.json key from it.
+		const { vaultPath } = await useNote(cdp, note);
+		// T62: unfold everything first and wait until the lines the folds will hide are back in
+		// the DOM, so both scenarios start from the same known state. A fold click on a block that
+		// is still folded (Obsidian restores folds natively when a note reopens) would *unfold* it.
+		const unfold = await unfoldAll(cdp, ["Outline", "A nested list item"], { waitMs: args.waitMs });
+		const disabled = await evaluate(cdp, disablePluginExpression(), { awaitPromise: true });
+		if (existsSync(data)) unlinkSync(data); // cleared while disabled
+		const cursor = await parkCursorOutsideFolds(cdp);
 		await sleep(args.waitMs);
-
-		const toggle = await evaluate(cdp, toggleReenablePluginExpression(), { awaitPromise: true });
+		// Two sibling blocks under the same heading — the plain list item and the task — not the
+		// heading and the task. CM6's fold state drops a fold that a newly added, enclosing fold
+		// fully covers (reproduced in real Obsidian in PR-6 T14; see tests/e2e/dormant-baseline
+		// .e2e.ts), so "task, then heading" can only ever leave the heading stored. Each step is
+		// confirmed from the DOM (scripts/e2e-lib.mjs foldAndConfirm).
+		const listClick = await foldAndConfirm(cdp, "Plain list item", "A nested list item", { waitMs: args.waitMs });
+		const taskClick = await foldAndConfirm(cdp, "Draft proposal", "Outline", { waitMs: args.waitMs });
+		const enabled = await evaluate(cdp, enablePluginExpression(), { awaitPromise: true });
 		await sleep(args.waitMs);
+		const reopened = reopen ? await evaluate(cdp, closeAndReopenExpression(vaultPath), { awaitPromise: true }) : null;
+		await sleep(Math.max(args.waitMs, 1000));
 
-		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
-		const record = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
-
-		state.baseline = {
-			note,
-			foldClick: click,
-			pluginToggle: toggle,
-			// G15/E5's own question: did the constructor-time baseline check see the fold that
-			// was already live, or an empty state raced ahead of Obsidian's own fold restore?
+		const visibleLines = await readVisibleLines(cdp);
+		const record = recordFor(readPluginData(data), vaultPath);
+		const anchors = record ? record.folds.filter((fold) => fold.kind !== "frontmatter") : [];
+		return {
+			label,
+			unfold,
+			disabled,
+			cursor,
+			listClick,
+			taskClick,
+			enabled,
+			reopened,
+			recordExists: record !== undefined,
+			// Two anchors expected: the list item and the task (Obsidian's own frontmatter fold is not counted).
+			anchorCount: record ? anchors.length : null,
+			anchorKinds: anchors.map((fold) => fold.kind),
+			contentHashMatchesDisk: record ? record.contentHash === beforeHash : null,
+			dormantCount: record ? record.dormant.length : null,
+			nestedListItemStillHidden: !visibleLinesInclude(visibleLines, "A nested list item"),
 			draftProposalStillHidden: !visibleLinesInclude(visibleLines, "Outline"),
 			sendInvoicesVisible: visibleLinesInclude(visibleLines, "Send invoices"),
-			recordExists: record !== undefined,
-			foldCount: record ? record.folds.length : null,
-			dormantCount: record ? record.dormant.length : null,
 		};
+	}
+
+	await withConnection(args.cdpPort, async (cdp) => {
+		const closeAndReopen = await scenario(cdp, "close and reopen the note", true);
+		const reenableOverOpenPane = await scenario(cdp, "re-enable over an open pane", false);
+		state.baseline = { note, closeAndReopen, reenableOverOpenPane };
 	});
+}
+
+/** The fold records' count ignoring Obsidian's own auto-folded frontmatter, which the baseline
+ * and the recorder legitimately store as a "frontmatter" anchor (tests/fixtures/tasks-before.md
+ * opens with a `---` block). Null when the note has no record. */
+function userFoldCount(record) {
+	return record ? record.folds.filter((fold) => fold.kind !== "frontmatter").length : null;
 }
 
 async function runDormantUnfold(args, state) {
@@ -392,12 +346,34 @@ async function runDormantUnfold(args, state) {
 	const data = args.data ?? DEFAULT_DATA_PATH;
 	const afterText = readFileSync(REWRITTEN_FIXTURE, "utf8");
 
+	// The G6 phases need exactly one user fold stored for the note — the task — whatever the
+	// baseline phase left behind (T62). Put the before-fixture back, unfold anything still folded,
+	// fold the task (confirmed from the DOM) with the plugin enabled so its recorder stores it.
+	copyFileSync(BEFORE_FIXTURE, note);
+	await sleep(Math.max(args.waitMs, 1500));
+	await withConnection(args.cdpPort, async (cdp) => {
+		const { vaultPath } = await useNote(cdp, note);
+		const unfold = await unfoldAll(cdp, ["Outline", "A nested list item"], { waitMs: args.waitMs });
+		const cursor = await parkCursorOutsideFolds(cdp);
+		const taskFold = await foldAndConfirm(cdp, "Draft proposal", "Outline", { waitMs: Math.max(args.waitMs, 1000) });
+		const record = recordFor(readPluginData(data), vaultPath);
+		state.dormantSetup = {
+			note,
+			unfold,
+			cursor,
+			taskFold,
+			storedUserFolds: userFoldCount(record),
+			storedDormant: record ? record.dormant.length : null,
+		};
+	});
+
 	writeFileSync(note, afterText, "utf8");
 	await sleep(Math.max(args.waitMs, 1500));
 
 	await withConnection(args.cdpPort, async (cdp) => {
-		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
-		const record = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
+		const { vaultPath } = await useNote(cdp, note);
+		const visibleLines = await readVisibleLines(cdp);
+		const record = recordFor(readPluginData(data), vaultPath);
 
 		state.dormantUnfold = {
 			note,
@@ -405,7 +381,7 @@ async function runDormantUnfold(args, state) {
 			// silently lost.
 			unrelatedTextVisible: visibleLinesInclude(visibleLines, "Completely unrelated paragraph"),
 			sendInvoicesVisible: visibleLinesInclude(visibleLines, "Send invoices"),
-			foldCount: record ? record.folds.length : null,
+			foldCount: userFoldCount(record),
 			dormantCount: record ? record.dormant.length : null,
 			dormantSince: record && record.dormant[0] ? record.dormant[0].dormantSince : null,
 		};
@@ -421,15 +397,16 @@ async function runDormantRefold(args, state) {
 	await sleep(Math.max(args.waitMs, 1500));
 
 	await withConnection(args.cdpPort, async (cdp) => {
-		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
-		const record = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
+		const { vaultPath } = await useNote(cdp, note);
+		const visibleLines = await readVisibleLines(cdp);
+		const record = recordFor(readPluginData(data), vaultPath);
 
 		state.dormantRefold = {
 			note,
 			// G6: the retry should find the text again and fold it straight back within about a
 			// second of the write landing.
 			draftProposalRefolded: !visibleLinesInclude(visibleLines, "Outline"),
-			foldCount: record ? record.folds.length : null,
+			foldCount: userFoldCount(record),
 			dormantCount: record ? record.dormant.length : null,
 		};
 	});
@@ -446,7 +423,9 @@ async function runDormantForgotten(args, state) {
 	await sleep(Math.max(args.waitMs, 1500));
 
 	let agedSince = null;
+	let vaultPath = null;
 	await withConnection(args.cdpPort, async (cdp) => {
+		vaultPath = (await useNote(cdp, note)).vaultPath;
 		await evaluate(cdp, `(async function () { await app.plugins.disablePlugin(${JSON.stringify(PLUGIN_ID)}); return true; })()`, {
 			awaitPromise: true,
 		});
@@ -455,7 +434,7 @@ async function runDormantForgotten(args, state) {
 	// 2) The container-verification script's own documented shortcut: edit `dormantSince` in
 	// data.json directly while the plugin is disabled, ageing it past the 600,000ms boundary.
 	const before = readPluginData(data);
-	const record = recordFor(before, DEFAULT_NOTE_VAULT_PATH);
+	const record = recordFor(before, vaultPath);
 	if (record && record.dormant[0]) {
 		agedSince = Date.now() - (MAX_DORMANT_AGE_MS + 1000);
 		record.dormant[0].dormantSince = agedSince;
@@ -474,8 +453,9 @@ async function runDormantForgotten(args, state) {
 	await sleep(Math.max(args.waitMs, 1500));
 
 	await withConnection(args.cdpPort, async (cdp) => {
-		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
-		const after = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
+		await useNote(cdp, note);
+		const visibleLines = await readVisibleLines(cdp);
+		const after = recordFor(readPluginData(data), vaultPath);
 
 		state.dormantForgotten = {
 			note,
@@ -483,7 +463,7 @@ async function runDormantForgotten(args, state) {
 			// G6: forgotten outright — never refolded, even though the text that would have
 			// matched it came back.
 			draftProposalStillUnfolded: visibleLinesInclude(visibleLines, "Outline"),
-			foldCount: after ? after.folds.length : null,
+			foldCount: userFoldCount(after),
 			dormantCount: after ? after.dormant.length : null,
 		};
 	});
@@ -494,17 +474,18 @@ async function runEmptyBaseline(args, state) {
 	const data = args.data ?? DEFAULT_DATA_PATH;
 
 	await withConnection(args.cdpPort, async (cdp) => {
-		const open = await evaluate(cdp, openFileExpression(DEFAULT_EMPTY_NOTE_VAULT_PATH), { awaitPromise: true });
+		const { vaultPath: emptyVaultPath } = await resolveNote(cdp, emptyNote);
+		const open = await evaluate(cdp, openFileExpression(emptyVaultPath), { awaitPromise: true });
 		await sleep(args.waitMs);
 
-		const record = recordFor(readPluginData(data), DEFAULT_EMPTY_NOTE_VAULT_PATH);
+		const record = recordFor(readPluginData(data), emptyVaultPath);
 		state.emptyBaseline = {
 			emptyNote,
 			open,
 			// G15: "a file with no folds on first open is stored as an empty baseline entry" —
 			// an entry must exist, with both lists empty, not no entry at all.
 			recordExists: record !== undefined,
-			foldCount: record ? record.folds.length : null,
+			foldCount: userFoldCount(record),
 			dormantCount: record ? record.dormant.length : null,
 		};
 	});
@@ -516,19 +497,28 @@ function renderReport(state) {
 		return `### ${title}\n\n${describe(data)}\n`;
 	}
 
-	const baselineSection = section("G15/E5: first-open baseline (--phase baseline)", state.baseline, (d) => [
-		`- Note: \`${d.note}\``,
-		`- Clicked "Draft proposal"'s fold indicator: ${JSON.stringify(d.foldClick)}`,
-		`- Disabled + re-enabled the plugin: ${JSON.stringify(d.pluginToggle)}`,
-		`- Draft proposal still hidden after the toggle: ${d.draftProposalStillHidden}`,
-		`- Send invoices visible (never folded): ${d.sendInvoicesVisible}`,
-		`- data.json has an entry for the note: ${d.recordExists}`,
-		`- Stored fold count: ${d.foldCount} (expect 1)`,
-		`- Stored dormant count: ${d.dormantCount} (expect 0)`,
-	].join("\n"));
+	const baselineSection = section("G15/E5: first-open baseline (--phase baseline)", state.baseline, (d) =>
+		[d.closeAndReopen, d.reenableOverOpenPane]
+			.map((c) =>
+				[
+					`#### ${c.label}`,
+					`- Note: \`${d.note}\``,
+					`- Unfolded everything first: ${JSON.stringify(c.unfold)}`,
+					`- Plugin disabled, data.json cleared, plain list item then task folded, plugin re-enabled${c.reopened ? ", note closed and reopened" : ""}: ${JSON.stringify({ disabled: c.disabled, cursor: c.cursor, listClick: c.listClick, taskClick: c.taskClick, enabled: c.enabled, reopened: c.reopened })}`,
+					`- data.json has an entry for the note: ${c.recordExists}`,
+					`- Stored non-frontmatter anchors: ${c.anchorCount} (expect 2: ${JSON.stringify(c.anchorKinds)})`,
+					`- Stored contentHash matches the file on disk: ${c.contentHashMatchesDisk}`,
+					`- Stored dormant count: ${c.dormantCount} (expect 0)`,
+					`- Plain list item's nested line still hidden: ${c.nestedListItemStillHidden}`,
+					`- Draft proposal still hidden: ${c.draftProposalStillHidden}`,
+					`- Send invoices visible (never folded): ${c.sendInvoicesVisible}`,
+				].join("\n"),
+			)
+			.join("\n\n"));
 
 	const unfoldSection = section("G6: dormant unfold (--phase dormant-unfold)", state.dormantUnfold, (d) => [
 		`- Note: \`${d.note}\``,
+		`- Precondition (task folded with the plugin enabled and stored): ${JSON.stringify(state.dormantSetup)}`,
 		`- Unrelated replacement text visible (task no longer folded): ${d.unrelatedTextVisible}`,
 		`- Send invoices visible: ${d.sendInvoicesVisible}`,
 		`- Stored fold count: ${d.foldCount} (expect 0)`,
@@ -559,10 +549,25 @@ function renderReport(state) {
 		`- Stored dormant count: ${d.dormantCount} (expect 0)`,
 	].join("\n"));
 
+	// Both baseline scenarios: each fold step confirmed from the DOM, two non-frontmatter anchors
+	// stored with the on-disk content hash and nothing dormant, both blocks still hidden, and the
+	// never-folded sibling task still visible.
+	const baselinePasses = (c) =>
+		c.listClick.folded &&
+		c.taskClick.folded &&
+		c.recordExists &&
+		c.anchorCount === 2 &&
+		c.contentHashMatchesDisk === true &&
+		c.dormantCount === 0 &&
+		c.nestedListItemStillHidden &&
+		c.draftProposalStillHidden &&
+		c.sendInvoicesVisible;
 	const overallPass =
-		state.baseline?.draftProposalStillHidden &&
-		state.baseline?.recordExists &&
-		state.baseline?.foldCount === 1 &&
+		state.baseline &&
+		baselinePasses(state.baseline.closeAndReopen) &&
+		baselinePasses(state.baseline.reenableOverOpenPane) &&
+		state.dormantSetup?.taskFold?.folded &&
+		state.dormantSetup?.storedUserFolds === 1 &&
 		state.dormantUnfold?.unrelatedTextVisible &&
 		state.dormantUnfold?.dormantCount === 1 &&
 		state.dormantRefold?.draftProposalRefolded &&

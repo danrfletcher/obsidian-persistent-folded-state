@@ -41,8 +41,11 @@ export function indentColumns(lineText: string): number {
  * checkbox status is a single character (` `, `x`, `X`, `/`, `-`, `>`, `!`, `?`, `~`). Requiring
  * exactly one character is what keeps `[[wikilinks]]` and `[text](url)` from being misread as a
  * checkbox and partially eaten — a `*`/`+` quantifier here would greedily match into
- * `[[wikilink]]`'s first `]` and leave a stray `]` behind. */
-const LIST_MARKER_WITH_OPTIONAL_CHECKBOX = /^(?:[-*+]|\d+[.)])\s+(?:\[[^\]]\]\s*)?/;
+ * `[[wikilink]]`'s first `]` and leave a stray `]` behind.
+ *
+ * R2 (PR-3): the closing `]` must also be followed by whitespace or the end of the line, so a
+ * one-character link label (`- [a](http://x) foo`) is not eaten as if it were a checkbox. */
+const LIST_MARKER_WITH_OPTIONAL_CHECKBOX = /^(?:[-*+]|\d+[.)])\s+(?:\[[^\]]\](?=\s|$)\s*)?/;
 
 /** A leading heading marker: 1-6 `#` characters followed by whitespace. */
 const HEADING_MARKER = /^#{1,6}\s+/;
@@ -53,10 +56,12 @@ const HEADING_MARKER = /^#{1,6}\s+/;
  * string, which `String.prototype.replace` provides even while building up the result, so this
  * is safe to run as one pass. */
 function stripNonWordUnderscores(text: string): string {
+	// R5 (PR-3): a "word character" is any Unicode letter or number, not just ASCII, so
+	// `café_bar` keeps its underscore.
 	return text.replace(/_/g, (match, offset: number, full: string) => {
 		const before = full[offset - 1];
 		const after = full[offset + 1];
-		const isWordChar = (ch: string | undefined): boolean => ch !== undefined && /[A-Za-z0-9]/.test(ch);
+		const isWordChar = (ch: string | undefined): boolean => ch !== undefined && /[\p{L}\p{N}]/u.test(ch);
 		return isWordChar(before) && isWordChar(after) ? "_" : "";
 	});
 }

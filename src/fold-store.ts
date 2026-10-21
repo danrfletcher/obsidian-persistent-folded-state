@@ -170,15 +170,22 @@ export class FoldStore {
 		const sanitized = sanitizeStoreData(raw);
 		const now = this.nowFn();
 		const files = new Map<string, FileFoldRecord>();
+		let pruned = false;
 		for (const [path, record] of Object.entries(sanitized.files)) {
 			// G6/E7: "forgotten ... at plugin load" — a dormant anchor aged out while the
 			// plugin was disabled (or Obsidian was shut) never comes back as a candidate to
 			// retry; a long gap between loads is exactly what's supposed to expire it.
-			files.set(path, { ...record, dormant: expireDormant(record.dormant, now) });
+			const dormant = expireDormant(record.dormant, now);
+			if (dormant.length !== record.dormant.length) pruned = true;
+			files.set(path, { ...record, dormant });
 		}
 		this.files = files;
-		this.dirty = false;
+		// R10 (PR-6): pruning an expired dormant anchor is a change to what data.json should
+		// hold, so the store is dirty again — otherwise the file keeps the expired entry on disk
+		// until something unrelated happens to write.
+		this.dirty = pruned;
 		this.cancelScheduledFlush();
+		if (pruned) this.scheduleDebouncedFlush();
 	}
 
 	get(path: string): FileFoldRecord | undefined {

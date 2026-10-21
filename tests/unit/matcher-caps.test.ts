@@ -3,10 +3,16 @@
  * cases that don't have a more specific home — empty stored/candidates, a normalized-empty line,
  * and 200-run shuffle determinism with no candidate reused (C24, C25 second half).
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as similarityModule from "../../src/similarity";
 import { matchAnchors } from "../../src/matcher";
 import { anchorsFrom } from "../fixtures/matcher/build-anchors";
+
+// R15 (PR-4): restored after every test, not at the end of a test body, so a failed assertion
+// can't leave a mocked similarity() in place for the tests that follow.
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 function tasksMarkdown(labels: string[]): string {
 	return labels.map((label) => `- [ ] ${label}`).join("\n");
@@ -58,7 +64,6 @@ describe("E6 C22: at most maxComparisons similarity() calls per run", () => {
 		for (let i = 0; i < 3; i++) expect(results[i]).toEqual({ tier: "positional", target: i }); // earlier matches kept
 		for (let i = 3; i < 10; i++) expect(results[i]).toEqual({ tier: "none", reason: "capped" });
 
-		vi.restoreAllMocks();
 	});
 
 	it("lowering the caps through options never reports a capped fold as matched", async () => {
@@ -72,6 +77,52 @@ describe("E6 C22: at most maxComparisons similarity() calls per run", () => {
 			expect(result.tier).toBe("none");
 			expect("target" in result).toBe(false);
 		}
+	});
+
+	it("R12: ancestor resolution and the parent-chain tiebreak count toward the cap too (every similarity() call does)", async () => {
+		// Renamed parents force fuzzy ancestor resolution; the children then need tier 2/3 too.
+		const stored = anchorsFrom(
+			Array.from({ length: 6 }, (_, i) => `# Section number ${i} old\n\t- [ ] child task ${i} before`).join("\n"),
+		).filter((a) => a.kind === "task");
+		const candidates = anchorsFrom(
+			Array.from({ length: 6 }, (_, i) => `# Section number ${i} new\n\t- [ ] child task ${i} after`).join("\n"),
+		);
+
+		for (const cap of [1, 4, 9, 20]) {
+			const spy = vi.spyOn(similarityModule, "similarity"); // real implementation, just counted
+			const results = await matchAnchors(stored, candidates, { maxComparisons: cap });
+			expect(spy.mock.calls.length, `cap ${cap}`).toBeLessThanOrEqual(cap);
+			for (const result of results) {
+				if (result.tier !== "none") expect(candidates[result.target].kind).toBe("task");
+			}
+			spy.mockRestore();
+		}
+	});
+
+	it("R12: the yield cadence counts ancestor and tiebreak comparisons too — no chunk of consecutive similarity() calls is longer than chunkSize", async () => {
+		const stored = anchorsFrom(
+			Array.from({ length: 6 }, (_, i) => `# Section number ${i} old\n\t- [ ] child task ${i} before`).join("\n"),
+		).filter((a) => a.kind === "task");
+		const candidates = anchorsFrom(
+			Array.from({ length: 6 }, (_, i) => `# Section number ${i} new\n\t- [ ] child task ${i} after`).join("\n"),
+		);
+
+		const events: string[] = [];
+		const real = similarityModule.similarity;
+		vi.spyOn(similarityModule, "similarity").mockImplementation((a, b) => {
+			events.push("call");
+			return real(a, b);
+		});
+		await matchAnchors(stored, candidates, { chunkSize: 3, yieldToHost: () => void events.push("yield") });
+
+		let run = 0;
+		let longest = 0;
+		for (const event of events) {
+			run = event === "yield" ? 0 : run + 1;
+			longest = Math.max(longest, run);
+		}
+		expect(events.filter((e) => e === "call").length).toBeGreaterThan(3);
+		expect(longest).toBeLessThanOrEqual(3);
 	});
 
 	it("MAX_COMPARISONS defaults to 5000", async () => {
@@ -102,6 +153,38 @@ describe("E6 C23: matchAnchors is async and yields through an injected yieldToHo
 		// 10 comparisons at chunkSize 2 -> a yield after every 2nd, i.e. 5 times.
 		expect(yieldCalls).toBe(5);
 		expect(yieldCalls).toBeGreaterThan(1);
+	});
+
+	it("R11 (PR-4): 500 folds over a 5,000-line note finish with more than one yield, and no stretch of similarity() calls exceeds one chunk", async () => {
+		// 500 tasks, each followed by 9 lines of filler: 5,000 lines in all. Every task is
+		// reworded in the new text, so each stored fold needs a tier 2 comparison (500 > the
+		// 250 default chunk size => at least 2 yields with the defaults).
+		const note = (suffix: string): string =>
+			Array.from({ length: 500 }, (_, i) =>
+				[`- [ ] long running task number ${i}${suffix}`, ...Array.from({ length: 9 }, (_, j) => `\tnote line ${j} of task ${i}`)].join("\n"),
+			).join("\n");
+		expect(note("").split("\n")).toHaveLength(5000);
+		const stored = anchorsFrom(note("")).filter((a) => a.kind === "task" && a.indent === 0);
+		const candidates = anchorsFrom(note(" v2"));
+		expect(stored).toHaveLength(500);
+
+		const events: string[] = [];
+		const real = similarityModule.similarity;
+		vi.spyOn(similarityModule, "similarity").mockImplementation((a, b) => {
+			events.push("call");
+			return real(a, b);
+		});
+		const results = await matchAnchors(stored, candidates, { yieldToHost: () => void events.push("yield") });
+
+		expect(results.filter((r) => r.tier !== "none")).toHaveLength(500);
+		expect(events.filter((e) => e === "yield").length).toBeGreaterThan(1);
+		let run = 0;
+		let longest = 0;
+		for (const event of events) {
+			run = event === "yield" ? 0 : run + 1;
+			longest = Math.max(longest, run);
+		}
+		expect(longest).toBeLessThanOrEqual(250); // CHUNK_SIZE: "no synchronous stretch exceeds one chunk"
 	});
 
 	it("CHUNK_SIZE defaults to 250", async () => {

@@ -81,9 +81,9 @@ import { foldEffect } from "@codemirror/language";
 import { Text, type ChangeDesc, type ChangeSet } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
-import { liveFoldedLineRanges } from "./live-folds";
+import { foldSpanForLineRange, liveFoldedLineRanges } from "./live-folds";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
-import { planRestore, type FoldTarget } from "./restore-plan";
+import { isAlreadyFolded, planRestore, type FoldTarget } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
 import { hashText, type FoldStore } from "./fold-store";
 import {
@@ -171,24 +171,27 @@ export function liveAnchorKeySet(store: FoldStore, path: string): ReadonlySet<st
 }
 
 /** Converts a line-range target into a CM6 character-offset fold effect: from the end of the
- * block's own first line to the end of its last line, leaving the first line itself visible
- * (the usual heading/task/list fold shape). Returns `null` rather than throwing when the doc no
- * longer has that many lines (it shrank between planning and dispatch), or when there's nothing
- * left to hide. */
+ * block's own first line to the end of its last non-blank line (`foldSpanForLineRange`: the
+ * trailing blank separators `buildAnchors` folds into a range are not hidden), leaving the first
+ * line itself visible (the usual heading/task/list fold shape). Returns `null` rather than
+ * throwing when the doc no longer has that many lines (it shrank between planning and
+ * dispatch), or when there's nothing left to hide. */
 function foldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof foldEffect.of> | null {
-	if (range.endLine <= range.startLine) return null; // nothing to collapse
-	if (range.endLine > view.state.doc.lines) return null;
-	const from = view.state.doc.line(range.startLine).to;
-	const to = view.state.doc.line(range.endLine).to;
-	if (from >= to) return null; // nothing left to hide
-	return foldEffect.of({ from, to });
+	const span = foldSpanForLineRange(view.state.doc, range);
+	return span ? foldEffect.of(span) : null;
 }
 
 function dispatchFoldTargets(view: EditorView, targets: readonly { range: LineRange }[]): void {
 	if (targets.length === 0) return;
 	const effects = targets
 		.map((target) => foldEffectFor(view, target.range))
-		.filter((effect): effect is NonNullable<typeof effect> => effect !== null);
+		.filter((effect): effect is NonNullable<typeof effect> => effect !== null)
+		// CM6's fold state adds every fold effect of one transaction with a single unsorted
+		// `RangeSet.update({ add })`, which throws "Ranges must be added sorted by `from`" for
+		// effects out of document order — and stored anchors are in the order the user folded
+		// them (task before its heading is the ordinary case), not document order. A throw here
+		// loses the whole restore, so the effects are sorted.
+		.sort((a, b) => a.value.from - b.value.from || a.value.to - b.value.to);
 	if (effects.length === 0) return;
 	view.dispatch({ effects, annotations: OWN_FOLD_ANNOTATION.of(true) });
 }
@@ -236,12 +239,24 @@ function mapCandidatesForward(candidates: AnchoredBlock[], text: string, changes
 	}));
 }
 
+/** R4 (PR-6): a dormant anchor promoted to the active list is stored as a plain anchor — the
+ * `dormantSince` it carried while dormant is stripped, so data.json's active folds never hold
+ * a stale dormant timestamp. */
+function toActiveAnchor(anchor: Anchor): StoredAnchor {
+	const { kind, indent, text, siblingIndex, parentChain } = anchor;
+	return { kind, indent, text, siblingIndex, parentChain };
+}
+
 /** Builds a `DeferredFoldTarget` (R2) from a plan's own `FoldTarget` (anchor index + line range,
  * already in live-doc coordinates — see `restoreSettledChange`) — the character-offset span that
- * gets mapped forward through later changes until the cursor leaves it. */
+ * gets mapped forward through later changes until the cursor leaves it. R5 (PR-5): the span is
+ * the part the fold would hide, so `from` is the end of the block's first line (where the fold
+ * starts), not the start of that line: a cursor resting on the heading/task line itself is
+ * outside the span, matching `planRestore`'s own "inside" rule. */
 function toDeferredFoldTarget(view: EditorView, anchor: Anchor | undefined, range: LineRange): DeferredFoldTarget | null {
 	if (!anchor) return null; // defensive: `target.anchorIndex` should always index a real stored anchor
-	const { from, to } = blockSpan(view.state.doc, range);
+	const { from: blockFrom, to } = blockSpan(view.state.doc, range);
+	const from = view.state.doc.lineAt(blockFrom).to;
 	return { anchorKey: anchorKey(anchor), from, to };
 }
 
@@ -254,7 +269,7 @@ function toDeferredFoldTarget(view: EditorView, anchor: Anchor | undefined, rang
  */
 export async function restoreSettledChange(
 	view: EditorView,
-	path: string,
+	triggerPath: string,
 	text: string,
 	deps: RestoreRunDeps,
 ): Promise<DeferredFoldTarget[]> {
@@ -267,7 +282,19 @@ export async function restoreSettledChange(
 	// entry under a key nothing on disk answers to any more. The later, narrower check further
 	// down (after the possibly-slow match) still applies for the case where the rename arrives
 	// *during* that match.
-	if (deps.getActivePath(view) !== path) return [];
+	//
+	// R7 (PR-7): a rename that lands inside the settle window is re-targeted rather than
+	// dropped. The pane's file kept the very text this run was handed, so it is the same note
+	// under its new path (the store entry was re-keyed by `handleRename`): restore against the
+	// path the pane shows now. A pane that moved to a *different* file shows different text and
+	// is still dropped (an identical-text different file is restored under its own path, which
+	// is also correct: the entry and the text belong together).
+	let path = triggerPath;
+	const activePath = deps.getActivePath(view);
+	if (activePath !== path) {
+		if (activePath === null || view.state.doc.toString() !== text) return [];
+		path = activePath;
+	}
 
 	const snapshot = deps.store.get(path);
 	if (!snapshot) {
@@ -282,7 +309,15 @@ export async function restoreSettledChange(
 		});
 		return [];
 	}
-	if (snapshot.folds.length === 0 && snapshot.dormant.length === 0) return [];
+	if (snapshot.folds.length === 0 && snapshot.dormant.length === 0) {
+		// R10 (PR-6): nothing to restore, but the entry's contentHash still has to follow the
+		// text: a hash left at the file's old content would make the next open treat an
+		// unchanged note as changed (and re-match against it) for no reason.
+		if (snapshot.contentHash !== hashText(text)) {
+			deps.store.set(path, { contentHash: hashText(text), folds: [], dormant: [] });
+		}
+		return [];
+	}
 
 	// The snapshot (E11/E9): taken once, now, before the possibly-slow matching below starts.
 	const storedAnchors: Anchor[] = [];
@@ -381,9 +416,33 @@ export async function restoreSettledChange(
 			if (anchor) activeFolds.set(anchorKey(anchor), raw);
 		}
 
+		// R12 (PR-6): anchors the recorder added while the match ran (the user folded something
+		// after the snapshot) — a dormant match already live on one of those blocks is the user's
+		// own fold, not a restore, and is not promoted alongside it (see below).
+		const snapshotKeys = new Set<string>();
+		for (const raw of snapshot.folds) {
+			const anchor = parseAnchor(raw);
+			if (anchor) snapshotKeys.add(anchorKey(anchor));
+		}
+		const addedSinceSnapshot = new Set([...activeFolds.keys()].filter((key) => !snapshotKeys.has(key)));
+
 		let dormantList = dormantResult.stillDormant;
 		for (let i = 0; i < storedAnchors.length; i++) {
-			if (matches[i]?.tier !== "none") continue;
+			const match = matches[i];
+			if (match?.tier !== "none") {
+				// R8 (PR-5): re-key the stored entry to the block it matched, as that block reads
+				// now. A fuzzy or sibling-shifted match otherwise leaves the old anchor stored, so
+				// the user's later unfold of this block (whose anchor `describeFold` builds from the
+				// current text) misses it and the next external write folds the block again.
+				const matchedBlock = match ? liveCandidates[match.target] : undefined;
+				if (!matchedBlock) continue;
+				const oldKey = anchorKey(storedAnchors[i]);
+				const newKey = anchorKey(matchedBlock.anchor);
+				if (oldKey === newKey || !activeFolds.has(oldKey)) continue; // E3: removed meanwhile
+				activeFolds.delete(oldKey);
+				if (!activeFolds.has(newKey)) activeFolds.set(newKey, matchedBlock.anchor as unknown as StoredAnchor);
+				continue;
+			}
 			const key = anchorKey(storedAnchors[i]);
 			if (!activeFolds.has(key)) continue; // E3: the user already removed it meanwhile
 			activeFolds.delete(key);
@@ -412,15 +471,22 @@ export async function restoreSettledChange(
 		for (let i = 0; i < dormantResult.matched.length; i++) {
 			const match = dormantResult.matched[i];
 			if (actedDormantIdx.has(i)) {
-				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				activeFolds.set(anchorKey(match.anchor), toActiveAnchor(match.anchor));
 				continue;
 			}
 			const candidate = liveCandidates[match.candidateIndex];
-			const alreadyLive =
-				candidate !== undefined &&
-				alreadyFolded.some((r) => r.startLine === candidate.range.startLine && r.endLine === candidate.range.endLine);
-			if (alreadyLive) {
-				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+			// R15 (PR-6)/R3 (PR-5): the same start-line test the planner uses, so a native fold
+			// that ends a blank line short of (or past) the candidate still counts as live.
+			const alreadyLive = candidate !== undefined && isAlreadyFolded(alreadyFolded, candidate.range);
+			if (alreadyLive && candidate !== undefined && addedSinceSnapshot.has(anchorKey(candidate.anchor))) {
+				// R12 (PR-6): the user folded this very block while the match ran, so the recorder
+				// already stored its own anchor for it. Promoting the (possibly fuzzily matched,
+				// differently keyed) dormant anchor too would leave two entries for one block, and
+				// the user's later unfold would remove only one of them — the other would refold
+				// the block on the next reload (never-break rule 2). The dormant entry is dropped.
+				continue;
+			} else if (alreadyLive) {
+				activeFolds.set(anchorKey(match.anchor), toActiveAnchor(match.anchor));
 			} else {
 				dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
 			}
@@ -433,8 +499,14 @@ export async function restoreSettledChange(
 		});
 	}
 
+	// R8: a deferred target is keyed by the anchor now stored for its block (the re-keyed one),
+	// so the later `liveAnchorKeys` recheck (applyReadyDeferredFolds) still finds it.
 	const activeDeferred = plan.deferred
-		.map((target) => toDeferredFoldTarget(view, storedAnchors[target.anchorIndex], target.range))
+		.map((target) => {
+			const matched = matches[target.anchorIndex];
+			const block = matched && matched.tier !== "none" ? liveCandidates[matched.target] : undefined;
+			return toDeferredFoldTarget(view, block?.anchor ?? storedAnchors[target.anchorIndex], target.range);
+		})
 		.filter((target): target is DeferredFoldTarget => target !== null);
 	const dormantDeferred = dormantPlan.deferred
 		.map((target: FoldTarget) => toDeferredFoldTarget(view, dormantMatchedAnchors[target.anchorIndex], target.range))
@@ -442,7 +514,7 @@ export async function restoreSettledChange(
 	return [...activeDeferred, ...dormantDeferred];
 }
 
-/** R2: maps every still-deferred target's character span forward through one update's own
+/** R2: maps every still-deferred target's character span (from the end of its first line to the end of its last, R5) forward through one update's own
  * `ChangeDesc` — called unconditionally by src/editor-watcher.ts on every update that carries a
  * document change, so a line added or removed inside (or around) a deferred block keeps its
  * span over the same content rather than the stale line numbers it was captured with. A block
@@ -451,7 +523,9 @@ export async function restoreSettledChange(
 export function mapDeferredTargets(targets: readonly DeferredFoldTarget[], changes: ChangeDesc): DeferredFoldTarget[] {
 	const mapped: DeferredFoldTarget[] = [];
 	for (const target of targets) {
-		const from = changes.mapPos(target.from, -1);
+		// `from` is the end of the block's first line (R5): bias +1 keeps text typed at the end of
+		// that line (before the fold) outside the span, while `to` keeps its +1 bias.
+		const from = changes.mapPos(target.from, 1);
 		const to = changes.mapPos(target.to, 1);
 		if (to <= from) continue; // the block this would have folded no longer exists
 		mapped.push({ anchorKey: target.anchorKey, from, to });
@@ -479,7 +553,7 @@ export function applyReadyDeferredFolds(
 	for (const target of pending) {
 		if (!liveAnchorKeys.has(target.anchorKey)) continue; // R2: forgotten/unfolded while deferred
 
-		const inside = cursorPos >= target.from && cursorPos <= target.to;
+		const inside = cursorPos > target.from && cursorPos <= target.to; // R5: not on the first line
 		if (inside) {
 			stillPending.push(target);
 			continue;

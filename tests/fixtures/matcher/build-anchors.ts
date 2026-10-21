@@ -3,7 +3,12 @@
  * `matchAnchors` consumes, by running it through PR-3's real extractor (`buildAnchors`) rather
  * than hand-building `Anchor` objects — so every matcher test exercises the same anchor shapes
  * (kind, indent, normalized text, sibling index, parent chain) the plugin will actually produce.
- * The only fake anywhere in the PR-4 test suite is `yieldToHost` (tests/unit/matcher-caps.test.ts).
+ * `yieldToHost` is faked (tests/unit/matcher-caps.test.ts). R10 (PR-4): `similarity()` is also
+ * pinned with `vi.spyOn(...)` in the threshold-boundary, tie and chain-tiebreak tests
+ * (tests/unit/matcher-tiers.test.ts, matcher-ambiguity.test.ts, matcher-nesting.test.ts): an exact
+ * score on a bar or an exact tie cannot be reached reliably from real text. That departs from
+ * "the only fake is yieldToHost" on purpose; the tests that can use real text do (for example
+ * the real-text parent-chain tiebreak in matcher-ambiguity.test.ts).
  */
 import { buildAnchors, type Anchor } from "../../../src/anchors";
 

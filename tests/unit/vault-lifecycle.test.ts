@@ -215,4 +215,17 @@ describe("vault-lifecycle: rename arriving while a pending flush exists (no writ
 		const after = renameFiles(before, "Old.md", "New.md");
 		expect(Object.keys(after)).toEqual(["New.md"]);
 	});
+
+	it("PR-1 R4: with a covers predicate, a trimmed native fold agrees with its untrimmed matched range", () => {
+		const native = [{ startLine: 2, endLine: 3 }];
+		const matched = [{ startLine: 2, endLine: 4 }];
+		// Default (exact) comparison: the trimmed fold looks like a stale offset.
+		expect(reconcileNativeRestore(native, matched)).toEqual({ toFold: matched, toUnfold: native });
+		const covers = (n: { startLine: number; endLine: number }, m: { startLine: number; endLine: number }): boolean =>
+			n.startLine === m.startLine && n.endLine <= m.endLine;
+		expect(reconcileNativeRestore(native, matched, covers)).toEqual({ toFold: [], toUnfold: [] });
+		// A native fold the matched set does not cover is still unfolded.
+		const stale = [{ startLine: 7, endLine: 8 }];
+		expect(reconcileNativeRestore([...native, ...stale], matched, covers)).toEqual({ toFold: [], toUnfold: stale });
+	});
 });

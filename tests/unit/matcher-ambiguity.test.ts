@@ -2,10 +2,16 @@
  * src/matcher.ts: E1 duplicate ordinal pairing, E2 ties in both directions, and the C14/C20
  * parent-chain tiebreak (C17-C20, C27).
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as similarityModule from "../../src/similarity";
 import { matchAnchors } from "../../src/matcher";
 import { anchorsFrom, indexOfAnchor } from "../fixtures/matcher/build-anchors";
+
+// R15 (PR-4): restored after every test, not at the end of a test body, so a failed assertion
+// can't leave a mocked similarity() in place for the tests that follow.
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 describe("E1: identical normalized lines under one parent pair by order (C17)", () => {
 	it("only the 2nd of three duplicates folded maps to the 2nd of the new three", async () => {
@@ -120,7 +126,6 @@ describe("E2 forward direction: two candidates tied for one anchor (C19)", () =>
 		const results = await matchAnchors(stored, candidates);
 		expect(results[0]).toEqual({ tier: "none", reason: "ambiguous" });
 
-		vi.restoreAllMocks();
 	});
 });
 
@@ -136,7 +141,6 @@ describe("E2 reverse direction: two anchors tied for one candidate (C19)", () =>
 		expect(results[0]).toEqual({ tier: "none", reason: "ambiguous" });
 		expect(results[1]).toEqual({ tier: "none", reason: "ambiguous" });
 
-		vi.restoreAllMocks();
 	});
 });
 
@@ -182,7 +186,6 @@ describe("C14/C20: the parent chain separates a text tie only when it itself dif
 		// "Giraffe" does — the tiebreak should pick it, not leave the tie unresolved.
 		expect(results[0]).toEqual({ tier: "positional", target: tuesdayMorningTask });
 
-		vi.restoreAllMocks();
 	});
 
 	it("a reverse-direction claim with a clear (non-tied) winner needs no tiebreak at all", async () => {
@@ -205,7 +208,6 @@ describe("C14/C20: the parent chain separates a text tie only when it itself dif
 		expect(results[0]).toEqual({ tier: "positional", target }); // the stronger claimant wins
 		expect(results[1]).toEqual({ tier: "none", reason: "no-candidate" }); // nothing else left
 
-		vi.restoreAllMocks();
 	});
 
 	it("an unseparated tie (chains equally (dis)similar) stays ambiguous", async () => {
@@ -221,7 +223,6 @@ describe("C14/C20: the parent chain separates a text tie only when it itself dif
 		const results = await matchAnchors(stored, candidates);
 		expect(results[0]).toEqual({ tier: "none", reason: "ambiguous" });
 
-		vi.restoreAllMocks();
 	});
 });
 
@@ -250,14 +251,72 @@ describe("Comparison memoization: a pair re-examined across deferred-acceptance 
 		expect(results[1]).toEqual({ tier: "none", reason: "ambiguous" }); // t2: tied for ca, every pass
 		expect(results[2]).toEqual({ tier: "positional", target: 1 }); // t3: wins cb cleanly in pass 1
 
-		// Each (anchor, candidate) *scoring* pair is only ever actually computed once, however
-		// many passes re-examine it: 6 distinct (anchor, candidate) pairs (t1/t2/t3 each
-		// against ca and cb) scored once apiece, plus the ca contest's chain-tiebreak call
-		// (not memoized, and not counted toward the comparisons budget either) repeating once
-		// per pass it's tied in — 2 claimants x 2 passes = 4. 6 + 4 = 10, not 6 + 6 = 12: the
-		// memo is what keeps pass 2's re-scoring of (t1, ca) and (t2, ca) from adding to this.
-		expect(spy.mock.calls.length).toBe(10);
+		// Each distinct comparison is only ever actually computed once, however many passes
+		// re-examine it: 6 distinct (anchor, candidate) text pairs (t1/t2/t3 each against ca and
+		// cb), plus the 2 distinct chain-tiebreak pairs of the ca contest (R12: the tiebreak goes
+		// through the same memoized budget, so pass 2's repeat of it is free). 6 + 2 = 8, not
+		// 6 + 4 = 10 (tiebreak unmemoized) and not 6 + 6 = 12 (nothing memoized).
+		expect(spy.mock.calls.length).toBe(8);
 
-		vi.restoreAllMocks();
+	});
+});
+
+describe("R15 (PR-4): the C14/C20 parent-chain tiebreak with real similarity() — nothing mocked", () => {
+	it("two equally good children are separated by how well their parent chains read, using real text", async () => {
+		// The stored task sat under `# Weekly review`. Neither new parent is close enough to
+		// resolve as that parent (real similarity: 0.30 and 0.08, under the 0.4 bar), so the
+		// child falls back to a file-wide search and finds two children tied on text. Only the
+		// parent *chains* differ: "heading:weekly planning and review of the quarter" reads closer
+		// to "heading:weekly review" (0.36) than "heading:garden" does (0.24), so it must win.
+		const stored = anchorsFrom("# Weekly review\n\t- [ ] send report now").filter((a) => a.kind === "task");
+		const candidates = anchorsFrom(
+			"# Garden\n\t- [ ] send report soon\n# Weekly planning and review of the quarter\n\t- [ ] send report soon",
+		);
+		const wanted = candidates.findIndex((a) => a.kind === "task" && a.parentChain[0]?.text.startsWith("weekly planning"));
+		expect(wanted).toBeGreaterThan(-1);
+
+		const results = await matchAnchors(stored, candidates);
+		expect(results[0]).toEqual({ tier: "positional", target: wanted });
+	});
+});
+
+describe("R14 (PR-4): one candidate is never claimed by two stored anchors (C9) in the exact tier", () => {
+	function targets(results: Awaited<ReturnType<typeof matchAnchors>>): number[] {
+		return results.flatMap((r) => (r.tier === "none" ? [] : [r.target]));
+	}
+
+	it("repro A: a fallback-scope anchor yields the candidate to the anchor whose parent really matched", async () => {
+		const stored = anchorsFrom("# Alpha\n- [ ] x\n# Beta\n- [ ] x").filter((a) => a.kind === "task");
+		const candidates = anchorsFrom("# Something entirely different\n# Beta\n- [ ] x");
+		const xIndex = candidates.findIndex((a) => a.kind === "task");
+
+		const results = await matchAnchors(stored, candidates);
+		expect(results[1]).toEqual({ tier: "exact", target: xIndex }); // Beta's own x
+		expect(results[0].tier).toBe("none"); // Alpha's x does not also map to it
+		expect(new Set(targets(results)).size).toBe(targets(results).length);
+	});
+
+	it("repro B: a candidate under a renamed-match parent goes to the anchor with identical ancestry", async () => {
+		const stored = anchorsFrom("# Home\n- [ ] x\n# Home base\n- [ ] x").filter((a) => a.kind === "task");
+		const candidates = anchorsFrom("# Home base\n- [ ] x");
+		const xIndex = candidates.findIndex((a) => a.kind === "task");
+
+		const results = await matchAnchors(stored, candidates);
+		expect(results[1]).toEqual({ tier: "exact", target: xIndex }); // `Home base > x` is identical
+		expect(results[0].tier).toBe("none");
+		expect(new Set(targets(results)).size).toBe(targets(results).length);
+	});
+
+	it("two anchors tied for the same best-fit candidate both come back ambiguous and the candidate stays unclaimed", async () => {
+		// Both stored `x` anchors have a parent (`# Home one`, `# Home two`) that no candidate
+		// parent equals; each resolves to the single `# Home` candidate by similarity, so both
+		// are real-scope with the same (different-from-the-candidate) ancestry rank.
+		const stored = anchorsFrom("# Home one\n- [ ] x\n# Home two\n- [ ] x").filter((a) => a.kind === "task");
+		const candidates = anchorsFrom("# Home\n- [ ] x");
+
+		const results = await matchAnchors(stored, candidates);
+		const claimed = targets(results);
+		expect(new Set(claimed).size).toBe(claimed.length); // never the same target twice
+		expect(claimed.length).toBeLessThanOrEqual(1);
 	});
 });

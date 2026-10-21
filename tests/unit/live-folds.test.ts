@@ -8,11 +8,49 @@
 import { describe, expect, it } from "vitest";
 import { EditorState } from "@codemirror/state";
 import type { AnchoredBlock } from "../../src/anchors";
-import { groupCandidatesByStartLine, resolveCandidateForLiveRange, widenLiveRangeToCandidate } from "../../src/live-folds";
+import {
+	foldSpanForLineRange,
+	groupCandidatesByStartLine,
+	liveFoldCoversCandidate,
+	resolveCandidateForLiveRange,
+	widenLiveRangeToCandidate,
+} from "../../src/live-folds";
 
 function stateFor(text: string): EditorState {
 	return EditorState.create({ doc: text });
 }
+
+describe("foldSpanForLineRange (PR-5 R4 / T132): trailing blank lines are never part of a fold", () => {
+	it("a buildAnchors range that swallows a blank separator folds to the last content line", () => {
+		// '# A\n- x\n  - y\n\n# B': x's buildAnchors range is lines 2-4 (blank line 4 included).
+		const doc = stateFor("# A\n- x\n  - y\n\n# B").doc;
+		const span = foldSpanForLineRange(doc, { startLine: 2, endLine: 4 });
+		expect(span).toEqual({ from: doc.line(2).to, to: doc.line(3).to });
+		expect(doc.sliceString(span!.from, span!.to)).toBe("\n  - y");
+	});
+
+	it("trims a whole run of blank (or whitespace-only) lines", () => {
+		const doc = stateFor("- x\n  - y\n\n   \n\n- z").doc;
+		expect(foldSpanForLineRange(doc, { startLine: 1, endLine: 5 })).toEqual({ from: doc.line(1).to, to: doc.line(2).to });
+	});
+
+	it("leaves a range that already ends on content untouched", () => {
+		const doc = stateFor("- x\n  - y\n- z").doc;
+		expect(foldSpanForLineRange(doc, { startLine: 1, endLine: 2 })).toEqual({ from: doc.line(1).to, to: doc.line(2).to });
+	});
+
+	it("returns null when only blank lines follow the first line (nothing to hide)", () => {
+		const doc = stateFor("- x\n\n\n- z").doc;
+		expect(foldSpanForLineRange(doc, { startLine: 1, endLine: 3 })).toBeNull();
+	});
+
+	it("returns null for a one-line range and for a range outside the document", () => {
+		const doc = stateFor("- x\n- z").doc;
+		expect(foldSpanForLineRange(doc, { startLine: 1, endLine: 1 })).toBeNull();
+		expect(foldSpanForLineRange(doc, { startLine: 1, endLine: 9 })).toBeNull();
+		expect(foldSpanForLineRange(doc, { startLine: 0, endLine: 2 })).toBeNull();
+	});
+});
 
 function block(startLine: number, endLine: number): AnchoredBlock {
 	return {
@@ -89,5 +127,20 @@ describe("groupCandidatesByStartLine", () => {
 		expect(grouped.get(1)).toEqual([a, b]);
 		expect(grouped.get(5)).toEqual([c]);
 		expect(grouped.get(2)).toBeUndefined();
+	});
+});
+
+describe("liveFoldCoversCandidate (PR-1 R4): a live fold and its buildAnchors candidate are the same block", () => {
+	// '# A\n- x\n  - y\n\n# B': x's candidate range is 2-4 (blank line 4 swallowed); its fold is 2-3.
+	const state = stateFor("# A\n- x\n  - y\n\n# B");
+
+	it.each([
+		{ name: "the identical range", live: { startLine: 2, endLine: 4 }, candidate: { startLine: 2, endLine: 4 }, expected: true },
+		{ name: "a fold trimmed of the trailing blank line", live: { startLine: 2, endLine: 3 }, candidate: { startLine: 2, endLine: 4 }, expected: true },
+		{ name: "a different start line", live: { startLine: 1, endLine: 3 }, candidate: { startLine: 2, endLine: 4 }, expected: false },
+		{ name: "a fold that stops short of non-blank content", live: { startLine: 2, endLine: 2 }, candidate: { startLine: 2, endLine: 4 }, expected: false },
+		{ name: "a fold wider than the candidate", live: { startLine: 2, endLine: 4 }, candidate: { startLine: 2, endLine: 3 }, expected: false },
+	])("$name -> $expected", ({ live, candidate, expected }) => {
+		expect(liveFoldCoversCandidate(state, live, candidate)).toBe(expected);
 	});
 });

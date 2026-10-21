@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App, type PluginManifest } from "obsidian";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding } from "@codemirror/language";
+import { codeFolding, foldedRanges } from "@codemirror/language";
 import { TFile as MockTFile, Vault as MockVault, Workspace as MockWorkspace, editorInfoField } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
 
@@ -205,6 +205,118 @@ describe("vault-events: rename (G9)", () => {
 			vi.useRealTimers();
 		},
 	);
+});
+
+describe("vault-events: rename inside a settle window (R7, PR-7)", () => {
+	it("re-targets the pending restore to the renamed path: the stored fold is applied and kept under the new key", async () => {
+		vi.useFakeTimers();
+		const app = new App();
+		setExists(app, "A.md");
+		const stored = {
+			value: {
+				version: 1,
+				files: {
+					"A.md": {
+						contentHash: "stale",
+						folds: [{ kind: "heading", indent: 0, text: "tuesday", siblingIndex: 0, parentChain: [] }],
+						dormant: [],
+					},
+				},
+			} as unknown,
+		};
+		const plugin = makePlugin(app, stored);
+		const registerEditorExtension = vi.spyOn(plugin, "registerEditorExtension");
+		await plugin.onload();
+		const watcherExtension = registerEditorExtension.mock.calls[0][0];
+
+		const fileRef = { path: "A.md", extension: "md" };
+		const view = new EditorView({
+			state: EditorState.create({
+				doc: "# Tuesday\nbody\n# Wednesday\nother",
+				extensions: [codeFolding(), watcherExtension as never, editorInfoField.init(() => ({ file: fileRef }))],
+			}),
+			parent: document.body,
+		});
+
+		// An external rewrite (Obsidian's reload shape: userEvent "set") starts the 150ms settle for "A.md".
+		view.dispatch({
+			changes: { from: view.state.doc.length, insert: " more" },
+			annotations: Transaction.userEvent.of("set"),
+		});
+		expect(foldedRanges(view.state).size).toBe(0);
+
+		// The rename lands before the timer fires; the pane now shows the same text under "B.md".
+		fileRef.path = "B.md";
+		triggerRename(app, "B.md", "A.md");
+		await vi.advanceTimersByTimeAsync(500);
+		await plugin.store.flush();
+
+		// The restore ran for B.md: the heading is folded (it used to be dropped, leaving the note unfolded).
+		const folded: [number, number][] = [];
+		foldedRanges(view.state).between(0, view.state.doc.length, (from, to) => void folded.push([from, to]));
+		expect(folded).toEqual([[9, 14]]); // end of "# Tuesday" .. end of "body"
+
+		const files = (stored.value as { files: Record<string, { contentHash: string; folds: unknown[] }> }).files;
+		expect(Object.keys(files)).toEqual(["B.md"]);
+		expect(files["B.md"].folds).toHaveLength(1);
+		expect(files["B.md"].contentHash).not.toBe("stale"); // refreshed against the new text
+
+		view.destroy();
+		document.body.replaceChildren();
+	});
+
+	it("still drops the pending restore when the pane moved to a different file (different text)", async () => {
+		vi.useFakeTimers();
+		const app = new App();
+		setExists(app, "A.md");
+		const stored = {
+			value: {
+				version: 1,
+				files: {
+					"A.md": {
+						contentHash: "stale",
+						folds: [{ kind: "heading", indent: 0, text: "tuesday", siblingIndex: 0, parentChain: [] }],
+						dormant: [],
+					},
+				},
+			} as unknown,
+		};
+		const plugin = makePlugin(app, stored);
+		const registerEditorExtension = vi.spyOn(plugin, "registerEditorExtension");
+		await plugin.onload();
+		const watcherExtension = registerEditorExtension.mock.calls[0][0];
+
+		const fileRef = { path: "A.md", extension: "md" };
+		const view = new EditorView({
+			state: EditorState.create({
+				doc: "# Tuesday\nbody\n# Wednesday\nother",
+				extensions: [codeFolding(), watcherExtension as never, editorInfoField.init(() => ({ file: fileRef }))],
+			}),
+			parent: document.body,
+		});
+		view.dispatch({
+			changes: { from: view.state.doc.length, insert: " more" },
+			annotations: Transaction.userEvent.of("set"),
+		});
+
+		// The pane switches to another file: same view, different path, and its text changed too.
+		fileRef.path = "C.md";
+		// (userEvent "input": an un-annotated replace would itself be a new non-user change and
+		// start its own settle for C.md, which is not what is under test.)
+		view.dispatch({
+			changes: { from: 0, to: view.state.doc.length, insert: "# Elsewhere\nx" },
+			annotations: Transaction.userEvent.of("input"),
+		});
+		await vi.advanceTimersByTimeAsync(500);
+		await plugin.store.flush();
+
+		expect(foldedRanges(view.state).size).toBe(0);
+		const files = (stored.value as { files: Record<string, unknown> }).files;
+		expect(Object.keys(files)).toEqual(["A.md"]); // nothing invented for C.md
+
+		view.destroy();
+		document.body.replaceChildren();
+	});
 });
 
 describe("vault-events: delete (G10)", () => {

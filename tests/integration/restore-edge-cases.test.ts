@@ -8,9 +8,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding, foldedRanges } from "@codemirror/language";
+import { codeFolding, foldEffect, foldedRanges } from "@codemirror/language";
 import { editorInfoField } from "../mocks/obsidian";
 import { FoldStore } from "../../src/fold-store";
+import { buildAnchors } from "../../src/anchors";
 import { createEditorWatcher } from "../../src/editor-watcher";
 import type { FileFoldRecord } from "../../src/types";
 
@@ -65,14 +66,15 @@ describe("restore edge cases: pane switched to a different file between the chan
 	it("is dropped without throwing: the view's active path no longer matches the settled path", async () => {
 		const store = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [TUESDAY_ANCHOR], dormant: [] } });
 
-		// A single mutable "current file" the mock editorInfoField reads, standing in for the
-		// pane being switched to a different open file after the change but before the settle.
-		let currentPath: string | null = NOTE_PATH;
+		// The mock editorInfoField's value is fixed when the state is created, so the pane
+		// "switching file" is modelled the way real Obsidian does it: the info object the field
+		// holds is mutated in place (its `file` is replaced) — see `info.file = ...` below.
+		const info: { file: { path: string; extension: string } | null } = { file: { path: NOTE_PATH, extension: "md" } };
 		const watcher = createEditorWatcher({ store, window });
 		const state = EditorState.create({
 			doc: BEFORE,
 			selection: { anchor: 0 },
-			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: currentPath ? { path: currentPath, extension: "md" } : null }))],
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => info)],
 		});
 		const view = new EditorView({ state, parent: document.body });
 
@@ -81,7 +83,7 @@ describe("restore edge cases: pane switched to a different file between the chan
 			annotations: Transaction.userEvent.of("set"),
 		});
 
-		currentPath = OTHER_PATH; // the pane now shows a different file, before the 150ms settle fires
+		info.file = { path: OTHER_PATH, extension: "md" }; // the pane now shows a different file, before the 150ms settle fires
 
 		await expect(settle()).resolves.toBeUndefined();
 		expect(liveFoldedRanges(view)).toEqual([]); // nothing was dispatched for the old path
@@ -173,5 +175,64 @@ describe("restore edge cases: idempotent re-apply against the real CM6 pipeline"
 		await settle();
 
 		expect(liveFoldedRanges(view)).toEqual(foldedAfterFirst);
+	});
+});
+
+describe("restore edge cases: R3 (PR-5) — a natively-ranged live fold is already folded", () => {
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	it("a fold that stops a blank line short of buildAnchors' range survives a non-user edit untouched: no second fold is dispatched", async () => {
+		const text = ["- [ ] Draft proposal", "\t- [ ] sub task", "", "- [ ] Send invoices"].join("\n");
+		const anchor = { kind: "task", indent: 0, text: "draft proposal", siblingIndex: 0, parentChain: [] };
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [anchor], dormant: [] } });
+		const cursorAt = text.length; // on the last line, clear of the folded block
+		const view = makeView(store, text, NOTE_PATH, cursorAt);
+
+		// The fold as Obsidian's own fold service makes it: from the end of the task's first
+		// line to the end of its last content line — NOT including the blank separator that
+		// buildAnchors' range for the same block swallows.
+		const firstLineEnd = text.indexOf("\n");
+		const lastContentEnd = text.indexOf("\n\n");
+		view.dispatch({ effects: foldEffect.of({ from: firstLineEnd, to: lastContentEnd }) });
+		const before = liveFoldedRanges(view);
+		expect(before).toEqual([{ from: firstLineEnd, to: lastContentEnd }]);
+
+		const dispatchSpy = vi.spyOn(view, "dispatch");
+		// A non-user edit (no userEvent annotation) that keeps the existing fold in place.
+		view.dispatch({ changes: { from: view.state.doc.length, insert: "\n- [ ] More" } });
+		dispatchSpy.mockClear();
+		await settle();
+
+		expect(dispatchSpy).not.toHaveBeenCalled(); // the restore dispatched nothing at all
+		expect(liveFoldedRanges(view)).toEqual(before); // still the one native fold, not widened or doubled
+	});
+});
+
+describe("restore edge cases: T132 (PR-5 R4) — a restored fold does not hide the trailing blank separator", () => {
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	it.each([
+		{ kind: "task", first: "- [ ] Draft proposal", anchor: { kind: "task", text: "draft proposal" } },
+		{ kind: "list", first: "- Draft proposal", anchor: { kind: "list", text: "draft proposal" } },
+	])("a restored $kind fold ends at its last content line; the blank line after it stays visible", async ({ first, anchor }) => {
+		const stored = { ...anchor, indent: 0, siblingIndex: 0, parentChain: [] };
+		const text = [first, "	- sub item", "", "- Send invoices"].join("\n");
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [stored], dormant: [] } });
+		const view = makeView(store, text, NOTE_PATH, text.length); // cursor on the last line, clear of the block
+
+		// An external rewrite: the whole buffer replaced with the same text plus a line at the end.
+		const rewritten = `${text}\n- Send receipts`;
+		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: rewritten }, annotations: Transaction.userEvent.of("set") });
+		await settle();
+
+		const doc = view.state.doc;
+		// buildAnchors' range for the block runs through the blank line 3 ...
+		expect(buildAnchors(rewritten).find((b) => b.range.startLine === 1)?.range).toEqual({ startLine: 1, endLine: 3 });
+		// ... but the fold the restore dispatched stops at line 2, the block's last content line.
+		expect(liveFoldedRanges(view)).toEqual([{ from: doc.line(1).to, to: doc.line(2).to }]);
 	});
 });

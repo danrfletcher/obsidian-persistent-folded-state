@@ -34,6 +34,12 @@ const FORBIDDEN: { label: string; pattern: RegExp }[] = [
 	{ label: "node:https import", pattern: /from\s+["'](node:)?https["']/ },
 	{ label: "node:net import", pattern: /from\s+["'](node:)?net["']/ },
 	{ label: "node:dgram import", pattern: /from\s+["'](node:)?dgram["']/ },
+	// R4: main.js is built as CJS (esbuild.config.mjs `format: "cjs"`), so a bundled network
+	// module shows up as `require("http")`, not `from "http"`. Checked for src/ too (harmless).
+	{ label: 'node:http require("http")', pattern: /\brequire\s*\(\s*["'](node:)?http["']\s*\)/ },
+	{ label: 'node:https require("https")', pattern: /\brequire\s*\(\s*["'](node:)?https["']\s*\)/ },
+	{ label: 'node:net require("net")', pattern: /\brequire\s*\(\s*["'](node:)?net["']\s*\)/ },
+	{ label: 'node:dgram require("dgram")', pattern: /\brequire\s*\(\s*["'](node:)?dgram["']\s*\)/ },
 	{ label: "posthog/analytics SDK", pattern: /posthog|mixpanel|segment\.io|amplitude|@sentry/i },
 ];
 
@@ -42,6 +48,26 @@ const UI_SURFACE: { label: string; pattern: RegExp }[] = [
 	{ label: "addStatusBarItem", pattern: /\baddStatusBarItem\s*\(/ },
 	{ label: "registerView", pattern: /\bregisterView\s*\(/ },
 ];
+
+describe("fence: the network patterns really match the shapes they exist to catch (R4)", () => {
+	it.each([
+		['import x from "http"', "node:http import"],
+		["import x from 'node:https'", "node:https import"],
+		['var import_http = require("http");', 'node:http require("http")'],
+		["var h = require('node:https');", 'node:https require("https")'],
+		['const n = require( "net" )', 'node:net require("net")'],
+		['const d = require("node:dgram")', 'node:dgram require("dgram")'],
+	])("%s is caught by %s", (sample, label) => {
+		const rule = FORBIDDEN.find((f) => f.label === label);
+		expect(rule).toBeDefined();
+		expect(sample).toMatch(rule!.pattern);
+	});
+
+	it("does not flag the externals the bundle legitimately requires", () => {
+		const bundleLike = 'require("obsidian"); require("@codemirror/state"); require("@codemirror/view"); require("httpx-not-a-module");';
+		for (const { pattern } of FORBIDDEN) expect(bundleLike).not.toMatch(pattern);
+	});
+});
 
 describe("fence: src/ never reaches for network or telemetry (F8)", () => {
 	it.each(FORBIDDEN)("does not contain $label", ({ pattern }) => {
@@ -77,6 +103,30 @@ describe("fence: manifest.json", () => {
 		expect(manifest.id).toBe("persistent-folded-state");
 		expect(manifest.minAppVersion).toBe("1.13.0");
 		expect(manifest.isDesktopOnly).toBe(false);
+	});
+
+	// T3 (PR-1 test round 1): the 1.13.0 floor is not arbitrary. `ButtonComponent.setDestructive()`
+	// (used by the settings tab and the confirmation modal) is `@since 1.13.0` in obsidian.d.ts;
+	// on an older app it is not a function, so opening the settings tab would throw. Lowering
+	// minAppVersion (to load in an older app such as 1.12.7) is only valid together with removing
+	// that call, so this ties the two together.
+	it("declares a minAppVersion no lower than the newest Obsidian API src calls (setDestructive, 1.13.0)", () => {
+		const toTuple = (v: string): number[] => v.split(".").map(Number);
+		const atLeast = (actual: string, floor: string): boolean => {
+			const a = toTuple(actual);
+			const f = toTuple(floor);
+			for (let i = 0; i < f.length; i++) {
+				if ((a[i] ?? 0) !== f[i]) return (a[i] ?? 0) > f[i];
+			}
+			return true;
+		};
+		expect(atLeast("1.13.0", "1.13.0")).toBe(true);
+		expect(atLeast("1.12.7", "1.13.0")).toBe(false);
+		expect(atLeast("1.14.4", "1.13.0")).toBe(true);
+
+		const usesSetDestructive = /\.setDestructive\s*\(/.test(srcText);
+		expect(usesSetDestructive).toBe(true); // if this ever fails, the floor can be re-derived and lowered
+		expect(atLeast(manifest.minAppVersion, "1.13.0")).toBe(true);
 	});
 });
 

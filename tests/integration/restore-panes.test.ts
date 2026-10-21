@@ -6,7 +6,7 @@
  * file would. No pane-to-pane wiring exists in this plugin at all (see the file comment in
  * src/fold-restorer.ts); this test is what proves that's sufficient.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldedRanges } from "@codemirror/language";
@@ -67,6 +67,7 @@ function externalRewrite(view: EditorView, text: string): void {
 
 describe("restore-panes (G11): one state per note, every pane restores to it", () => {
 	afterEach(() => {
+		vi.restoreAllMocks();
 		document.body.replaceChildren();
 	});
 
@@ -106,28 +107,44 @@ describe("restore-panes (G11): one state per note, every pane restores to it", (
 		// on (nothing further to assert on a destroyed view beyond "this didn't throw").
 	});
 
-	it("a split pane and a popout-window pane (different `window`) both restore the same way", async () => {
+	it("a split pane and a popout-window pane (a genuinely different `Window`) both restore the same way", async () => {
 		const store = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [TUESDAY_ANCHOR], dormant: [] } });
 		const splitPane = makePaneView(store, BEFORE);
 
-		// A popout window is a different `Window` object entirely; the watcher's own `window`
-		// dependency (used for the settle timer and the matcher's yieldToHost) is overridden
-		// the same way SettleDebouncer/FoldStore already support, per-pane.
-		const popoutWatcher = createEditorWatcher({ store, window });
+		// R6 (PR-5)/R8 (PR-2): a popout is a different `Window` with its own document. An iframe's
+		// content window is the jsdom equivalent. No `window` dep is passed, so the watcher must
+		// find the pane's own window from its DOM (`view.dom.ownerDocument.defaultView`).
+		const frame = document.createElement("iframe");
+		document.body.appendChild(frame);
+		const popoutWindow = frame.contentWindow as Window;
+		expect(popoutWindow).not.toBe(window);
+		const popoutSetTimeout = vi.spyOn(popoutWindow, "setTimeout");
+
+		const popoutWatcher = createEditorWatcher({ store });
 		const popoutState = EditorState.create({
 			doc: BEFORE,
 			selection: { anchor: BEFORE.length },
 			extensions: [codeFolding(), popoutWatcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
 		});
-		const popoutPane = new EditorView({ state: popoutState, parent: document.body });
+		const popoutPane = new EditorView({ state: popoutState, parent: popoutWindow.document.body });
+		expect(popoutPane.dom.ownerDocument.defaultView).toBe(popoutWindow);
 
 		const after = ["intro 1", "intro 2", "intro 3", "intro 4", ...BEFORE.split("\n"), "## Another"].join("\n");
+		popoutSetTimeout.mockClear();
 		externalRewrite(splitPane, after);
 		externalRewrite(popoutPane, after);
+
+		// The popout pane's 150ms settle timer is set on the popout's own window. (Only that
+		// side is asserted: jsdom's iframe timers delegate to the main window's setTimeout
+		// internally, so a main-window count would include the popout's own timer.)
+		const settleDelays = (spy: typeof popoutSetTimeout): number[] => spy.mock.calls.map((c) => c[1] as number).filter((ms) => ms === 150);
+		expect(settleDelays(popoutSetTimeout)).toHaveLength(1);
 
 		await settle();
 
 		expect(liveFoldedLineRanges(splitPane)).toEqual([{ startLine: 5, endLine: 10 }]);
 		expect(liveFoldedLineRanges(popoutPane)).toEqual(liveFoldedLineRanges(splitPane));
+		popoutPane.destroy();
+		vi.restoreAllMocks();
 	});
 });

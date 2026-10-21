@@ -121,24 +121,42 @@ describe("restore-cm6: E2 — a non-exact tie folds neither candidate", () => {
 	});
 
 	it("two equally-plausible renamed headings: neither is folded", async () => {
-		const before = ["## Alpha", "a body", "## Beta", "b body"].join("\n");
-		const anchor = { kind: "heading", indent: 0, text: "alpha", siblingIndex: 0, parentChain: [] };
+		const before = ["## Quarterly planning review alpha", "a body", "## Other", "b body"].join("\n");
+		// siblingIndex 5 matches no candidate's position, so the positional tier has nothing and
+		// the stored anchor can only be placed by the fuzzy tier (R5, PR-5: the previous fixture used
+		// a stored anchor at sibling index 0, which the first renamed heading matched positionally
+		// — the test only passed because the cursor on line 1 deferred every fold).
+		const anchor = { kind: "heading", indent: 0, text: "quarterly planning review alpha", siblingIndex: 5, parentChain: [] };
 		const { store } = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [anchor], dormant: [] } });
 		const view = makeView(store, before);
 
-		// Both headings are renamed to the exact same new text — "alpha" has nothing left to
-		// exact/positionally prefer one over the other on text alone, and a top-level anchor's
-		// positional tier only ever has itself to compare against at its own (unique) sibling
-		// index, so this is engineered to land as an ambiguous *fuzzy* tie instead: give both
-		// candidates equally similar (but not identical) text to "alpha".
-		const after = ["## Alphx", "a body", "## Alphy", "b body"].join("\n");
+		// Two headings equally (and sufficiently) similar to the stored text: a fuzzy tie.
+		const after = ["## Quarterly planning review alphx", "a body", "## Quarterly planning review alphy", "b body"].join("\n");
 		view.dispatch({
 			changes: { from: 0, to: view.state.doc.length, insert: after },
 			annotations: Transaction.userEvent.of("set"),
+			selection: { anchor: view.state.doc.length }, // cursor away from both headings
 		});
 
 		await settle();
 		expect(liveFoldedRanges(view)).toHaveLength(0);
+	});
+
+	it("control: the same document with a single unambiguous rename does fold (the tie test is not vacuous)", async () => {
+		const before = ["## Quarterly planning review alpha", "a body", "## Other", "b body"].join("\n");
+		const anchor = { kind: "heading", indent: 0, text: "quarterly planning review alpha", siblingIndex: 5, parentChain: [] };
+		const { store } = await makeStore({ [NOTE_PATH]: { contentHash: "x", folds: [anchor], dormant: [] } });
+		const view = makeView(store, before);
+
+		const after = ["## Quarterly planning review alphx", "a body", "## Other", "b body"].join("\n");
+		view.dispatch({
+			changes: { from: 0, to: view.state.doc.length, insert: after },
+			annotations: Transaction.userEvent.of("set"),
+			selection: { anchor: view.state.doc.length },
+		});
+
+		await settle();
+		expect(liveFoldedRanges(view)).toHaveLength(1);
 	});
 });
 
