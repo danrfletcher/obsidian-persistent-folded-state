@@ -33,6 +33,7 @@
  * self-diagnosing. The jsdom tests cover the logic; the real-Obsidian run is the tester's.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { posix } from "node:path";
 
 /** @typedef {{ send: (method: string, params?: Record<string, unknown>, opts?: { timeoutMs?: number }) => Promise<any>, close: () => void }} Cdp */
 
@@ -203,6 +204,139 @@ export function hashText(text) {
 	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
 	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
 	return (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
+}
+
+/** @param {StoredDataLike | null} data @param {string} vaultPath the key the plugin stores the
+ * note under (`resolveNote` derives it) @param {string} dataPath only used in the message
+ * @returns {StoredFileRecordLike} the record, or throws naming the key that was looked up and the
+ * keys data.json actually holds — so a mismatch between the note a probe folded and the note it
+ * is checking reads as exactly that (T100), not as "no stored entry". */
+export function requireRecord(data, vaultPath, dataPath) {
+	const record = data?.files[vaultPath];
+	if (record) return record;
+	const keys = data ? Object.keys(data.files) : null;
+	throw new Error(
+		`no stored entry for the vault path ${JSON.stringify(vaultPath)} in ${dataPath} ` +
+			(keys === null ? "(the file is missing or unreadable)" : `(it holds: ${JSON.stringify(keys)})`),
+	);
+}
+
+// --- which note a probe is acting on (T99/T100/T102) ------------------------------------------
+//
+// Every fold step below acts on the *active* editor, and the plugin stores a note's folds under
+// `file.path` — its path relative to the vault root. A probe that is given an absolute `--note`
+// path only wrote that file on disk; nothing opened it, so the editor it folded could be any
+// other open note, and the data.json key it then looked up was a hand-typed constant that
+// matched neither. The probes folded one note, rewrote another and read a third's record.
+// `resolveNote` / `useNote` close that: the key is derived from the vault root Obsidian reports,
+// and the note is made the active editor (and confirmed) before any fold step.
+
+/** The vault-relative key for `notePath`, the way Obsidian names the file (`TFile.path`: forward
+ * slashes, no leading slash, relative to the vault root). Pure. Throws when the note is not
+ * inside the vault, naming both paths.
+ * @param {string} basePath the vault root as Obsidian reports it @param {string} notePath */
+export function vaultPathForNote(basePath, notePath) {
+	const slashes = (p) => p.replace(/\\/g, "/");
+	const base = slashes(basePath).replace(/\/+$/, "");
+	const note = slashes(notePath);
+	if (base === "" || !note.startsWith(`${base}/`) || note.length === base.length + 1) {
+		throw new Error(`the note ${JSON.stringify(notePath)} is not inside the vault root ${JSON.stringify(basePath)}`);
+	}
+	return note.slice(base.length + 1);
+}
+
+const VAULT_BASE_PATH_EXPRESSION = `
+(function () {
+	const adapter = typeof app !== "undefined" && app.vault && app.vault.adapter;
+	if (!adapter) return { basePath: null };
+	return { basePath: typeof adapter.getBasePath === "function" ? adapter.getBasePath() : (adapter.basePath || null) };
+})()
+`;
+
+/** Makes `vaultPath` the active markdown editor and waits until Obsidian says so. Async —
+ * evaluate with `awaitPromise: true`. Result `{opened, activePath, reason?}`; `activePath` is
+ * what the active editor really shows, so a failure names the note it fell back to. */
+export function openNoteExpression(vaultPath, { timeoutMs = 5000, pollMs = 100 } = {}) {
+	return `
+(async function () {
+	const path = ${JSON.stringify(vaultPath)};
+	const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+	const activePath = () => {
+		const info = app.workspace.activeEditor;
+		return info && info.file && info.editor && info.editor.cm ? info.file.path : null;
+	};
+	const deadline = Date.now() + ${Number(timeoutMs)};
+	// A note just written on disk is not in the vault index until Obsidian's watcher sees it.
+	let file = app.vault.getAbstractFileByPath(path);
+	while (!file && Date.now() < deadline) {
+		await pause(${Number(pollMs)});
+		file = app.vault.getAbstractFileByPath(path);
+	}
+	if (!file) return { opened: false, activePath: activePath(), reason: "the vault has no file at " + path };
+	if (activePath() !== path) {
+		const shown = app.workspace.getLeavesOfType("markdown").find((leaf) => leaf.view && leaf.view.file && leaf.view.file.path === path);
+		const leaf = shown || app.workspace.getLeaf(false);
+		if (!shown) await leaf.openFile(file);
+		app.workspace.setActiveLeaf(leaf, { focus: true });
+	}
+	while (activePath() !== path && Date.now() < deadline) await pause(${Number(pollMs)});
+	return activePath() === path
+		? { opened: true, activePath: path }
+		: { opened: false, activePath: activePath(), reason: "the active editor never switched to " + path };
+})()
+`;
+}
+
+/** Where tests/e2e/rename-delete.e2e.ts renames and moves a note, from the note's own vault key:
+ * a same-folder rename ("<name> Q4.md") and a move into an "Archive" folder that sits beside the
+ * note's own folder (Projects/Quarry/Tasks.md -> Projects/Archive/Tasks Q4.md). The Archive
+ * folder is part of the answer so the caller creates it before moving (T101).
+ * @param {string} vaultPath
+ * @returns {{ renamed: string, archiveFolder: string, moved: string }} */
+export function renameDeletePaths(vaultPath) {
+	const dir = posix.dirname(vaultPath);
+	const renamedName = `${posix.basename(vaultPath, ".md")} Q4.md`;
+	const archiveFolder = posix.join(posix.dirname(dir), "Archive");
+	return { renamed: posix.join(dir, renamedName), archiveFolder, moved: posix.join(archiveFolder, renamedName) };
+}
+
+/** Creates the folder `vaultPath` through Obsidian's own vault (so its index knows about it)
+ * unless it already exists. Async — evaluate with `awaitPromise: true`. */
+export function ensureFolderExpression(vaultPath) {
+	return `
+(async function () {
+	const path = ${JSON.stringify(vaultPath)};
+	if (app.vault.getAbstractFileByPath(path)) return { ok: true, created: false };
+	await app.vault.createFolder(path);
+	return { ok: true, created: true };
+})()
+`;
+}
+
+/** The vault root as Obsidian reports it, and the key the plugin would store `notePath` under.
+ * Does not open anything.
+ * @param {Cdp} cdp @param {string} notePath
+ * @returns {Promise<{ basePath: string, vaultPath: string }>} */
+export async function resolveNote(cdp, notePath) {
+	const { basePath } = await evaluate(cdp, VAULT_BASE_PATH_EXPRESSION);
+	if (!basePath) throw new Error("Obsidian did not report a vault root (app.vault.adapter.getBasePath)");
+	return { basePath, vaultPath: vaultPathForNote(basePath, notePath) };
+}
+
+/** `resolveNote`, then makes the note the active editor. Throws (naming the key and the note the
+ * editor actually shows) when it cannot — a probe must never fold one note and check another.
+ * @param {Cdp} cdp @param {string} notePath @param {{ timeoutMs?: number, pollMs?: number }} [options]
+ * @returns {Promise<{ basePath: string, vaultPath: string }>} */
+export async function useNote(cdp, notePath, options = {}) {
+	const resolved = await resolveNote(cdp, notePath);
+	const opened = await evaluate(cdp, openNoteExpression(resolved.vaultPath, options), { awaitPromise: true });
+	if (!opened.opened) {
+		throw new Error(
+			`could not make ${JSON.stringify(resolved.vaultPath)} the active editor: ${opened.reason}` +
+				` (the active editor shows ${JSON.stringify(opened.activePath)})`,
+		);
+	}
+	return resolved;
 }
 
 // --- page-side fold helpers ---------------------------------------------------------------
