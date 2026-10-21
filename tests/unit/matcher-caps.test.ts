@@ -74,6 +74,53 @@ describe("E6 C22: at most maxComparisons similarity() calls per run", () => {
 		}
 	});
 
+	it("R12: ancestor resolution and the parent-chain tiebreak count toward the cap too (every similarity() call does)", async () => {
+		// Renamed parents force fuzzy ancestor resolution; the children then need tier 2/3 too.
+		const stored = anchorsFrom(
+			Array.from({ length: 6 }, (_, i) => `# Section number ${i} old\n\t- [ ] child task ${i} before`).join("\n"),
+		).filter((a) => a.kind === "task");
+		const candidates = anchorsFrom(
+			Array.from({ length: 6 }, (_, i) => `# Section number ${i} new\n\t- [ ] child task ${i} after`).join("\n"),
+		);
+
+		for (const cap of [1, 4, 9, 20]) {
+			const spy = vi.spyOn(similarityModule, "similarity"); // real implementation, just counted
+			const results = await matchAnchors(stored, candidates, { maxComparisons: cap });
+			expect(spy.mock.calls.length, `cap ${cap}`).toBeLessThanOrEqual(cap);
+			for (const result of results) {
+				if (result.tier !== "none") expect(candidates[result.target].kind).toBe("task");
+			}
+			spy.mockRestore();
+		}
+	});
+
+	it("R12: the yield cadence counts ancestor and tiebreak comparisons too — no chunk of consecutive similarity() calls is longer than chunkSize", async () => {
+		const stored = anchorsFrom(
+			Array.from({ length: 6 }, (_, i) => `# Section number ${i} old\n\t- [ ] child task ${i} before`).join("\n"),
+		).filter((a) => a.kind === "task");
+		const candidates = anchorsFrom(
+			Array.from({ length: 6 }, (_, i) => `# Section number ${i} new\n\t- [ ] child task ${i} after`).join("\n"),
+		);
+
+		const events: string[] = [];
+		const real = similarityModule.similarity;
+		vi.spyOn(similarityModule, "similarity").mockImplementation((a, b) => {
+			events.push("call");
+			return real(a, b);
+		});
+		await matchAnchors(stored, candidates, { chunkSize: 3, yieldToHost: () => void events.push("yield") });
+		vi.restoreAllMocks();
+
+		let run = 0;
+		let longest = 0;
+		for (const event of events) {
+			run = event === "yield" ? 0 : run + 1;
+			longest = Math.max(longest, run);
+		}
+		expect(events.filter((e) => e === "call").length).toBeGreaterThan(3);
+		expect(longest).toBeLessThanOrEqual(3);
+	});
+
 	it("MAX_COMPARISONS defaults to 5000", async () => {
 		const { MAX_COMPARISONS } = await import("../../src/matcher");
 		expect(MAX_COMPARISONS).toBe(5000);

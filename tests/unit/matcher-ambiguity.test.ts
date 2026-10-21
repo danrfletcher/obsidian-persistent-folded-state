@@ -250,13 +250,12 @@ describe("Comparison memoization: a pair re-examined across deferred-acceptance 
 		expect(results[1]).toEqual({ tier: "none", reason: "ambiguous" }); // t2: tied for ca, every pass
 		expect(results[2]).toEqual({ tier: "positional", target: 1 }); // t3: wins cb cleanly in pass 1
 
-		// Each (anchor, candidate) *scoring* pair is only ever actually computed once, however
-		// many passes re-examine it: 6 distinct (anchor, candidate) pairs (t1/t2/t3 each
-		// against ca and cb) scored once apiece, plus the ca contest's chain-tiebreak call
-		// (not memoized, and not counted toward the comparisons budget either) repeating once
-		// per pass it's tied in — 2 claimants x 2 passes = 4. 6 + 4 = 10, not 6 + 6 = 12: the
-		// memo is what keeps pass 2's re-scoring of (t1, ca) and (t2, ca) from adding to this.
-		expect(spy.mock.calls.length).toBe(10);
+		// Each distinct comparison is only ever actually computed once, however many passes
+		// re-examine it: 6 distinct (anchor, candidate) text pairs (t1/t2/t3 each against ca and
+		// cb), plus the 2 distinct chain-tiebreak pairs of the ca contest (R12: the tiebreak goes
+		// through the same memoized budget, so pass 2's repeat of it is free). 6 + 2 = 8, not
+		// 6 + 4 = 10 (tiebreak unmemoized) and not 6 + 6 = 12 (nothing memoized).
+		expect(spy.mock.calls.length).toBe(8);
 
 		vi.restoreAllMocks();
 	});
