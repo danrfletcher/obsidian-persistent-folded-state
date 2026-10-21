@@ -13,7 +13,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding, foldedRanges } from "@codemirror/language";
+import { codeFolding, foldEffect, foldedRanges } from "@codemirror/language";
 import { editorInfoField } from "../mocks/obsidian";
 import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
@@ -126,5 +126,37 @@ describe("golden path GP1-GP3 (tasks-before.md -> tasks-after.md)", () => {
 
 		// The stored content hash is refreshed to the settled (GP2) text (PR-7's hook).
 		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(AFTER));
+	});
+
+	it("GP1 -> GP3 round trip: folds the user makes are recorded through the recorder (describeFold), and that stored state alone drives the restore after the external rewrite", async () => {
+		const store = await makeStore({}); // nothing seeded by hand: the recorder must create every entry
+		const view = makeView(store);
+
+		// The user folds "## Tuesday" and "- [ ] Draft proposal" as a fold command or gutter click
+		// would: end of the block's first line to end of its last content line, no annotation.
+		const before = buildAnchors(BEFORE);
+		const doc = view.state.doc;
+		for (const wanted of [
+			(a: Anchor) => a.kind === "task" && a.text === "draft proposal",
+			(a: Anchor) => a.kind === "heading" && a.text === "tuesday",
+		]) {
+			const { range } = findOneBlock(before, wanted);
+			view.dispatch({ effects: foldEffect.of({ from: doc.line(range.startLine).to, to: doc.line(range.endLine).to }) });
+		}
+		const recorded = (store.get(NOTE_PATH)?.folds ?? []).map((f) => (f as unknown as Anchor).text).sort();
+		expect(recorded).toEqual(["draft proposal", "tuesday"]);
+
+		view.dispatch({
+			changes: { from: 0, to: view.state.doc.length, insert: AFTER },
+			annotations: Transaction.userEvent.of("set"),
+		});
+		await settle();
+
+		expect(view.state.doc.toString()).toBe(AFTER);
+		const afterBlocks = buildAnchors(AFTER);
+		const folded = liveFoldedLineRanges(view);
+		expect(folded).toContainEqual(findOneBlock(afterBlocks, (a) => a.kind === "heading" && a.text === "tuesday").range);
+		expect(folded).toContainEqual(findOneBlock(afterBlocks, (a) => a.kind === "task" && a.text === "draft proposal v2").range);
+		expect(folded).not.toContainEqual(findOneBlock(afterBlocks, (a) => a.kind === "task" && a.text === "send invoices").range);
 	});
 });

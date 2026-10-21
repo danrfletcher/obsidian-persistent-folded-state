@@ -159,8 +159,14 @@ function unfoldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof 
 }
 
 function dispatchFoldAndUnfold(view: EditorView, toFold: readonly LineRange[], toUnfold: readonly LineRange[]): void {
+	// Fold effects are sorted into document order: CM6's fold state throws on an unsorted batch
+	// (see dispatchFoldTargets in src/fold-restorer.ts), and stored anchors are in fold order.
+	const foldEffects = toFold
+		.map((range) => foldEffectFor(view, range))
+		.filter((effect): effect is NonNullable<typeof effect> => effect !== null)
+		.sort((a, b) => a.value.from - b.value.from || a.value.to - b.value.to);
 	const effects = [
-		...toFold.map((range) => foldEffectFor(view, range)),
+		...foldEffects,
 		...toUnfold.map((range) => unfoldEffectFor(view, range)),
 	].filter((effect): effect is NonNullable<typeof effect> => effect !== null);
 	if (effects.length === 0) return;

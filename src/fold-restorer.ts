@@ -188,7 +188,13 @@ function dispatchFoldTargets(view: EditorView, targets: readonly { range: LineRa
 	if (targets.length === 0) return;
 	const effects = targets
 		.map((target) => foldEffectFor(view, target.range))
-		.filter((effect): effect is NonNullable<typeof effect> => effect !== null);
+		.filter((effect): effect is NonNullable<typeof effect> => effect !== null)
+		// CM6's fold state adds every fold effect of one transaction with a single unsorted
+		// `RangeSet.update({ add })`, which throws "Ranges must be added sorted by `from`" for
+		// effects out of document order — and stored anchors are in the order the user folded
+		// them (task before its heading is the ordinary case), not document order. A throw here
+		// loses the whole restore, so the effects are sorted.
+		.sort((a, b) => a.value.from - b.value.from || a.value.to - b.value.to);
 	if (effects.length === 0) return;
 	view.dispatch({ effects, annotations: OWN_FOLD_ANNOTATION.of(true) });
 }
