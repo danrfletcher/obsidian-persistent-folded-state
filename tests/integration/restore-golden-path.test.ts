@@ -13,7 +13,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding, foldEffect, foldedRanges } from "@codemirror/language";
+import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { editorInfoField } from "../mocks/obsidian";
 import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
@@ -43,10 +43,10 @@ async function makeStore(seed: Record<string, FileFoldRecord>): Promise<FoldStor
 	return store;
 }
 
-function makeView(store: FoldStore): EditorView {
+function makeView(store: FoldStore, doc: string = BEFORE): EditorView {
 	const watcher = createEditorWatcher({ store, window });
 	const state = EditorState.create({
-		doc: BEFORE,
+		doc,
 		selection: { anchor: 0 }, // line 1 ("---"), well before "## Tuesday" either way
 		extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
 	});
@@ -158,5 +158,95 @@ describe("golden path GP1-GP3 (tasks-before.md -> tasks-after.md)", () => {
 		expect(folded).toContainEqual(findOneBlock(afterBlocks, (a) => a.kind === "heading" && a.text === "tuesday").range);
 		expect(folded).toContainEqual(findOneBlock(afterBlocks, (a) => a.kind === "task" && a.text === "draft proposal v2").range);
 		expect(folded).not.toContainEqual(findOneBlock(afterBlocks, (a) => a.kind === "task" && a.text === "send invoices").range);
+	});
+
+	// R1 (PR-1 review round 1) — regression guards for the stale-entry handling of PR-5 R8
+	// (resolveStaleEntryKey in the recorder, the restore-time re-key, restoreRefoldedEntries).
+
+	/** Folds the block matching `wanted` in `text` the way a gutter click does. */
+	function userFold(view: EditorView, text: string, wanted: (a: Anchor) => boolean): void {
+		const { range } = findOneBlock(buildAnchors(text), wanted);
+		const doc = view.state.doc;
+		view.dispatch({ effects: foldEffect.of({ from: doc.line(range.startLine).to, to: doc.line(range.endLine).to }) });
+	}
+
+	/** Unfolds whichever live fold covers `range`'s first line, as the user's unfold click does. */
+	function userUnfold(view: EditorView, range: { startLine: number }): void {
+		const doc = view.state.doc;
+		const lineEnd = doc.line(range.startLine).to;
+		let target: { from: number; to: number } | null = null;
+		foldedRanges(view.state).between(0, doc.length, (from, to) => {
+			if (from === lineEnd) target = { from, to };
+		});
+		expect(target).not.toBeNull();
+		view.dispatch({ effects: unfoldEffect.of(target as unknown as { from: number; to: number }) });
+	}
+
+	const isDraft = (a: Anchor): boolean => a.kind === "task" && a.text === "draft proposal";
+	const isDraftV2 = (a: Anchor): boolean => a.kind === "task" && a.text === "draft proposal v2";
+
+	function externalRewrite(view: EditorView, text: string): void {
+		view.dispatch({
+			changes: { from: 0, to: view.state.doc.length, insert: text },
+			annotations: Transaction.userEvent.of("set"),
+		});
+	}
+
+	it("R1: fold Draft proposal -> external rewrite to v2 -> user unfold leaves zero stored folds, and a second external rewrite leaves it unfolded", async () => {
+		const store = await makeStore({});
+		const view = makeView(store);
+		userFold(view, BEFORE, isDraft);
+		expect((store.get(NOTE_PATH)?.folds ?? []).map((f) => (f as unknown as Anchor).text)).toEqual(["draft proposal"]);
+
+		externalRewrite(view, AFTER);
+		await settle();
+		const v2Range = findOneBlock(buildAnchors(AFTER), isDraftV2).range;
+		expect(liveFoldedLineRanges(view)).toContainEqual(v2Range); // restored by fuzzy match
+
+		userUnfold(view, v2Range);
+		expect(liveFoldedLineRanges(view)).not.toContainEqual(v2Range);
+		expect(store.get(NOTE_PATH)?.folds ?? []).toHaveLength(0); // no stale "draft proposal" entry left
+
+		// A second external rewrite (an unrelated line changes) must not fold it again.
+		const secondRewrite = AFTER.replace("owner: dan", "owner: dan2");
+		expect(secondRewrite).not.toBe(AFTER);
+		externalRewrite(view, secondRewrite);
+		await settle();
+		expect(view.state.doc.toString()).toBe(secondRewrite);
+		expect(liveFoldedLineRanges(view)).toHaveLength(0);
+		expect(store.get(NOTE_PATH)?.folds ?? []).toHaveLength(0);
+	});
+
+	it("R1: the restore re-keys the stored entry to the block it matched, so the stored fold reads 'draft proposal v2'", async () => {
+		const store = await makeStore({});
+		const view = makeView(store);
+		userFold(view, BEFORE, isDraft);
+
+		externalRewrite(view, AFTER);
+		await settle();
+
+		const texts = (store.get(NOTE_PATH)?.folds ?? []).map((f) => (f as unknown as Anchor).text);
+		expect(texts).toEqual(["draft proposal v2"]);
+	});
+
+	it("R1: re-folding a block whose stored entry is stale replaces that entry rather than adding a second", async () => {
+		// The note already reads "Draft proposal v2" but the store still holds the entry recorded
+		// under the old text, and no fold is live (e.g. the restore never matched it).
+		const draftAnchor = findOneBlock(buildAnchors(BEFORE), isDraft).anchor;
+		const store = await makeStore({
+			[NOTE_PATH]: {
+				contentHash: hashText(BEFORE),
+				folds: [draftAnchor] as unknown as Record<string, unknown>[],
+				dormant: [],
+			},
+		});
+		const view = makeView(store, AFTER);
+		expect(liveFoldedLineRanges(view)).toHaveLength(0);
+
+		userFold(view, AFTER, isDraftV2);
+
+		const folds = (store.get(NOTE_PATH)?.folds ?? []).map((f) => f as unknown as Anchor);
+		expect(folds).toHaveLength(1);
+		expect(folds[0].text).toBe("draft proposal v2");
 	});
 });

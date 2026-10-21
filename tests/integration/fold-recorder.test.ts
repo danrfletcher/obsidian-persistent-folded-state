@@ -269,18 +269,15 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 			view.dispatch({ effects: [unfoldEffect.of(liveFolded[0])] });
 
 			// R4: the *other* stored fold — never touched by this transaction at all — must
-			// survive. This is the actual guarantee R4 restores: handling one fold/unfold never
-			// rewrites (and so never erases) anything the transaction's own effects didn't
-			// mention. Whether the drifted entry itself is also removed is a separate, known
-			// limitation: once a folded block's own text changes in an earlier, untouched
-			// transaction, the recorder (which matches by structural identity, not by CM6's
-			// live decoration position) can no longer recognise a later unfold at that position
-			// as targeting the same stored anchor — reconciling identity across a text edit is
-			// the matcher's job (PR-4's fuzzy tiers), not the recorder's; the stale entry is
-			// simply left for the next restore to resolve, the same as any other anchor whose
-			// text has drifted since it was last recorded.
-			const remaining = store.get(NOTE_PATH)?.folds ?? [];
-			expect(remaining.some((entry) => (entry as { kind: string }).kind === "task")).toBe(true);
+			// survive: handling one fold/unfold never rewrites (and so never erases) anything the
+			// transaction's own effects didn't mention.
+			// R8 (PR-5): and the drifted entry itself is removed too. The recorder resolves the
+			// unfolded block ("## Tuesday v2") to the one stored entry no current block accounts for
+			// (same kind and ancestry, text similar enough), so no stale "## Tuesday" entry is left to
+			// re-fold the block on the next external write. That leaves exactly the task.
+			const remaining = (store.get(NOTE_PATH)?.folds ?? []) as { kind: string }[];
+			expect(remaining).toHaveLength(1);
+			expect(remaining[0].kind).toBe("task");
 		});
 	});
 
