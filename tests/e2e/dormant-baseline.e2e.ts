@@ -335,6 +335,21 @@ const READ_VISIBLE_LINES_EXPRESSION = `
 JSON.stringify(Array.from(document.querySelectorAll(".cm-line")).map((el) => el.textContent))
 `;
 
+/** T1 (PR-1 test round 1): CM6 drops a fold whose range contains the selection head, so a fold
+ * click made while the cursor sits inside the block reports `clicked: true` and then leaves the
+ * block unfolded. Park the cursor on the note's "# " title line, which lies outside every
+ * foldable block of tests/fixtures/tasks-before.md, before folding anything. */
+const PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION = `
+(function () {
+	const editor = app.workspace.activeEditor && app.workspace.activeEditor.editor;
+	if (!editor) return { parked: false, reason: "no active editor" };
+	const lines = editor.getValue().split("\\n");
+	const title = lines.findIndex((line) => /^# /.test(line));
+	editor.setCursor({ line: title >= 0 ? title : 0, ch: 0 });
+	return { parked: true, line: title >= 0 ? title : 0 };
+})()
+`;
+
 function disablePluginExpression(): string {
 	return `
 (async function () {
@@ -414,6 +429,10 @@ async function runCase(
 	// 2.5. R9(c): guarantee a clean, fully-unfolded starting point for the clicks below,
 	// regardless of whatever an earlier case in this same run left folded live.
 	await evaluate(cdp, unfoldAllExpression());
+	await sleep(args.waitMs);
+	const cursor = (await evaluate(cdp, PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION)) as { parked: boolean; reason?: string };
+	if (!cursor.parked) problems.push(`could not park the cursor outside the folds: ${cursor.reason ?? "unknown"}`);
+	await sleep(args.waitMs);
 
 	// 3. Fold the task and its sibling list item by hand (native CM6 fold, same as a user
 	// would) — the plugin is disabled, so neither fold is recorded yet; both should still be
@@ -425,6 +444,7 @@ async function runCase(
 		reason?: string;
 	};
 	if (!listClick.clicked) problems.push(`list fold click failed: ${listClick.reason ?? "unknown"}`);
+	await sleep(args.waitMs);
 	const taskClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"))) as {
 		clicked: boolean;
 		reason?: string;

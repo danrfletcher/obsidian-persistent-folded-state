@@ -20,10 +20,12 @@
  *                      ticked, a new child appended under "Send invoices") by writing the file
  *                      from outside Obsidian, then waits for the plugin's settle window plus
  *                      match time.
- *   --phase verify     GP3: reads the DOM again and checks: "## Tuesday" and "Draft proposal v2"
- *                      still have their interior lines hidden; "Send invoices" and its new child
- *                      are both rendered (visible); the file on disk is byte-identical to what
- *                      --phase rewrite wrote (F1 — nothing added).
+ *   --phase verify     GP3: reads the DOM again and checks: "## Tuesday" is still folded; then
+ *                      expands it (T2: "Send invoices" and its new child are nested inside
+ *                      Tuesday's foldable range, so they are only rendered once it is expanded)
+ *                      and checks "Draft proposal v2" still has its own fold while "Send invoices"
+ *                      and its new child are both rendered; the file on disk is byte-identical to
+ *                      what --phase rewrite wrote (F1 — nothing added).
  *   --phase report      (re)writes docs/restore-golden-path.md from the gathered state.
  *   --phase all          setup + rewrite + verify + report in one Obsidian session (the default).
  *
@@ -233,27 +235,60 @@ function visibleLinesInclude(visibleLines, needle) {
 	return visibleLines.some((line) => line.includes(needle));
 }
 
+/** T1 (PR-1 test round 1): CM6 drops a fold whose range contains the selection head, so a fold
+ * click made while the cursor sits inside the block (a cursor left over from an earlier run, or
+ * one Obsidian restored when it reopened the note) reports `clicked: true` and then leaves the
+ * block unfolded. Park the cursor on the note's "# " title line, which lies outside every
+ * foldable block of tests/fixtures/tasks-before.md, before folding anything. */
+const PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION = `
+(function () {
+	const editor = app.workspace.activeEditor && app.workspace.activeEditor.editor;
+	if (!editor) return { parked: false, reason: "no active editor" };
+	const lines = editor.getValue().split("\\n");
+	const title = lines.findIndex((line) => /^# /.test(line));
+	editor.setCursor({ line: title >= 0 ? title : 0, ch: 0 });
+	return { parked: true, line: title >= 0 ? title : 0 };
+})()
+`;
+
+async function readVisibleLines(cdp) {
+	return JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
+}
+
+/** Clicks the fold indicator of the first rendered line containing `needle`, then confirms from
+ * the DOM that `hiddenNeedle` is no longer rendered. A click that reports `clicked: true` but
+ * folded nothing is reported as `folded: false` instead of passing silently (T1). */
+async function foldAndConfirm(cdp, needle, hiddenNeedle, waitMs) {
+	const click = await evaluate(cdp, clickFoldIndicatorNearExpression(needle));
+	await sleep(waitMs);
+	const visibleLines = await readVisibleLines(cdp);
+	return { ...click, folded: click.clicked && !visibleLinesInclude(visibleLines, hiddenNeedle) };
+}
+
 async function runSetup(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
+		const cursor = await evaluate(cdp, PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION);
+		await sleep(args.waitMs);
 		// T1 (PR-5): Draft proposal first, then Tuesday. Tasks.md has no heading after "## Tuesday",
 		// so Tuesday's fold hides every line below it, Draft proposal's included — clicking
 		// Tuesday first leaves nothing to click for the task and GP1 never gets its second fold.
-		const draftClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"));
-		await sleep(args.waitMs);
-		const tuesdayClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"));
-		await sleep(args.waitMs);
+		const draftClick = await foldAndConfirm(cdp, "Draft proposal", "Outline", args.waitMs);
+		const tuesdayClick = await foldAndConfirm(cdp, "Tuesday", "Notes for Tuesday", args.waitMs);
 
-		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
+		const visibleLines = await readVisibleLines(cdp);
 		state.setup = {
 			note,
+			cursor,
 			tuesdayClick,
 			draftClick,
-			// GP1's own check: Tuesday's and Draft proposal's interior lines are hidden; Send
-			// invoices (never folded) is still rendered.
+			// GP1's own check: Tuesday's and Draft proposal's interior lines are hidden.
 			tuesdayBodyHidden: !visibleLinesInclude(visibleLines, "Notes for Tuesday"),
 			draftChildrenHidden: !visibleLinesInclude(visibleLines, "Outline"),
-			sendInvoicesVisible: visibleLinesInclude(visibleLines, "Send invoices"),
+			// T2 (PR-1 test round 1): "Send invoices" sits inside "## Tuesday"'s foldable range (the
+			// fixture has no later heading), so it is hidden by Tuesday's own fold and cannot be
+			// asserted visible here. It is checked in --phase verify, after Tuesday is expanded.
+			sendInvoicesHiddenByTuesday: !visibleLinesInclude(visibleLines, "Send invoices"),
 		};
 	});
 }
@@ -275,18 +310,32 @@ async function runRewrite(args, state) {
 async function runVerify(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
-		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
+		const foldedLines = await readVisibleLines(cdp);
 		const onDiskText = readFileSync(note, "utf8");
 		const expectedText = state.rewrite?.afterText;
 
+		// T2 (PR-1 test round 1): "Send invoices" and its new child are nested inside "## Tuesday"'s
+		// foldable range (no later heading), so while Tuesday is folded they are not rendered at
+		// all — that is the fold working, not the restore failing. Expand Tuesday (not Draft
+		// proposal v2, whose own fold must stay put) to read the nested lines, the same way a user
+		// would see GP3's described state.
+		const tuesdayStillFolded = !visibleLinesInclude(foldedLines, "Notes for Tuesday");
+		const expand = await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"));
+		await sleep(Math.max(args.waitMs, 500));
+		const expandedLines = expand.clicked ? await readVisibleLines(cdp) : [];
+
 		state.verify = {
 			note,
-			// GP3: Tuesday and "Draft proposal v2" stay folded (interior lines still hidden).
-			tuesdayStillFolded: !visibleLinesInclude(visibleLines, "Notes for Tuesday"),
-			draftProposalV2StillFolded: !visibleLinesInclude(visibleLines, "Outline") && !visibleLinesInclude(visibleLines, "Review"),
-			// Send invoices was never folded and gets no new fold — its new child is visible.
-			sendInvoicesVisible: visibleLinesInclude(visibleLines, "Send invoices"),
-			followUpCallVisible: visibleLinesInclude(visibleLines, "Follow up call"),
+			expand,
+			// GP3: Tuesday stays folded across the rewrite (checked before expanding it)...
+			tuesdayStillFolded,
+			// ...and "Draft proposal v2" has its own fold (its sub-tasks stay hidden once Tuesday
+			// is expanded — while Tuesday is folded they are hidden by it, which proves nothing).
+			draftProposalV2StillFolded:
+				expand.clicked && !visibleLinesInclude(expandedLines, "Outline") && !visibleLinesInclude(expandedLines, "Review"),
+			// Send invoices was never folded and gets no new fold — it and its new child render.
+			sendInvoicesVisible: visibleLinesInclude(expandedLines, "Send invoices"),
+			followUpCallVisible: visibleLinesInclude(expandedLines, "Follow up call"),
 			// F1: the file on disk is exactly what --phase rewrite wrote — nothing added.
 			fileByteIdentical: expectedText !== undefined ? onDiskText === expectedText : null,
 		};
@@ -301,11 +350,12 @@ function renderReport(state) {
 
 	const setupSection = section("GP1 (--phase setup)", state.setup, (d) => [
 		`- Note: \`${d.note}\``,
-		`- Clicked Tuesday's fold indicator: ${JSON.stringify(d.tuesdayClick)}`,
-		`- Clicked Draft proposal's fold indicator: ${JSON.stringify(d.draftClick)}`,
+		`- Cursor parked outside every fold: ${JSON.stringify(d.cursor)}`,
+		`- Clicked Draft proposal's fold indicator (first): ${JSON.stringify(d.draftClick)}`,
+		`- Clicked Tuesday's fold indicator (second): ${JSON.stringify(d.tuesdayClick)}`,
 		`- Tuesday's body hidden: ${d.tuesdayBodyHidden}`,
 		`- Draft proposal's children hidden: ${d.draftChildrenHidden}`,
-		`- Send invoices visible (never folded): ${d.sendInvoicesVisible}`,
+		`- Send invoices hidden by Tuesday's fold (it is nested in Tuesday; not a failure): ${d.sendInvoicesHiddenByTuesday}`,
 	].join("\n"));
 
 	const rewriteSection = section("GP2 (--phase rewrite)", state.rewrite, (d) => [
@@ -316,13 +366,17 @@ function renderReport(state) {
 
 	const verifySection = section("GP3 (--phase verify)", state.verify, (d) => [
 		`- Tuesday still folded: ${d.tuesdayStillFolded}`,
-		`- Draft proposal v2 still folded: ${d.draftProposalV2StillFolded}`,
-		`- Send invoices visible: ${d.sendInvoicesVisible}`,
+		`- Expanded Tuesday to read its nested lines: ${JSON.stringify(d.expand)}`,
+		`- Draft proposal v2 still folded (checked with Tuesday expanded): ${d.draftProposalV2StillFolded}`,
+		`- Send invoices visible (with Tuesday expanded): ${d.sendInvoicesVisible}`,
 		`- "Follow up call" (new child) visible: ${d.followUpCallVisible}`,
 		`- File on disk byte-identical to what --phase rewrite wrote (F1): ${d.fileByteIdentical}`,
 	].join("\n"));
 
 	const overallPass =
+		state.setup &&
+		state.setup.draftClick.folded &&
+		state.setup.tuesdayClick.folded &&
 		state.verify &&
 		state.verify.tuesdayStillFolded &&
 		state.verify.draftProposalV2StillFolded &&
@@ -332,7 +386,7 @@ function renderReport(state) {
 
 	return `# GP1-GP3: the golden path, proven against real Obsidian
 
-Outcome: ${state.verify ? (overallPass ? "**pass**" : "**fail — see GP3 below**") : "PENDING — not yet run"}
+Outcome: ${state.verify ? (overallPass ? "**pass**" : "**fail — see GP1/GP3 below**") : "PENDING — not yet run"}
 
 ## How this was captured
 

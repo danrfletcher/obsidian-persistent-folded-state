@@ -305,6 +305,33 @@ function visibleLinesInclude(visibleLines, needle) {
 	return visibleLines.some((line) => line.includes(needle));
 }
 
+/** T1 (PR-1 test round 1): CM6 drops a fold whose range contains the selection head, so a fold
+ * click made while the cursor sits inside the block (a cursor left over from an earlier scenario,
+ * or one Obsidian restored when the note was reopened) reports `clicked: true` and then leaves
+ * the block unfolded — the "re-enable over an open pane" case saw exactly that, with the plugin
+ * disabled the whole time. Park the cursor on the note's "# " title line, which lies outside
+ * every foldable block of tests/fixtures/tasks-before.md, before folding anything. */
+const PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION = `
+(function () {
+	const editor = app.workspace.activeEditor && app.workspace.activeEditor.editor;
+	if (!editor) return { parked: false, reason: "no active editor" };
+	const lines = editor.getValue().split("\\n");
+	const title = lines.findIndex((line) => /^# /.test(line));
+	editor.setCursor({ line: title >= 0 ? title : 0, ch: 0 });
+	return { parked: true, line: title >= 0 ? title : 0 };
+})()
+`;
+
+/** Clicks the fold indicator of the first rendered line containing `needle`, then confirms from
+ * the DOM that `hiddenNeedle` is no longer rendered: a click that reports `clicked: true` but
+ * folded nothing comes back as `folded: false` rather than passing silently (T1). */
+async function foldAndConfirm(cdp, needle, hiddenNeedle, waitMs) {
+	const click = await evaluate(cdp, clickFoldIndicatorNearExpression(needle));
+	await sleep(waitMs);
+	const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
+	return { ...click, folded: click.clicked && !visibleLinesInclude(visibleLines, hiddenNeedle) };
+}
+
 /** Disables then re-enables this plugin through Obsidian's own public `app.plugins` API — the
  * closest a non-interactive script can get, without a full relaunch, to "this plugin sees an
  * already-folded note for the first time": every open pane's `ViewPlugin` (including its
@@ -417,13 +444,13 @@ async function runBaseline(args, state) {
 		await sleep(args.waitMs);
 		const disabled = await evaluate(cdp, disablePluginExpression(), { awaitPromise: true });
 		if (existsSync(data)) unlinkSync(data); // cleared while disabled
-		const taskClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"));
+		const cursor = await evaluate(cdp, PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION);
 		await sleep(args.waitMs);
+		const taskClick = await foldAndConfirm(cdp, "Draft proposal", "Outline", args.waitMs);
 		// "Tuesday", not "## Tuesday": Live Preview hides a heading's "## " on lines the cursor isn't on,
 		// so the rendered .cm-line reads just "Tuesday" (same needle as e2e-restore-probe.mjs). In
 		// tasks-before.md the heading is the first line containing it.
-		const headingClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"));
-		await sleep(args.waitMs);
+		const headingClick = await foldAndConfirm(cdp, "Tuesday", "Notes for Tuesday", args.waitMs);
 		const enabled = await evaluate(cdp, enablePluginExpression(), { awaitPromise: true });
 		await sleep(args.waitMs);
 		const reopened = reopen ? await evaluate(cdp, closeAndReopenExpression(DEFAULT_NOTE_VAULT_PATH), { awaitPromise: true }) : null;
@@ -435,6 +462,7 @@ async function runBaseline(args, state) {
 		return {
 			label,
 			disabled,
+			cursor,
 			taskClick,
 			headingClick,
 			enabled,
@@ -592,7 +620,7 @@ function renderReport(state) {
 				[
 					`#### ${c.label}`,
 					`- Note: \`${d.note}\``,
-					`- Plugin disabled, data.json cleared, task then heading folded, plugin re-enabled${c.reopened ? ", note closed and reopened" : ""}: ${JSON.stringify({ disabled: c.disabled, taskClick: c.taskClick, headingClick: c.headingClick, enabled: c.enabled, reopened: c.reopened })}`,
+					`- Plugin disabled, data.json cleared, task then heading folded, plugin re-enabled${c.reopened ? ", note closed and reopened" : ""}: ${JSON.stringify({ disabled: c.disabled, cursor: c.cursor, taskClick: c.taskClick, headingClick: c.headingClick, enabled: c.enabled, reopened: c.reopened })}`,
 					`- data.json has an entry for the note: ${c.recordExists}`,
 					`- Stored non-frontmatter anchors: ${c.anchorCount} (expect 2: ${JSON.stringify(c.anchorKinds)})`,
 					`- Stored contentHash matches the file on disk: ${c.contentHashMatchesDisk}`,

@@ -333,6 +333,41 @@ const READ_VISIBLE_LINES_EXPRESSION = `
 JSON.stringify(Array.from(document.querySelectorAll(".cm-line")).map((el) => el.textContent))
 `;
 
+/** T1 (PR-1 test round 1): CM6 drops a fold whose range contains the selection head, so a fold
+ * click made while the cursor sits inside the block (a cursor left over from an earlier run, or
+ * one Obsidian restored when it reopened the note) reports `clicked: true` and then leaves the
+ * block unfolded. Park the cursor on the note's "# " title line, which lies outside every
+ * foldable block of tests/fixtures/tasks-before.md, before folding anything. */
+const PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION = `
+(function () {
+	const editor = app.workspace.activeEditor && app.workspace.activeEditor.editor;
+	if (!editor) return { parked: false, reason: "no active editor" };
+	const lines = editor.getValue().split("\\n");
+	const title = lines.findIndex((line) => /^# /.test(line));
+	editor.setCursor({ line: title >= 0 ? title : 0, ch: 0 });
+	return { parked: true, line: title >= 0 ? title : 0 };
+})()
+`;
+
+/** Clicks the fold indicator of the first rendered line containing `needle`, then confirms from
+ * the DOM that `hiddenNeedle` is no longer rendered. A click that reports `clicked: true` but
+ * folded nothing fails loudly with what was (not) hidden, instead of surfacing later as a
+ * missing stored anchor (T1). */
+async function foldAndConfirm(cdp: CdpConnection, needle: string, hiddenNeedle: string, waitMs: number): Promise<void> {
+	const click = (await evaluate(cdp, clickFoldIndicatorNearExpression(needle))) as {
+		clicked: boolean;
+		reason?: string;
+	};
+	if (!click.clicked) throw new Error(`folding "${needle}" failed: ${click.reason ?? "unknown"}`);
+	await sleep(waitMs);
+	const lines = JSON.parse((await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION)) as string) as string[];
+	if (lines.some((line) => line.includes(hiddenNeedle))) {
+		throw new Error(
+			`clicked the fold indicator for "${needle}" but "${hiddenNeedle}" is still rendered — the block did not fold`,
+		);
+	}
+}
+
 function unfoldAllExpression(): string {
 	return `
 (function () {
@@ -350,6 +385,7 @@ async function runBeforeQuit(args: Args): Promise<void> {
 
 	await withConnection(args.cdpPort, async (cdp) => {
 		await evaluate(cdp, unfoldAllExpression());
+		await sleep(args.waitMs);
 
 		// GP1-GP3's own baseline: fold "## Tuesday" and the task "Draft proposal", leave the
 		// sibling task "Send invoices" unfolded — exactly GP4's own starting point. Needle is
@@ -366,17 +402,14 @@ async function runBeforeQuit(args: Args): Promise<void> {
 		// so that click always fails with "no rendered .cm-line contains ...". Folding the
 		// nested task first, then the heading that contains it, works every time (the same
 		// order the tester's own manual verification already used).
-		const taskClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"))) as {
-			clicked: boolean;
-			reason?: string;
-		};
-		if (!taskClick.clicked) throw new Error(`folding "Draft proposal" failed: ${taskClick.reason ?? "unknown"}`);
-		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as {
-			clicked: boolean;
-			reason?: string;
-		};
-		if (!tuesdayClick.clicked) throw new Error(`folding "## Tuesday" failed: ${tuesdayClick.reason ?? "unknown"}`);
-
+		// T1: park the cursor outside every foldable block, and let each step settle (and be
+		// confirmed from the DOM) before the next, rather than firing unfold-all and both clicks
+		// back to back and discovering a missing fold only in data.json.
+		const cursor = (await evaluate(cdp, PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION)) as { parked: boolean; reason?: string };
+		if (!cursor.parked) throw new Error(`could not park the cursor outside the folds: ${cursor.reason ?? "unknown"}`);
+		await sleep(args.waitMs);
+		await foldAndConfirm(cdp, "Draft proposal", "Outline", args.waitMs);
+		await foldAndConfirm(cdp, "Tuesday", "Notes for Tuesday", args.waitMs);
 		await sleep(args.waitMs);
 
 		const data = readPluginData(args.data);
