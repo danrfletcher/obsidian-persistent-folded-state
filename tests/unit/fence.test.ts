@@ -104,6 +104,30 @@ describe("fence: manifest.json", () => {
 		expect(manifest.minAppVersion).toBe("1.13.0");
 		expect(manifest.isDesktopOnly).toBe(false);
 	});
+
+	// T3 (PR-1 test round 1): the 1.13.0 floor is not arbitrary. `ButtonComponent.setDestructive()`
+	// (used by the settings tab and the confirmation modal) is `@since 1.13.0` in obsidian.d.ts;
+	// on an older app it is not a function, so opening the settings tab would throw. Lowering
+	// minAppVersion (to load in an older app such as 1.12.7) is only valid together with removing
+	// that call, so this ties the two together.
+	it("declares a minAppVersion no lower than the newest Obsidian API src calls (setDestructive, 1.13.0)", () => {
+		const toTuple = (v: string): number[] => v.split(".").map(Number);
+		const atLeast = (actual: string, floor: string): boolean => {
+			const a = toTuple(actual);
+			const f = toTuple(floor);
+			for (let i = 0; i < f.length; i++) {
+				if ((a[i] ?? 0) !== f[i]) return (a[i] ?? 0) > f[i];
+			}
+			return true;
+		};
+		expect(atLeast("1.13.0", "1.13.0")).toBe(true);
+		expect(atLeast("1.12.7", "1.13.0")).toBe(false);
+		expect(atLeast("1.14.4", "1.13.0")).toBe(true);
+
+		const usesSetDestructive = /\.setDestructive\s*\(/.test(srcText);
+		expect(usesSetDestructive).toBe(true); // if this ever fails, the floor can be re-derived and lowered
+		expect(atLeast(manifest.minAppVersion, "1.13.0")).toBe(true);
+	});
 });
 
 describe("fence: built main.js (run `npm run build` first)", () => {
