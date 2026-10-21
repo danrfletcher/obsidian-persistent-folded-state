@@ -2,9 +2,11 @@
  * Shared plumbing for the real-Obsidian probes and e2e scripts (scripts/e2e-*-probe.mjs,
  * tests/e2e/*.e2e.ts): the Chrome DevTools Protocol client, plugin data.json helpers, and the
  * page-side fold helpers. One copy, so a fix lands everywhere at once. PR-1 (polish) T63 moved
- * the CDP client here from scripts/e2e-reload-probe.mjs (PR-2's original) and deleted the four
- * later copies (restore probe, dormant-baseline probe, and the dormant-baseline, relaunch and
- * rename-delete e2e scripts).
+ * the CDP client here from scripts/e2e-reload-probe.mjs (PR-2's original) and deleted the copies
+ * in the restore probe, the dormant-baseline probe and tests/e2e/dormant-baseline.e2e.ts; R3
+ * did the same for tests/e2e/relaunch.e2e.ts and tests/e2e/rename-delete.e2e.ts, which had kept
+ * their own CDP client and their own document-wide fold helpers. tests/unit/e2e-scripts.test.ts
+ * fails if any script grows its own copy again.
  *
  * Plain ES module with no side effects on import and no dependency on src/*, so it runs under
  * plain Node, type-stripped `.ts` e2e scripts, and vitest (tests/unit/e2e-lib.test.ts drives the

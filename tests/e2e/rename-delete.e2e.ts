@@ -5,9 +5,10 @@
  * `scripts/e2e-*-probe.mjs` in this repo drives a real action — see the file comment on
  * `--vault-cli` below for why "the Obsidian CLI" the spec names is read this way), then reads
  * `data.json` and reopens the note at each new path. Same CDP/data.json plumbing style as
- * `tests/e2e/dormant-baseline.e2e.ts` and `tests/e2e/relaunch.e2e.ts` (each script keeps its own
- * copy rather than sharing a module — see those files' own comments for why). Kept runnable as
- * plain Node + type-stripped TypeScript, no build step.
+ * `tests/e2e/dormant-baseline.e2e.ts` and `tests/e2e/relaunch.e2e.ts`: the shared helper
+ * scripts/e2e-lib.mjs supplies the CDP client, the data.json helpers and the fold steps (scoped
+ * to the active editor and confirmed from the DOM — PR-1 polish R3). Kept runnable as plain
+ * Node + type-stripped TypeScript, no build step.
  *
  * Judgement call: Obsidian the desktop app has no separate command-line executable that renames,
  * moves or deletes a vault file on its own — "through the Obsidian CLI" is read here as "through
@@ -48,6 +49,16 @@
 import { copyFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	evaluate,
+	foldAndConfirm,
+	parkCursorOutsideFolds,
+	readPluginData,
+	readVisibleLines,
+	sleep,
+	unfoldAll,
+	withConnection,
+} from "../../scripts/e2e-lib.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PLUGIN_ID = "persistent-folded-state";
@@ -55,147 +66,6 @@ const DEFAULT_NOTE_PATH = "/config/test-vault/Projects/Quarry/Tasks.md";
 const DEFAULT_VAULT_PATH = "Projects/Quarry/Tasks.md";
 const DEFAULT_DATA_PATH = `/config/test-vault/.obsidian/plugins/${PLUGIN_ID}/data.json`;
 const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
-
-// --- CDP (own copy — see the file comment above for why) ---------------------------------------
-
-interface CdpTarget {
-	type: string;
-	webSocketDebuggerUrl?: string;
-}
-
-interface CdpConnection {
-	send: (method: string, params?: Record<string, unknown>, opts?: { timeoutMs?: number }) => Promise<unknown>;
-	close: () => void;
-}
-
-async function findDebuggableTarget(cdpPort: number): Promise<CdpTarget> {
-	const res = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
-	if (!res.ok) throw new Error(`CDP target list request failed: HTTP ${res.status}`);
-	const targets = (await res.json()) as CdpTarget[];
-	const target = targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-	if (!target) throw new Error("no debuggable Obsidian window found on that CDP port");
-	return target;
-}
-
-function connectCdp(webSocketDebuggerUrl: string): CdpConnection {
-	const ws = new WebSocket(webSocketDebuggerUrl);
-	let nextId = 1;
-	const pending = new Map<number, { resolve: (value: unknown) => void; reject: (err: Error) => void }>();
-	let closed = false;
-
-	function rejectAllPending(err: Error): void {
-		for (const { reject } of pending.values()) reject(err);
-		pending.clear();
-	}
-
-	ws.addEventListener("message", (event: MessageEvent) => {
-		const message = JSON.parse(String(event.data)) as { id?: number; error?: { message: string }; result?: unknown };
-		if (message.id && pending.has(message.id)) {
-			const entry = pending.get(message.id);
-			pending.delete(message.id);
-			if (!entry) return;
-			if (message.error) entry.reject(new Error(message.error.message));
-			else entry.resolve(message.result);
-		}
-	});
-	ws.addEventListener("close", () => {
-		closed = true;
-		rejectAllPending(new Error("CDP socket closed"));
-	});
-	ws.addEventListener("error", () => rejectAllPending(new Error("CDP socket error")));
-
-	const ready = new Promise<void>((resolve, reject) => {
-		ws.addEventListener("open", () => resolve());
-		ws.addEventListener("error", (err) => reject(err instanceof Error ? err : new Error(String(err))));
-	});
-
-	async function send(
-		method: string,
-		params: Record<string, unknown> = {},
-		opts: { timeoutMs?: number } = {},
-	): Promise<unknown> {
-		const timeoutMs = opts.timeoutMs ?? 10000;
-		await ready;
-		if (closed) throw new Error(`CDP socket already closed, cannot send ${method}`);
-		const id = nextId++;
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				pending.delete(id);
-				reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
-			}, timeoutMs);
-			pending.set(id, {
-				resolve: (value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
-				reject: (err) => {
-					clearTimeout(timer);
-					reject(err);
-				},
-			});
-			ws.send(JSON.stringify({ id, method, params }));
-		});
-	}
-
-	return {
-		send,
-		close: () => {
-			if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
-		},
-	};
-}
-
-async function evaluate(
-	cdp: CdpConnection,
-	expression: string,
-	opts: { awaitPromise?: boolean } = {},
-): Promise<unknown> {
-	await cdp.send("Runtime.enable");
-	const result = (await cdp.send("Runtime.evaluate", {
-		expression,
-		returnByValue: true,
-		awaitPromise: opts.awaitPromise ?? false,
-	})) as { exceptionDetails?: unknown; result: { value: unknown } };
-	if (result.exceptionDetails) throw new Error(`Runtime.evaluate threw: ${JSON.stringify(result.exceptionDetails)}`);
-	return result.result.value;
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withConnection<T>(cdpPort: number, fn: (cdp: CdpConnection) => Promise<T>): Promise<T> {
-	const target = await findDebuggableTarget(cdpPort);
-	if (!target.webSocketDebuggerUrl) throw new Error("debuggable target has no webSocketDebuggerUrl");
-	const cdp = connectCdp(target.webSocketDebuggerUrl);
-	try {
-		return await fn(cdp);
-	} finally {
-		cdp.close();
-	}
-}
-
-// --- this plugin's own data.json (read directly from the host filesystem) ----------------------
-
-interface StoredFileRecordLike {
-	contentHash: string;
-	folds: { kind?: string }[];
-	dormant: unknown[];
-}
-
-interface StoredDataLike {
-	version: number;
-	files: Record<string, StoredFileRecordLike>;
-}
-
-function readPluginData(dataPath: string): StoredDataLike | null {
-	if (!existsSync(dataPath)) return null;
-	try {
-		return JSON.parse(readFileSync(dataPath, "utf8")) as StoredDataLike;
-	} catch {
-		return null;
-	}
-}
 
 // --- CLI ----------------------------------------------------------------------------------
 
@@ -245,35 +115,6 @@ function printUsage(): void {
 }
 
 // --- page-side expressions -----------------------------------------------------------------
-
-function clickFoldIndicatorNearExpression(needle: string): string {
-	return `
-(function () {
-	const needle = ${JSON.stringify(needle)};
-	const lines = Array.from(document.querySelectorAll(".cm-line"));
-	const target = lines.find((el) => el.textContent && el.textContent.includes(needle));
-	if (!target) return { clicked: false, reason: \`no rendered .cm-line contains "\${needle}"\` };
-	const indicator = target.querySelector(".cm-fold-indicator .collapse-indicator") ||
-		target.closest(".cm-line")?.previousElementSibling?.querySelector?.(".cm-fold-indicator .collapse-indicator");
-	if (!indicator) return { clicked: false, reason: \`found the line but no fold-indicator on/near it\` };
-	indicator.click();
-	return { clicked: true };
-})()
-`;
-}
-
-const READ_VISIBLE_LINES_EXPRESSION = `
-JSON.stringify(Array.from(document.querySelectorAll(".cm-line")).map((el) => el.textContent))
-`;
-
-function unfoldAllExpression(): string {
-	return `
-(function () {
-	app.commands.executeCommandById("editor:unfold-all");
-	return { unfolded: true };
-})()
-`;
-}
 
 /** Obsidian's own rename/move API (see the file comment for why this, not a second hand-rolled
  * path) — `fileManager.renameFile` is what Obsidian's file-explorer rename/drag-to-move both
@@ -345,16 +186,26 @@ async function main(): Promise<void> {
 		};
 		if (!opened.opened) throw new Error(`initial open failed: ${opened.reason ?? "unknown"}`);
 		await sleep(args.waitMs);
-		await evaluate(cdp, unfoldAllExpression());
-		// T7: "Draft proposal" is folded *before* "## Tuesday" — in the real fixture, "Draft
-		// proposal" is a task nested directly under "## Tuesday" with nothing else between
-		// them, so folding the heading first removes the task's own line from the rendered DOM
-		// before the second click ever runs. See tests/e2e/relaunch.e2e.ts's own comment on
-		// the same reorder for the full explanation.
-		const taskClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"))) as { clicked: boolean; reason?: string };
-		if (!taskClick.clicked) throw new Error(`folding "Draft proposal" failed: ${taskClick.reason ?? "unknown"}`);
-		const tuesdayClick = (await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"))) as { clicked: boolean; reason?: string };
-		if (!tuesdayClick.clicked) throw new Error(`folding "## Tuesday" failed: ${tuesdayClick.reason ?? "unknown"}`);
+		// R3: start from a note Obsidian did not restore (partly) folded — a fold click on a block
+		// that is still folded would *unfold* it — then park the cursor outside every foldable
+		// block (CM6 drops a fold that contains the selection head, T1) and fold each block with
+		// e2e-lib's foldAndConfirm: scoped to the active editor, polled, confirmed from the DOM,
+		// with the editor:toggle-fold fallback. A block that did not fold throws here, with a DOM
+		// diagnostic, instead of surfacing later as a missing stored entry.
+		const unfold = await unfoldAll(cdp, ["Outline", "Notes for Tuesday"], { waitMs: args.waitMs });
+		if (!unfold.unfolded) throw new Error(`could not unfold the note first; still hidden: ${JSON.stringify(unfold.missing)}`);
+		const cursor = await parkCursorOutsideFolds(cdp);
+		if (!cursor.parked) throw new Error(`could not park the cursor outside the folds: ${cursor.reason ?? "unknown"}`);
+		await sleep(args.waitMs);
+		// T7: "Draft proposal" is folded *before* "## Tuesday" — it is a task nested directly
+		// under the heading, so folding the heading first removes its line from the rendered DOM.
+		for (const [needle, hidden] of [
+			["Draft proposal", "Outline"],
+			["Tuesday", "Notes for Tuesday"],
+		] as const) {
+			const step = await foldAndConfirm(cdp, needle, hidden, { waitMs: args.waitMs });
+			if (!step.folded) throw new Error(`folding "${needle}" did not take: ${JSON.stringify(step)}`);
+		}
 		await sleep(args.waitMs);
 
 		let data = readPluginData(args.data);
@@ -387,8 +238,7 @@ async function main(): Promise<void> {
 		};
 		if (!reopened.opened) problems.push(`reopening the renamed file failed: ${reopened.reason ?? "unknown"}`);
 		await sleep(args.waitMs);
-		const visibleAfterRenameRaw = (await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION)) as string;
-		const visibleAfterRename: string[] = JSON.parse(visibleAfterRenameRaw);
+		const visibleAfterRename = await readVisibleLines(cdp);
 		if (visibleAfterRename.some((line) => line.includes("Notes for Tuesday"))) {
 			problems.push("G9: \"## Tuesday\" is not folded after the rename — its body is visible");
 		}
