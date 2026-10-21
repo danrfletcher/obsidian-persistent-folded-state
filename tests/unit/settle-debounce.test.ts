@@ -108,4 +108,34 @@ describe("SettleDebouncer: E9 timing rules", () => {
 
 		expect(calls).toEqual(["setTimeout", "clearTimeout"]);
 	});
+
+	it("R8: a window resolver is consulted on every trigger, and cancel clears on the window the timer was set on", () => {
+		const log: string[] = [];
+		const makeWindow = (name: string) =>
+			({
+				setTimeout: (cb: () => void, ms: number) => {
+					log.push(`${name}.setTimeout`);
+					return window.setTimeout(cb, ms);
+				},
+				clearTimeout: (id: number) => {
+					log.push(`${name}.clearTimeout`);
+					window.clearTimeout(id);
+				},
+			}) as unknown as Window;
+		const main = makeWindow("main");
+		const popout = makeWindow("popout");
+		let current = main;
+
+		const onSettle = vi.fn();
+		const debouncer = new SettleDebouncer<string>(onSettle, 150, () => current);
+		debouncer.trigger("a"); // on main
+		current = popout; // the pane moved into a popout window
+		debouncer.cancel(); // must clear on main, where the timer lives
+		debouncer.trigger("b"); // now on popout
+		vi.advanceTimersByTime(150);
+
+		expect(log).toEqual(["main.setTimeout", "main.clearTimeout", "popout.setTimeout"]);
+		expect(onSettle).toHaveBeenCalledTimes(1);
+		expect(onSettle).toHaveBeenCalledWith("b");
+	});
 });

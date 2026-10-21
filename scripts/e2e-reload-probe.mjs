@@ -86,6 +86,7 @@
  * is still starting back up.
  */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { buildExternalRewrite } from "./e2e-external-rewrite.mjs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -369,11 +370,14 @@ async function readLog(cdp) {
 	return JSON.parse(await evaluate(cdp, READ_LOG_EXPRESSION));
 }
 
+/** R7(a): writes the spec's rewrite (a line inserted above, a task renamed, a child appended —
+ * scripts/e2e-external-rewrite.mjs) to the note on disk. `before` is returned so the caller can
+ * put the fixture back afterwards instead of leaving the probe's edits in it on every run. */
 function externallyRewrite(notePath) {
 	const before = readFileSync(notePath, "utf8");
-	const rewritten = `<!-- e2e-reload-probe external write at ${new Date().toISOString()} -->\n${before}`;
-	writeFileSync(notePath, rewritten, "utf8");
-	return { before, after: rewritten };
+	const { after, renamedTask } = buildExternalRewrite(before, new Date().toISOString());
+	writeFileSync(notePath, after, "utf8");
+	return { before, after, renamedTask };
 }
 
 function summarizeWindow(entries) {
@@ -415,16 +419,23 @@ async function runExternalWrite(args, state) {
 		if (install.error) throw new Error(install.error);
 
 		const writeStartedAt = Date.now();
-		externallyRewrite(note);
+		const { before, after } = externallyRewrite(note);
 		await sleep(args.waitMs);
 
 		const log = await readLog(cdp);
+		// R7(b), the F1 near-miss check: once the plugin has had its whole settle window to
+		// react, the bytes on disk must still be exactly what the external writer wrote — the
+		// plugin must never write to the vault. Checked on bytes, then the fixture is put back
+		// (R7(a): no residue from the probe in the fixture note on later runs).
+		const onDisk = readFileSync(note);
+		const diskBytesUnchangedByPlugin = onDisk.equals(Buffer.from(after, "utf8"));
+		writeFileSync(note, before, "utf8");
 		const windowEntries = log.filter((e) => e.t >= writeStartedAt);
 		const summary = summarizeWindow(windowEntries);
 		const outcome = summary.docChangedCount > 0 ? "emitted" : "not emitted";
 
 		state.obsidianVersion = install.obsidianVersion;
-		state.externalWrite = { note, waitMs: args.waitMs, outcome, ...summary };
+		state.externalWrite = { note, waitMs: args.waitMs, outcome, diskBytesUnchangedByPlugin, ...summary };
 	});
 }
 
@@ -538,6 +549,7 @@ function renderReport(state) {
 		`- Wait after write before reading the log: ${d.waitMs}ms`,
 		`- Transactions observed in the write window: ${d.transactionCount}`,
 		`- Document-changing transactions in that window: ${d.docChangedCount}`,
+		`- On-disk bytes after the settle window still equal what the external writer wrote (F1 near-miss check): ${d.diskBytesUnchangedByPlugin === undefined ? "not recorded" : d.diskBytesUnchangedByPlugin}`,
 		`- ...of which with no \`userEvent\` annotation: ${d.docChangedNoAnnotationCount}`,
 		`- \`userEvent\` values seen in that window: ${d.annotationsSeen.length ? d.annotationsSeen.join(", ") : "(none)"}`,
 	].join("\n"));
