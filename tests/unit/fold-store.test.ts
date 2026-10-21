@@ -316,3 +316,42 @@ describe("hashText", () => {
 		expect(hashText("")).toBe(hashText(""));
 	});
 });
+
+describe("FoldStore: load prunes expired dormant anchors on disk too (R10, PR-6)", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	const anchor = { kind: "heading", indent: 0, text: "tuesday", siblingIndex: 0, parentChain: [] };
+
+	it("an expired dormant entry found at load is written back out, not left in data.json", async () => {
+		const saveData = vi.fn(async (_data: unknown) => undefined);
+		const onDisk = {
+			version: 1,
+			files: { "A.md": { contentHash: "h", folds: [], dormant: [{ ...anchor, dormantSince: 0 }] } },
+		};
+		const store = new FoldStore({ loadData: async () => onDisk, saveData, now: () => 600_000 });
+		await store.load();
+		expect(store.get("A.md")?.dormant).toEqual([]);
+
+		await vi.advanceTimersByTimeAsync(150);
+		expect(saveData).toHaveBeenCalledTimes(1);
+		const written = saveData.mock.calls[0][0] as { files: Record<string, { dormant: unknown[] }> };
+		expect(written.files["A.md"].dormant).toEqual([]);
+	});
+
+	it("a load that prunes nothing still writes nothing", async () => {
+		const saveData = vi.fn(async (_data: unknown) => undefined);
+		const onDisk = {
+			version: 1,
+			files: { "A.md": { contentHash: "h", folds: [], dormant: [{ ...anchor, dormantSince: 1 }] } },
+		};
+		const store = new FoldStore({ loadData: async () => onDisk, saveData, now: () => 599_999 });
+		await store.load();
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(saveData).not.toHaveBeenCalled();
+	});
+});

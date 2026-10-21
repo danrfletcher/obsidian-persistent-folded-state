@@ -10,7 +10,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding, foldEffect, foldedRanges } from "@codemirror/language";
+import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { editorInfoField } from "../mocks/obsidian";
 import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
@@ -143,5 +143,66 @@ describe("dormant/baseline pipeline (PR-6 R5)", () => {
 		const dormant = store.get(NOTE_PATH)?.dormant ?? [];
 		expect(dormant).toHaveLength(1);
 		expect((dormant[0] as unknown as { dormantSince: number }).dormantSince).toBe(5);
+	});
+
+	it("R10: a settled external change to a note with no folds and nothing dormant still refreshes the stored contentHash", async () => {
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: hashText(TEXT_UNRELATED), folds: [], dormant: [] } });
+		const view = makeView(store, { file: { path: NOTE_PATH, extension: "md" } }, () => 0, TEXT_UNRELATED);
+
+		set(view, TEXT_WITH_TUESDAY);
+		await settle();
+
+		expect(store.get(NOTE_PATH)).toEqual({ contentHash: hashText(TEXT_WITH_TUESDAY), folds: [], dormant: [] });
+	});
+
+	it("R12 (PR-6): the user folding the matched block while the match runs leaves one stored anchor for it, not two", async () => {
+		const TEXT_RENAMED = "Notes\n\n## Tuesdays\n- [ ] Draft proposal\n";
+		const store = await makeStore({
+			[NOTE_PATH]: {
+				contentHash: hashText(TEXT_UNRELATED),
+				folds: [],
+				dormant: [{ ...tuesdayAnchor(), dormantSince: 0 }] as unknown as Record<string, unknown>[],
+			},
+		});
+		// Hold the matcher's first yield open so the user can act in the middle of the match.
+		let release: () => void = () => {};
+		let yields = 0;
+		const yieldToHost = (): Promise<void> => {
+			yields++;
+			return yields === 1 ? new Promise<void>((resolve) => void (release = resolve)) : Promise.resolve();
+		};
+		const info = { file: { path: NOTE_PATH, extension: "md" } };
+		const watcher = createEditorWatcher({ store, window, now: () => 1, matcherOptions: { chunkSize: 1, yieldToHost } });
+		const view = new EditorView({
+			state: EditorState.create({
+				doc: TEXT_UNRELATED,
+				selection: { anchor: 0 },
+				extensions: [codeFolding(), watcher, editorInfoField.init(() => info)],
+			}),
+			parent: document.body,
+		});
+
+		set(view, TEXT_RENAMED);
+		await sleep(250);
+		expect(yields).toBe(1); // the match is in flight
+
+		// The user folds the "## Tuesdays" block now: the recorder stores the anchor for the text as it reads.
+		const headingEnd = TEXT_RENAMED.indexOf("\n- [ ]");
+		view.dispatch({ effects: foldEffect.of({ from: headingEnd, to: TEXT_RENAMED.length - 1 }) });
+		expect(store.get(NOTE_PATH)?.folds.map((f) => (f as unknown as Anchor).text)).toEqual(["tuesdays"]);
+
+		release();
+		await sleep(100);
+
+		const record = store.get(NOTE_PATH)!;
+		expect(record.folds.map((f) => (f as unknown as Anchor).text)).toEqual(["tuesdays"]); // not also "tuesday"
+		expect(record.dormant).toEqual([]);
+		expect(folded(view)).toBe(1);
+
+		// So one unfold forgets the block entirely.
+		let live: { from: number; to: number } | null = null;
+		foldedRanges(view.state).between(0, view.state.doc.length, (from, to) => void (live = { from, to }));
+		view.dispatch({ effects: unfoldEffect.of(live!) });
+		expect(store.get(NOTE_PATH)?.folds).toEqual([]);
 	});
 });

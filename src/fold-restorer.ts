@@ -241,7 +241,7 @@ function mapCandidatesForward(candidates: AnchoredBlock[], text: string, changes
  * a stale dormant timestamp. */
 function toActiveAnchor(anchor: Anchor): StoredAnchor {
 	const { kind, indent, text, siblingIndex, parentChain } = anchor;
-	return { kind, indent, text, siblingIndex, parentChain } as unknown as StoredAnchor;
+	return { kind, indent, text, siblingIndex, parentChain };
 }
 
 /** Builds a `DeferredFoldTarget` (R2) from a plan's own `FoldTarget` (anchor index + line range,
@@ -294,7 +294,15 @@ export async function restoreSettledChange(
 		});
 		return [];
 	}
-	if (snapshot.folds.length === 0 && snapshot.dormant.length === 0) return [];
+	if (snapshot.folds.length === 0 && snapshot.dormant.length === 0) {
+		// R10 (PR-6): nothing to restore, but the entry's contentHash still has to follow the
+		// text: a hash left at the file's old content would make the next open treat an
+		// unchanged note as changed (and re-match against it) for no reason.
+		if (snapshot.contentHash !== hashText(text)) {
+			deps.store.set(path, { contentHash: hashText(text), folds: [], dormant: [] });
+		}
+		return [];
+	}
 
 	// The snapshot (E11/E9): taken once, now, before the possibly-slow matching below starts.
 	const storedAnchors: Anchor[] = [];
@@ -393,6 +401,16 @@ export async function restoreSettledChange(
 			if (anchor) activeFolds.set(anchorKey(anchor), raw);
 		}
 
+		// R12 (PR-6): anchors the recorder added while the match ran (the user folded something
+		// after the snapshot) — a dormant match already live on one of those blocks is the user's
+		// own fold, not a restore, and is not promoted alongside it (see below).
+		const snapshotKeys = new Set<string>();
+		for (const raw of snapshot.folds) {
+			const anchor = parseAnchor(raw);
+			if (anchor) snapshotKeys.add(anchorKey(anchor));
+		}
+		const addedSinceSnapshot = new Set([...activeFolds.keys()].filter((key) => !snapshotKeys.has(key)));
+
 		let dormantList = dormantResult.stillDormant;
 		for (let i = 0; i < storedAnchors.length; i++) {
 			const match = matches[i];
@@ -445,7 +463,14 @@ export async function restoreSettledChange(
 			// R15 (PR-6)/R3 (PR-5): the same start-line test the planner uses, so a native fold
 			// that ends a blank line short of (or past) the candidate still counts as live.
 			const alreadyLive = candidate !== undefined && isAlreadyFolded(alreadyFolded, candidate.range);
-			if (alreadyLive) {
+			if (alreadyLive && candidate !== undefined && addedSinceSnapshot.has(anchorKey(candidate.anchor))) {
+				// R12 (PR-6): the user folded this very block while the match ran, so the recorder
+				// already stored its own anchor for it. Promoting the (possibly fuzzily matched,
+				// differently keyed) dormant anchor too would leave two entries for one block, and
+				// the user's later unfold would remove only one of them — the other would refold
+				// the block on the next reload (never-break rule 2). The dormant entry is dropped.
+				continue;
+			} else if (alreadyLive) {
 				activeFolds.set(anchorKey(match.anchor), toActiveAnchor(match.anchor));
 			} else {
 				dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
