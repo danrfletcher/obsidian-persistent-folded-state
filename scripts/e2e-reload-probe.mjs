@@ -78,7 +78,11 @@
  * T2/T3: `npm run test:e2e` passes no `--phase`, which now runs `all` — external-write,
  * gutter-fold and fold-command in one Obsidian session, then renders the report — rather than
  * only printing usage and exiting 1. `--note` defaults to the container test vault's fixture note
- * path (`DEFAULT_NOTE_PATH` below) and can be overridden. `native-restore` stays its own explicit
+ * path (`DEFAULT_NOTE_PATH` below) and can be overridden. T130: every capture phase (external-write,
+ * gutter-fold, fold-command) first makes that note the active editor (`useNote`, confirmed, or the
+ * run fails naming the note that is active), because the spy and the fold steps act on the active
+ * editor while the external write goes to the file: a run no longer rewrites one note while
+ * watching another. `native-restore` stays its own explicit
  * phase: it needs a human to actually quit and relaunch Obsidian first, which can't happen inside
  * one non-interactive invocation.
  *
@@ -94,7 +98,7 @@
  */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { buildExternalRewrite } from "./e2e-external-rewrite.mjs";
-import { evaluate, sleep, withConnection } from "./e2e-lib.mjs";
+import { evaluate, sleep, useNote, withConnection } from "./e2e-lib.mjs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
@@ -158,8 +162,8 @@ function printUsage() {
 			"                                           in one Obsidian session (native-restore excluded: see below)",
 			"  --phase external-write [--note <path>]  external rewrite + E10 outcome for that write",
 			`                                           (--note defaults to ${DEFAULT_NOTE_PATH})`,
-			"  --phase gutter-fold                    click the fold gutter on the open note's first line",
-			"  --phase fold-command                    run Obsidian's fold command at the cursor",
+			"  --phase gutter-fold [--note <path>]    click the fold gutter on the note's first foldable lines",
+			"  --phase fold-command [--note <path>]   run Obsidian's fold command at the cursor",
 			"  --phase native-restore                  attach just after relaunching Obsidian",
 			"  --phase report                          render the report from --state",
 			"",
@@ -169,8 +173,9 @@ function printUsage() {
 			"         [--connect-retries 30] [--connect-retry-delay-ms 2000] (native-restore only)",
 			"",
 			"Requires a real Obsidian launched with --remote-debugging-port=<cdp-port>, this plugin",
-			"built and enabled, and (for external-write/gutter-fold/fold-command) --note already open",
-			"in an editor. See the file comment in this script and docs/reload-shape.md.",
+			"built and enabled, and (for external-write/gutter-fold/fold-command) --note inside the",
+			"vault; each of those phases makes it the active editor first. See the file comment in",
+			"this script and docs/reload-shape.md.",
 			"",
 			"native-restore needs Obsidian to actually be quit and relaunched by hand first, so it is",
 			"never part of the default `all` sequence; run it (then --phase report) separately.",
@@ -258,7 +263,10 @@ const READ_LOG_EXPRESSION = "JSON.stringify(window.__pfsProbe ? window.__pfsProb
  * folded. */
 const CLICK_FOLD_GUTTER_EXPRESSION = `
 (function () {
-	const indicators = Array.from(document.querySelectorAll(".cm-fold-indicator .collapse-indicator"));
+	const info = window.app && window.app.workspace && window.app.workspace.activeEditor;
+	const cm = info && info.editor && info.editor.cm;
+	if (!cm) return { clicked: false, reason: "no active markdown editor to click in" };
+	const indicators = Array.from(cm.dom.querySelectorAll(".cm-fold-indicator .collapse-indicator"));
 	if (indicators.length < 2) return { clicked: false, reason: \`found \${indicators.length} fold indicator(s), need at least 2 (the first is the note's own title heading)\` };
 	indicators[1].click();
 	return { clicked: true };
@@ -290,20 +298,37 @@ function externallyRewrite(notePath) {
 	return { before, after, renamedTask };
 }
 
+/** True when the rewritten note (`note`, a path on the machine running the vault) is the file the
+ * active editor shows (`activeNotePath`, vault-relative). Compared on whole path segments, so
+ * `Tasks.md` is not mistaken for the active `MyTasks.md`. */
+function isActiveNote(note, activeNotePath) {
+	const n = note.replace(/\\/g, "/");
+	const a = activeNotePath.replace(/\\/g, "/").replace(/^\/+/, "");
+	return n === a || n.endsWith(`/${a}`);
+}
+
 /** T58: what a captured external-write window proves. "emitted": at least one document-changing
  * transaction. "not emitted": transactions were observed but none changed the document. "inconclusive":
  * the spy logged nothing at all (or was watching another note), which says nothing about how
  * Obsidian reloads — the tester's no-argument run hit exactly this and the old report turned it
  * into "Obsidian appears to replace the editor state/view outright", contradicting the committed
- * raw log of the same build. @returns {{ outcome: "emitted" | "not emitted" | "inconclusive", reason?: string }} */
-export function classifyExternalWrite({ transactionCount, docChangedCount, activeNotePath, note }) {
-	if (docChangedCount > 0) return { outcome: "emitted" };
-	if (activeNotePath && note && !note.replace(/\\/g, "/").endsWith(activeNotePath.replace(/\\/g, "/"))) {
+ * raw log of the same build.
+ *
+ * T130: the active-note check comes FIRST. A document change logged while the editor showed another
+ * note (the tester's default run rewrote Tasks.md while Quarry/Empty.md was active) is that other
+ * note's own transaction, not the reload of the rewritten one, so it can never make a run "emitted".
+ * `expectedActivePath` (the vault-relative key `useNote` activated) makes the comparison exact;
+ * without it the note's path must end in the active path on a whole-segment boundary.
+ * @param {{ transactionCount: number, docChangedCount: number, activeNotePath?: string | null, note?: string, expectedActivePath?: string }} input
+ * @returns {{ outcome: "emitted" | "not emitted" | "inconclusive", reason?: string }} */
+export function classifyExternalWrite({ transactionCount, docChangedCount, activeNotePath, note, expectedActivePath }) {
+	if (activeNotePath && note && !(expectedActivePath ? activeNotePath === expectedActivePath : isActiveNote(note, activeNotePath))) {
 		return {
 			outcome: "inconclusive",
 			reason: `the active editor shows \`${activeNotePath}\`, not the rewritten note \`${note}\`, so the spy was watching a different note`,
 		};
 	}
+	if (docChangedCount > 0) return { outcome: "emitted" };
 	if (transactionCount === 0) {
 		return {
 			outcome: "inconclusive",
@@ -347,6 +372,9 @@ function summarizeWindow(entries) {
 async function runExternalWrite(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
+		// T130: the spy watches the ACTIVE editor and the write below goes to `note`, so `note`
+		// has to be the active editor first (confirmed, or this throws naming what is active).
+		const { vaultPath } = await useNote(cdp, note);
 		const install = await evaluate(cdp, INSTALL_SPY_EXPRESSION);
 		if (install.error) throw new Error(install.error);
 
@@ -368,6 +396,7 @@ async function runExternalWrite(args, state) {
 			transactionCount: summary.transactionCount,
 			docChangedCount: summary.docChangedCount,
 			activeNotePath: install.notePath,
+			expectedActivePath: vaultPath,
 			note,
 		});
 
@@ -386,6 +415,7 @@ async function runExternalWrite(args, state) {
 
 async function runGutterFold(args, state) {
 	await withConnection(args.cdpPort, async (cdp) => {
+		await useNote(cdp, args.note ?? DEFAULT_NOTE_PATH); // T130: fold the same note the other phases probe
 		const install = await evaluate(cdp, INSTALL_SPY_EXPRESSION);
 		if (install.error) throw new Error(install.error);
 
@@ -402,6 +432,7 @@ async function runGutterFold(args, state) {
 
 async function runFoldCommand(args, state) {
 	await withConnection(args.cdpPort, async (cdp) => {
+		await useNote(cdp, args.note ?? DEFAULT_NOTE_PATH); // T130: the command acts on the active editor
 		const install = await evaluate(cdp, INSTALL_SPY_EXPRESSION);
 		if (install.error) throw new Error(install.error);
 

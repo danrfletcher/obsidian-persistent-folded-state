@@ -68,6 +68,34 @@ describe("classifyExternalWrite", () => {
 		expect(result.reason).toContain("Other/Scratch.md");
 	});
 
+	it("T130: a document change logged on a different active note is NOT 'emitted' (the tester's default run: Tasks.md written while Quarry/Empty.md was active)", () => {
+		const result = classifyExternalWrite({
+			transactionCount: 2,
+			docChangedCount: 1,
+			activeNotePath: "Quarry/Empty.md",
+			note: "/config/test-vault/Tasks.md",
+		});
+		expect(result.outcome).toBe("inconclusive");
+		expect(result.reason).toContain("Quarry/Empty.md");
+		expect(result.reason).toContain("/config/test-vault/Tasks.md");
+	});
+
+	it("T130: the active note is compared on whole path segments, not as a string suffix", () => {
+		const base = { transactionCount: 1, docChangedCount: 1, note: "/config/test-vault/Tasks.md" };
+		expect(classifyExternalWrite({ ...base, activeNotePath: "MyTasks.md" }).outcome).toBe("inconclusive");
+		expect(classifyExternalWrite({ ...base, activeNotePath: "Tasks.md" }).outcome).toBe("emitted");
+		expect(
+			classifyExternalWrite({ ...base, note: "/config/test-vault/Projects/Quarry/Tasks.md", activeNotePath: "Projects/Quarry/Tasks.md" }).outcome,
+		).toBe("emitted");
+	});
+
+	it("T130: given the vault-relative key the run activated, only that exact path counts as the active note", () => {
+		const base = { transactionCount: 1, docChangedCount: 1, note: "/config/test-vault/Projects/Quarry/Tasks.md" };
+		const expectedActivePath = "Projects/Quarry/Tasks.md";
+		expect(classifyExternalWrite({ ...base, expectedActivePath, activeNotePath: "Projects/Quarry/Tasks.md" }).outcome).toBe("emitted");
+		expect(classifyExternalWrite({ ...base, expectedActivePath, activeNotePath: "Quarry/Tasks.md" }).outcome).toBe("inconclusive");
+	});
+
 	it("is 'not emitted' only when transactions were observed on the right note and none changed the document", () => {
 		expect(
 			classifyExternalWrite({ transactionCount: 2, docChangedCount: 0, activeNotePath: "Tasks.md", note: "/config/test-vault/Tasks.md" }),
