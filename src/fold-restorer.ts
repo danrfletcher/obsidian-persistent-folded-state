@@ -81,7 +81,7 @@ import { foldEffect } from "@codemirror/language";
 import { Text, type ChangeDesc, type ChangeSet } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
-import { liveFoldedLineRanges } from "./live-folds";
+import { foldSpanForLineRange, liveFoldedLineRanges } from "./live-folds";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
 import { isAlreadyFolded, planRestore, type FoldTarget } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
@@ -171,17 +171,14 @@ export function liveAnchorKeySet(store: FoldStore, path: string): ReadonlySet<st
 }
 
 /** Converts a line-range target into a CM6 character-offset fold effect: from the end of the
- * block's own first line to the end of its last line, leaving the first line itself visible
- * (the usual heading/task/list fold shape). Returns `null` rather than throwing when the doc no
- * longer has that many lines (it shrank between planning and dispatch), or when there's nothing
- * left to hide. */
+ * block's own first line to the end of its last non-blank line (`foldSpanForLineRange`: the
+ * trailing blank separators `buildAnchors` folds into a range are not hidden), leaving the first
+ * line itself visible (the usual heading/task/list fold shape). Returns `null` rather than
+ * throwing when the doc no longer has that many lines (it shrank between planning and
+ * dispatch), or when there's nothing left to hide. */
 function foldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof foldEffect.of> | null {
-	if (range.endLine <= range.startLine) return null; // nothing to collapse
-	if (range.endLine > view.state.doc.lines) return null;
-	const from = view.state.doc.line(range.startLine).to;
-	const to = view.state.doc.line(range.endLine).to;
-	if (from >= to) return null; // nothing left to hide
-	return foldEffect.of({ from, to });
+	const span = foldSpanForLineRange(view.state.doc, range);
+	return span ? foldEffect.of(span) : null;
 }
 
 function dispatchFoldTargets(view: EditorView, targets: readonly { range: LineRange }[]): void {

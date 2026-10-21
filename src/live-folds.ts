@@ -35,7 +35,7 @@
  * have a fixed range that's never extended this way) is completely unaffected.
  */
 import { foldedRanges } from "@codemirror/language";
-import type { EditorState } from "@codemirror/state";
+import type { EditorState, Text } from "@codemirror/state";
 import type { AnchoredBlock, LineRange } from "./anchors";
 
 /** `to`'s line number, adjusted so a fold that runs to the very end of a document ending in a
@@ -94,6 +94,30 @@ export function resolveCandidateForLiveRange(
 		if (widenLiveRangeToCandidate(state, range, candidate.range)) return candidate;
 	}
 	return null;
+}
+
+/** The last line of `range` that is not blank (never before `range.startLine`). `buildAnchors`
+ * closes a list/task/heading/other block lazily, so its `endLine` includes the blank separator
+ * lines before the next sibling (src/anchors.ts, PR-3 R4); a fold must stop at the block's own
+ * last content line, which is also where Obsidian's own fold service and a click-made fold end. */
+function lastContentLine(doc: Text, range: LineRange): number {
+	let endLine = Math.min(range.endLine, doc.lines);
+	while (endLine > range.startLine && doc.line(endLine).text.trim() === "") endLine--;
+	return endLine;
+}
+
+/** The CM6 fold span for `range`, a `buildAnchors` line range: from the end of the block's first
+ * line to the end of its last non-blank line (PR-5 R4: trailing blank lines are trimmed, so a
+ * restored fold never hides the blank separator that follows the block). `null` when the range
+ * lies outside `doc`, or when nothing is left to hide. The shared fold-end rule for every
+ * fold/unfold effect this plugin dispatches (src/fold-restorer.ts, src/open-restore.ts). */
+export function foldSpanForLineRange(doc: Text, range: LineRange): { from: number; to: number } | null {
+	if (range.startLine < 1 || range.endLine > doc.lines) return null;
+	const endLine = lastContentLine(doc, range);
+	if (endLine <= range.startLine) return null; // nothing to collapse
+	const from = doc.line(range.startLine).to;
+	const to = doc.line(endLine).to;
+	return from >= to ? null : { from, to };
 }
 
 /** Groups `candidates` by their `range.startLine` — the shape `resolveCandidateForLiveRange`

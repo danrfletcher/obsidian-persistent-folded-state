@@ -68,7 +68,7 @@
 import { foldEffect, unfoldEffect } from "@codemirror/language";
 import type { EditorView } from "@codemirror/view";
 import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
-import { liveFoldedLineRanges } from "./live-folds";
+import { foldSpanForLineRange, liveFoldedLineRanges } from "./live-folds";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
 import { planRestore } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
@@ -140,14 +140,12 @@ function defaultYieldToHost(win: Window): () => Promise<void> {
 	return () => new Promise((resolve) => win.setTimeout(resolve, 0));
 }
 
-/** The CM6 fold span for a block: end of its first line to end of its last (nothing to hide ->
- * `null`). Shared by the fold and unfold effects below, which differ only in the effect type. */
+/** The CM6 fold span for a block: end of its first line to end of its last non-blank line
+ * (trailing blank separators trimmed, `foldSpanForLineRange`; nothing to hide -> `null`). Shared
+ * by the fold and unfold effects below, which differ only in the effect type. */
 function foldSpanFor(view: EditorView, range: LineRange): { from: number; to: number } | null {
 	if (!isFoldable(range)) return null;
-	if (range.endLine > view.state.doc.lines) return null;
-	const from = view.state.doc.line(range.startLine).to;
-	const to = view.state.doc.line(range.endLine).to;
-	return from >= to ? null : { from, to };
+	return foldSpanForLineRange(view.state.doc, range);
 }
 
 function foldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof foldEffect.of> | null {
