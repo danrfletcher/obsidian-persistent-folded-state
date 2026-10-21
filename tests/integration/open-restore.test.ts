@@ -7,7 +7,7 @@
  * compare, re-match, E4 native-restore replacement), not just `src/open-restore.ts`'s pure
  * decision logic in isolation.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
@@ -343,6 +343,9 @@ describe("open-restore via the plugin's file-open handler", () => {
 			},
 		};
 		const plugin = makePlugin(app, stored);
+		// R11 (PR-7)/T133: a short multi-check schedule, so every check of the guard window runs
+		// inside this test (the production schedule runs to 16 s; this test waits ~300 ms).
+		plugin.guardDelaysMs = [30, 60, 90, 120];
 		await plugin.onload();
 
 		// TEXT_V3: "## Tuesday" is now lines 3-4. Put the cursor inside that block (line 4,
@@ -352,6 +355,7 @@ describe("open-restore via the plugin's file-open handler", () => {
 		view.dispatch({ selection: { anchor: cursorPos } });
 
 		openFile(app, NOTE_PATH, view);
+		const dispatchSpy = vi.spyOn(view, "dispatch");
 
 		// Deferred at open (G13): nothing folded yet.
 		expect(liveFoldedLineRanges(view)).toEqual([]);
@@ -359,12 +363,13 @@ describe("open-restore via the plugin's file-open handler", () => {
 		// R8's own bug folded this anyway, around the cursor, the moment the native-restore
 		// guard's onLayoutReady-triggered check ran — because that check reused `matchedRanges`
 		// (which deliberately includes G13-deferred ranges) to decide what to fold. Firing
-		// onLayoutReady immediately, *and* letting the two fixed-delay checks run too, exercises
-		// every one of the guard's checks against this same cursor position.
+		// onLayoutReady immediately, *and* letting all four timed checks (30-120 ms) run too,
+		// exercises every one of the guard's checks against this same cursor position.
 		(app.workspace as unknown as MockWorkspace).triggerLayoutReady();
 		expect(liveFoldedLineRanges(view)).toEqual([]); // still unfolded right after the immediate check
 		await settle();
-		expect(liveFoldedLineRanges(view)).toEqual([]); // and after the 50ms/300ms checks too
+		expect(liveFoldedLineRanges(view)).toEqual([]); // and after every timed check too
+		expect(dispatchSpy).not.toHaveBeenCalled(); // no fold or unfold effect at all in the window
 		expect(view.state.doc.toString()).toBe(TEXT_V3); // F1
 	}, 10000);
 
