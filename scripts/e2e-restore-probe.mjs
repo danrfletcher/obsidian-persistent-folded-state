@@ -51,16 +51,28 @@
  *
  * Every phase accepts [--cdp-port 9222] [--wait-ms 1000] [--state <path>].
  */
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { copyFileSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import {
+	clickFoldIndicatorExpression,
+	evaluate,
+	foldAndConfirm,
+	parkCursorOutsideFolds,
+	readVisibleLines,
+	sleep,
+	unfoldAll,
+	visibleLinesInclude,
+	withConnection,
+} from "./e2e-lib.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPORT_PATH = join(ROOT, "docs", "restore-golden-path.md");
 const DEFAULT_STATE_PATH = join(tmpdir(), "pfs-e2e-restore-probe-state.json");
 const DEFAULT_NOTE_PATH = "/config/test-vault/Tasks.md";
 const DEFAULT_AFTER_PATH = join(ROOT, "tests", "fixtures", "tasks-after.md");
+const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
 
 const EXPLICIT_PHASES = ["setup", "rewrite", "verify", "report"];
 const PHASES = ["all", ...EXPLICIT_PHASES];
@@ -75,6 +87,7 @@ function parseArgs(argv) {
 		else if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--state") args.state = argv[++i];
+		else if (arg === "--keep-note") args.keepNote = true;
 		else if (arg === "--help" || arg === "-h") args.help = true;
 	}
 	return args;
@@ -92,7 +105,8 @@ function printUsage() {
 			"  --phase verify  [--note <path>]    GP3: check folded/visible lines + byte-identical file",
 			"  --phase report                     (re)write docs/restore-golden-path.md from --state",
 			"",
-			"Options: [--cdp-port 9222] [--wait-ms 1000] [--state <path>]",
+			"Options: [--cdp-port 9222] [--wait-ms 1000] [--state <path>] [--keep-note]",
+			"         (setup copies tests/fixtures/tasks-before.md over --note first, so every run starts from the same text; --keep-note skips that)",
 			"",
 			`--note defaults to ${DEFAULT_NOTE_PATH} (the container test vault's copy of tests/fixtures/tasks-before.md).`,
 			"Requires a real Obsidian launched with --remote-debugging-port, this plugin built and",
@@ -114,171 +128,37 @@ function saveState(path, state) {
 	writeFileSync(path, JSON.stringify(state, null, 2), "utf8");
 }
 
-async function findDebuggableTarget(cdpPort) {
-	const res = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
-	if (!res.ok) throw new Error(`CDP target list request failed: HTTP ${res.status}`);
-	const targets = await res.json();
-	const target = targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-	if (!target) throw new Error("no debuggable Obsidian window found on that CDP port");
-	return target;
-}
-
-/** Minimal CDP client — identical shape to scripts/e2e-reload-probe.mjs's `connectCdp` (kept as
- * its own copy here rather than shared, so each probe stays independently runnable/removable). */
-function connectCdp(webSocketDebuggerUrl) {
-	const ws = new WebSocket(webSocketDebuggerUrl);
-	let nextId = 1;
-	const pending = new Map();
-	let closed = false;
-
-	function rejectAllPending(err) {
-		for (const { reject } of pending.values()) reject(err);
-		pending.clear();
-	}
-
-	ws.addEventListener("message", (event) => {
-		const message = JSON.parse(event.data.toString());
-		if (message.id && pending.has(message.id)) {
-			const { resolve, reject } = pending.get(message.id);
-			pending.delete(message.id);
-			if (message.error) reject(new Error(message.error.message));
-			else resolve(message.result);
-		}
-	});
-	ws.addEventListener("close", () => {
-		closed = true;
-		rejectAllPending(new Error("CDP socket closed"));
-	});
-	ws.addEventListener("error", () => rejectAllPending(new Error("CDP socket error")));
-
-	const ready = new Promise((resolve, reject) => {
-		ws.addEventListener("open", () => resolve());
-		ws.addEventListener("error", (err) => reject(err instanceof Error ? err : new Error(String(err))));
-	});
-
-	async function send(method, params = {}, { timeoutMs = 10000 } = {}) {
-		await ready;
-		if (closed) throw new Error(`CDP socket already closed, cannot send ${method}`);
-		const id = nextId++;
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				pending.delete(id);
-				reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
-			}, timeoutMs);
-			pending.set(id, {
-				resolve: (value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
-				reject: (err) => {
-					clearTimeout(timer);
-					reject(err);
-				},
-			});
-			ws.send(JSON.stringify({ id, method, params }));
-		});
-	}
-
-	return { send, close: () => ws.readyState === WebSocket.OPEN && ws.close() };
-}
-
-async function evaluate(cdp, expression, { awaitPromise = false } = {}) {
-	await cdp.send("Runtime.enable");
-	const result = await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise });
-	if (result.exceptionDetails) throw new Error(`Runtime.evaluate threw: ${JSON.stringify(result.exceptionDetails)}`);
-	return result.result.value;
-}
-
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withConnection(cdpPort, fn) {
-	const target = await findDebuggableTarget(cdpPort);
-	const cdp = connectCdp(target.webSocketDebuggerUrl);
-	try {
-		return await fn(cdp);
-	} finally {
-		cdp.close();
-	}
-}
-
-/** Clicks the fold-indicator triangle for the first rendered `.cm-line` whose text matches
- * `needle` (a plain substring, not a regex — kept simple and visible rather than clever). Each
- * foldable line gets its own `.cm-fold-indicator` widget in the left margin (see the file
- * comment in e2e-reload-probe.mjs). Returns `{clicked: boolean, reason?: string}` rather than
- * throwing, so a phase that can't find the line reports why instead of a bare stack trace. */
-function clickFoldIndicatorNearExpression(needle) {
-	return `
-(function () {
-	const needle = ${JSON.stringify(needle)};
-	const lines = Array.from(document.querySelectorAll(".cm-line"));
-	const target = lines.find((el) => el.textContent && el.textContent.includes(needle));
-	if (!target) return { clicked: false, reason: \`no rendered .cm-line contains "\${needle}"\` };
-	const indicator = target.querySelector(".cm-fold-indicator .collapse-indicator") ||
-		target.closest(".cm-line")?.previousElementSibling?.querySelector?.(".cm-fold-indicator .collapse-indicator");
-	if (!indicator) return { clicked: false, reason: \`found the line but no fold-indicator on/near it\` };
-	indicator.click();
-	return { clicked: true };
-})()
-`;
-}
-
-/** The exact rendered-text signal GP3 checks: for each needle, whether a `.cm-line` containing
- * that text is currently present in the DOM at all (CM6 never renders a folded range's interior
- * lines as `.cm-line` elements — see the file comment above). */
-const READ_VISIBLE_LINES_EXPRESSION = `
-JSON.stringify(Array.from(document.querySelectorAll(".cm-line")).map((el) => el.textContent))
-`;
-
-function visibleLinesInclude(visibleLines, needle) {
-	return visibleLines.some((line) => line.includes(needle));
-}
-
-/** T1 (PR-1 test round 1): CM6 drops a fold whose range contains the selection head, so a fold
- * click made while the cursor sits inside the block (a cursor left over from an earlier run, or
- * one Obsidian restored when it reopened the note) reports `clicked: true` and then leaves the
- * block unfolded. Park the cursor on the note's "# " title line, which lies outside every
- * foldable block of tests/fixtures/tasks-before.md, before folding anything. */
-const PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION = `
-(function () {
-	const editor = app.workspace.activeEditor && app.workspace.activeEditor.editor;
-	if (!editor) return { parked: false, reason: "no active editor" };
-	const lines = editor.getValue().split("\\n");
-	const title = lines.findIndex((line) => /^# /.test(line));
-	editor.setCursor({ line: title >= 0 ? title : 0, ch: 0 });
-	return { parked: true, line: title >= 0 ? title : 0 };
-})()
-`;
-
-async function readVisibleLines(cdp) {
-	return JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
-}
-
-/** Clicks the fold indicator of the first rendered line containing `needle`, then confirms from
- * the DOM that `hiddenNeedle` is no longer rendered. A click that reports `clicked: true` but
- * folded nothing is reported as `folded: false` instead of passing silently (T1). */
-async function foldAndConfirm(cdp, needle, hiddenNeedle, waitMs) {
-	const click = await evaluate(cdp, clickFoldIndicatorNearExpression(needle));
-	await sleep(waitMs);
-	const visibleLines = await readVisibleLines(cdp);
-	return { ...click, folded: click.clicked && !visibleLinesInclude(visibleLines, hiddenNeedle) };
-}
-
 async function runSetup(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
+	// T61: start every run from the same note. A previous run leaves the note holding the
+	// rewritten text and Obsidian (or this plugin) restores the folds it stored, so a fold click
+	// on the next run would *unfold* a block that was already folded. Put the "before" fixture
+	// back, then unfold anything that is still folded, so GP1 always folds from a known state.
+	let reset = { skipped: true };
+	if (!args.keepNote) {
+		copyFileSync(BEFORE_FIXTURE, note);
+		await sleep(Math.max(args.waitMs, 1500)); // the plugin's own settle window + restore
+		reset = { copiedFrom: BEFORE_FIXTURE };
+	}
 	await withConnection(args.cdpPort, async (cdp) => {
-		const cursor = await evaluate(cdp, PARK_CURSOR_OUTSIDE_FOLDS_EXPRESSION);
+		// Only lines inside the two blocks GP1 folds: Obsidian may keep the frontmatter folded.
+		const unfold = await unfoldAll(cdp, ["Outline", "Notes for Tuesday"], { waitMs: args.waitMs });
+		const cursor = await parkCursorOutsideFolds(cdp);
 		await sleep(args.waitMs);
 		// T1 (PR-5): Draft proposal first, then Tuesday. Tasks.md has no heading after "## Tuesday",
 		// so Tuesday's fold hides every line below it, Draft proposal's included — clicking
 		// Tuesday first leaves nothing to click for the task and GP1 never gets its second fold.
-		const draftClick = await foldAndConfirm(cdp, "Draft proposal", "Outline", args.waitMs);
-		const tuesdayClick = await foldAndConfirm(cdp, "Tuesday", "Notes for Tuesday", args.waitMs);
+		// T61: each step is confirmed from the DOM (scripts/e2e-lib.mjs foldAndConfirm), is
+		// scoped to the active editor, skips a block that is already folded, and falls back to
+		// the fold command if the indicator click does not take.
+		const draftClick = await foldAndConfirm(cdp, "Draft proposal", "Outline", { waitMs: args.waitMs });
+		const tuesdayClick = await foldAndConfirm(cdp, "Tuesday", "Notes for Tuesday", { waitMs: args.waitMs });
 
 		const visibleLines = await readVisibleLines(cdp);
 		state.setup = {
 			note,
+			reset,
+			unfold,
 			cursor,
 			tuesdayClick,
 			draftClick,
@@ -320,7 +200,7 @@ async function runVerify(args, state) {
 		// proposal v2, whose own fold must stay put) to read the nested lines, the same way a user
 		// would see GP3's described state.
 		const tuesdayStillFolded = !visibleLinesInclude(foldedLines, "Notes for Tuesday");
-		const expand = await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"));
+		const expand = await evaluate(cdp, clickFoldIndicatorExpression("Tuesday"));
 		await sleep(Math.max(args.waitMs, 500));
 		const expandedLines = expand.clicked ? await readVisibleLines(cdp) : [];
 
@@ -350,9 +230,11 @@ function renderReport(state) {
 
 	const setupSection = section("GP1 (--phase setup)", state.setup, (d) => [
 		`- Note: \`${d.note}\``,
+		`- Note reset to the before-fixture: ${JSON.stringify(d.reset)}`,
+		`- Unfolded anything left folded first: ${JSON.stringify(d.unfold)}`,
 		`- Cursor parked outside every fold: ${JSON.stringify(d.cursor)}`,
-		`- Clicked Draft proposal's fold indicator (first): ${JSON.stringify(d.draftClick)}`,
-		`- Clicked Tuesday's fold indicator (second): ${JSON.stringify(d.tuesdayClick)}`,
+		`- Folded Draft proposal (first): ${JSON.stringify(d.draftClick)}`,
+		`- Folded Tuesday (second): ${JSON.stringify(d.tuesdayClick)}`,
 		`- Tuesday's body hidden: ${d.tuesdayBodyHidden}`,
 		`- Draft proposal's children hidden: ${d.draftChildrenHidden}`,
 		`- Send invoices hidden by Tuesday's fold (it is nested in Tuesday; not a failure): ${d.sendInvoicesHiddenByTuesday}`,
