@@ -358,32 +358,99 @@ function runSeed(args, state) {
 	state.seed = { note, emptyNote, data, clearedData };
 }
 
+/** Closes every pane showing `vaultPath` and opens it again in a new tab — the "close and reopen
+ * the note" step, the path where real Obsidian may build the EditorView after the plugin's
+ * constructor-time check has already read an empty state. */
+function closeAndReopenExpression(vaultPath) {
+	return `
+(async function () {
+	const path = ${JSON.stringify(vaultPath)};
+	app.workspace.getLeavesOfType("markdown")
+		.filter((leaf) => leaf.view && leaf.view.file && leaf.view.file.path === path)
+		.forEach((leaf) => leaf.detach());
+	const file = app.vault.getAbstractFileByPath(path);
+	if (!file) return { reopened: false, reason: "file not found: " + path };
+	await app.workspace.getLeaf("tab").openFile(file);
+	return { reopened: true };
+})()
+`;
+}
+
+function disablePluginExpression() {
+	return `(async function () { await app.plugins.disablePlugin(${JSON.stringify(PLUGIN_ID)}); return { disabled: true }; })()`;
+}
+
+function enablePluginExpression() {
+	return `(async function () { await app.plugins.enablePlugin(${JSON.stringify(PLUGIN_ID)}); return { enabled: true }; })()`;
+}
+
+/** R7/T14 (PR-6): the E5/G15 baseline can only run when the plugin has *no* record for the note
+ * and then meets folds that already exist. So: disable the plugin, clear data.json while it is
+ * disabled (a plugin holding its store in memory would just write it back), fold the task and
+ * then its heading *with the plugin off* (task first — the heading's fold hides the task's
+ * line, so the reverse order leaves nothing to click), enable it, reopen the note in a fresh
+ * pane, and read what it adopted. The over-an-open-pane case (re-enable without closing) is the
+ * second scenario, run straight after. */
+/** Copy of `hashText` in src/fold-store.ts (this script is plain Node and cannot import the
+ * plugin's TypeScript): the stored `contentHash` for the note's on-disk text. Keep in step. */
+function hashOnDisk(path) {
+	const normalized = readFileSync(path, "utf8").replace(/\r\n?/g, "\n");
+	let h1 = 0xdeadbeef;
+	let h2 = 0x41c6ce57;
+	for (let i = 0; i < normalized.length; i++) {
+		const ch = normalized.charCodeAt(i);
+		h1 = Math.imul(h1 ^ ch, 2654435761);
+		h2 = Math.imul(h2 ^ ch, 1597334677);
+	}
+	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+	return (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
+}
+
 async function runBaseline(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	const data = args.data ?? DEFAULT_DATA_PATH;
+	const beforeHash = hashOnDisk(note);
 
-	await withConnection(args.cdpPort, async (cdp) => {
-		const click = await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"));
+	async function scenario(cdp, label, reopen) {
+		await evaluate(cdp, "app.commands.executeCommandById('editor:unfold-all')"); // same start for both cases
 		await sleep(args.waitMs);
-
-		const toggle = await evaluate(cdp, toggleReenablePluginExpression(), { awaitPromise: true });
+		const disabled = await evaluate(cdp, disablePluginExpression(), { awaitPromise: true });
+		if (existsSync(data)) unlinkSync(data); // cleared while disabled
+		const taskClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"));
 		await sleep(args.waitMs);
+		const headingClick = await evaluate(cdp, clickFoldIndicatorNearExpression("## Tuesday"));
+		await sleep(args.waitMs);
+		const enabled = await evaluate(cdp, enablePluginExpression(), { awaitPromise: true });
+		await sleep(args.waitMs);
+		const reopened = reopen ? await evaluate(cdp, closeAndReopenExpression(DEFAULT_NOTE_VAULT_PATH), { awaitPromise: true }) : null;
+		await sleep(Math.max(args.waitMs, 1000));
 
 		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));
 		const record = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
-
-		state.baseline = {
-			note,
-			foldClick: click,
-			pluginToggle: toggle,
-			// G15/E5's own question: did the constructor-time baseline check see the fold that
-			// was already live, or an empty state raced ahead of Obsidian's own fold restore?
+		const anchors = record ? record.folds.filter((fold) => fold.kind !== "frontmatter") : [];
+		return {
+			label,
+			disabled,
+			taskClick,
+			headingClick,
+			enabled,
+			reopened,
+			recordExists: record !== undefined,
+			// Two anchors expected: the heading and the task (Obsidian's own frontmatter fold is not counted).
+			anchorCount: record ? anchors.length : null,
+			anchorKinds: anchors.map((fold) => fold.kind),
+			contentHashMatchesDisk: record ? record.contentHash === beforeHash : null,
+			dormantCount: record ? record.dormant.length : null,
 			draftProposalStillHidden: !visibleLinesInclude(visibleLines, "Outline"),
 			sendInvoicesVisible: visibleLinesInclude(visibleLines, "Send invoices"),
-			recordExists: record !== undefined,
-			foldCount: record ? record.folds.length : null,
-			dormantCount: record ? record.dormant.length : null,
 		};
+	}
+
+	await withConnection(args.cdpPort, async (cdp) => {
+		const closeAndReopen = await scenario(cdp, "close and reopen the note", true);
+		const reenableOverOpenPane = await scenario(cdp, "re-enable over an open pane", false);
+		state.baseline = { note, closeAndReopen, reenableOverOpenPane };
 	});
 }
 
@@ -516,16 +583,22 @@ function renderReport(state) {
 		return `### ${title}\n\n${describe(data)}\n`;
 	}
 
-	const baselineSection = section("G15/E5: first-open baseline (--phase baseline)", state.baseline, (d) => [
-		`- Note: \`${d.note}\``,
-		`- Clicked "Draft proposal"'s fold indicator: ${JSON.stringify(d.foldClick)}`,
-		`- Disabled + re-enabled the plugin: ${JSON.stringify(d.pluginToggle)}`,
-		`- Draft proposal still hidden after the toggle: ${d.draftProposalStillHidden}`,
-		`- Send invoices visible (never folded): ${d.sendInvoicesVisible}`,
-		`- data.json has an entry for the note: ${d.recordExists}`,
-		`- Stored fold count: ${d.foldCount} (expect 1)`,
-		`- Stored dormant count: ${d.dormantCount} (expect 0)`,
-	].join("\n"));
+	const baselineSection = section("G15/E5: first-open baseline (--phase baseline)", state.baseline, (d) =>
+		[d.closeAndReopen, d.reenableOverOpenPane]
+			.map((c) =>
+				[
+					`#### ${c.label}`,
+					`- Note: \`${d.note}\``,
+					`- Plugin disabled, data.json cleared, task then heading folded, plugin re-enabled${c.reopened ? ", note closed and reopened" : ""}: ${JSON.stringify({ disabled: c.disabled, taskClick: c.taskClick, headingClick: c.headingClick, enabled: c.enabled, reopened: c.reopened })}`,
+					`- data.json has an entry for the note: ${c.recordExists}`,
+					`- Stored non-frontmatter anchors: ${c.anchorCount} (expect 2: ${JSON.stringify(c.anchorKinds)})`,
+					`- Stored contentHash matches the file on disk: ${c.contentHashMatchesDisk}`,
+					`- Stored dormant count: ${c.dormantCount} (expect 0)`,
+					`- Draft proposal still hidden: ${c.draftProposalStillHidden}`,
+					`- Send invoices visible (never folded): ${c.sendInvoicesVisible}`,
+				].join("\n"),
+			)
+			.join("\n\n"));
 
 	const unfoldSection = section("G6: dormant unfold (--phase dormant-unfold)", state.dormantUnfold, (d) => [
 		`- Note: \`${d.note}\``,
