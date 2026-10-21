@@ -96,8 +96,10 @@ import {
 	readPluginData,
 	readVisibleLines,
 	recordFor,
+	resolveNote,
 	sleep,
 	unfoldAll,
+	useNote,
 	visibleLinesInclude,
 	withConnection,
 	writePluginData,
@@ -109,9 +111,7 @@ const DEFAULT_STATE_PATH = join(tmpdir(), "pfs-e2e-dormant-baseline-probe-state.
 
 const PLUGIN_ID = "persistent-folded-state";
 const DEFAULT_NOTE_PATH = "/config/test-vault/Quarry/Tasks.md";
-const DEFAULT_NOTE_VAULT_PATH = "Quarry/Tasks.md";
 const DEFAULT_EMPTY_NOTE_PATH = "/config/test-vault/Quarry/Empty.md";
-const DEFAULT_EMPTY_NOTE_VAULT_PATH = "Quarry/Empty.md";
 const DEFAULT_DATA_PATH = `/config/test-vault/.obsidian/plugins/${PLUGIN_ID}/data.json`;
 
 const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
@@ -281,6 +281,8 @@ async function runBaseline(args, state) {
 	const beforeHash = hashOnDisk(note);
 
 	async function scenario(cdp, label, reopen) {
+		// T102: fold --note, not whichever note is active; derive the data.json key from it.
+		const { vaultPath } = await useNote(cdp, note);
 		// T62: unfold everything first and wait until the lines the folds will hide are back in
 		// the DOM, so both scenarios start from the same known state. A fold click on a block that
 		// is still folded (Obsidian restores folds natively when a note reopens) would *unfold* it.
@@ -298,11 +300,11 @@ async function runBaseline(args, state) {
 		const taskClick = await foldAndConfirm(cdp, "Draft proposal", "Outline", { waitMs: args.waitMs });
 		const enabled = await evaluate(cdp, enablePluginExpression(), { awaitPromise: true });
 		await sleep(args.waitMs);
-		const reopened = reopen ? await evaluate(cdp, closeAndReopenExpression(DEFAULT_NOTE_VAULT_PATH), { awaitPromise: true }) : null;
+		const reopened = reopen ? await evaluate(cdp, closeAndReopenExpression(vaultPath), { awaitPromise: true }) : null;
 		await sleep(Math.max(args.waitMs, 1000));
 
 		const visibleLines = await readVisibleLines(cdp);
-		const record = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
+		const record = recordFor(readPluginData(data), vaultPath);
 		const anchors = record ? record.folds.filter((fold) => fold.kind !== "frontmatter") : [];
 		return {
 			label,
@@ -350,10 +352,11 @@ async function runDormantUnfold(args, state) {
 	copyFileSync(BEFORE_FIXTURE, note);
 	await sleep(Math.max(args.waitMs, 1500));
 	await withConnection(args.cdpPort, async (cdp) => {
+		const { vaultPath } = await useNote(cdp, note);
 		const unfold = await unfoldAll(cdp, ["Outline", "A nested list item"], { waitMs: args.waitMs });
 		const cursor = await parkCursorOutsideFolds(cdp);
 		const taskFold = await foldAndConfirm(cdp, "Draft proposal", "Outline", { waitMs: Math.max(args.waitMs, 1000) });
-		const record = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
+		const record = recordFor(readPluginData(data), vaultPath);
 		state.dormantSetup = {
 			note,
 			unfold,
@@ -368,8 +371,9 @@ async function runDormantUnfold(args, state) {
 	await sleep(Math.max(args.waitMs, 1500));
 
 	await withConnection(args.cdpPort, async (cdp) => {
+		const { vaultPath } = await useNote(cdp, note);
 		const visibleLines = await readVisibleLines(cdp);
-		const record = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
+		const record = recordFor(readPluginData(data), vaultPath);
 
 		state.dormantUnfold = {
 			note,
@@ -393,8 +397,9 @@ async function runDormantRefold(args, state) {
 	await sleep(Math.max(args.waitMs, 1500));
 
 	await withConnection(args.cdpPort, async (cdp) => {
+		const { vaultPath } = await useNote(cdp, note);
 		const visibleLines = await readVisibleLines(cdp);
-		const record = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
+		const record = recordFor(readPluginData(data), vaultPath);
 
 		state.dormantRefold = {
 			note,
@@ -418,7 +423,9 @@ async function runDormantForgotten(args, state) {
 	await sleep(Math.max(args.waitMs, 1500));
 
 	let agedSince = null;
+	let vaultPath = null;
 	await withConnection(args.cdpPort, async (cdp) => {
+		vaultPath = (await useNote(cdp, note)).vaultPath;
 		await evaluate(cdp, `(async function () { await app.plugins.disablePlugin(${JSON.stringify(PLUGIN_ID)}); return true; })()`, {
 			awaitPromise: true,
 		});
@@ -427,7 +434,7 @@ async function runDormantForgotten(args, state) {
 	// 2) The container-verification script's own documented shortcut: edit `dormantSince` in
 	// data.json directly while the plugin is disabled, ageing it past the 600,000ms boundary.
 	const before = readPluginData(data);
-	const record = recordFor(before, DEFAULT_NOTE_VAULT_PATH);
+	const record = recordFor(before, vaultPath);
 	if (record && record.dormant[0]) {
 		agedSince = Date.now() - (MAX_DORMANT_AGE_MS + 1000);
 		record.dormant[0].dormantSince = agedSince;
@@ -446,8 +453,9 @@ async function runDormantForgotten(args, state) {
 	await sleep(Math.max(args.waitMs, 1500));
 
 	await withConnection(args.cdpPort, async (cdp) => {
+		await useNote(cdp, note);
 		const visibleLines = await readVisibleLines(cdp);
-		const after = recordFor(readPluginData(data), DEFAULT_NOTE_VAULT_PATH);
+		const after = recordFor(readPluginData(data), vaultPath);
 
 		state.dormantForgotten = {
 			note,
@@ -466,10 +474,11 @@ async function runEmptyBaseline(args, state) {
 	const data = args.data ?? DEFAULT_DATA_PATH;
 
 	await withConnection(args.cdpPort, async (cdp) => {
-		const open = await evaluate(cdp, openFileExpression(DEFAULT_EMPTY_NOTE_VAULT_PATH), { awaitPromise: true });
+		const { vaultPath: emptyVaultPath } = await resolveNote(cdp, emptyNote);
+		const open = await evaluate(cdp, openFileExpression(emptyVaultPath), { awaitPromise: true });
 		await sleep(args.waitMs);
 
-		const record = recordFor(readPluginData(data), DEFAULT_EMPTY_NOTE_VAULT_PATH);
+		const record = recordFor(readPluginData(data), emptyVaultPath);
 		state.emptyBaseline = {
 			emptyNote,
 			open,

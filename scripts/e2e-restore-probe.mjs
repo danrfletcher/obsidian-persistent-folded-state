@@ -60,9 +60,12 @@ import {
 	evaluate,
 	foldAndConfirm,
 	parkCursorOutsideFolds,
+	readPluginData,
 	readVisibleLines,
+	requireRecord,
 	sleep,
 	unfoldAll,
+	useNote,
 	visibleLinesInclude,
 	withConnection,
 } from "./e2e-lib.mjs";
@@ -71,6 +74,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPORT_PATH = join(ROOT, "docs", "restore-golden-path.md");
 const DEFAULT_STATE_PATH = join(tmpdir(), "pfs-e2e-restore-probe-state.json");
 const DEFAULT_NOTE_PATH = "/config/test-vault/Tasks.md";
+const DEFAULT_DATA_PATH = "/config/test-vault/.obsidian/plugins/persistent-folded-state/data.json";
 const DEFAULT_AFTER_PATH = join(ROOT, "tests", "fixtures", "tasks-after.md");
 const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
 
@@ -84,6 +88,7 @@ function parseArgs(argv) {
 		if (arg === "--phase") args.phase = argv[++i];
 		else if (arg === "--note") args.note = argv[++i];
 		else if (arg === "--after") args.after = argv[++i];
+		else if (arg === "--data") args.data = argv[++i];
 		else if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--state") args.state = argv[++i];
@@ -105,7 +110,7 @@ function printUsage() {
 			"  --phase verify  [--note <path>]    GP3: check folded/visible lines + byte-identical file",
 			"  --phase report                     (re)write docs/restore-golden-path.md from --state",
 			"",
-			"Options: [--cdp-port 9222] [--wait-ms 1000] [--state <path>] [--keep-note]",
+			"Options: [--cdp-port 9222] [--wait-ms 1000] [--state <path>] [--keep-note] [--data <path to this plugin's data.json>]",
 			"         (setup copies tests/fixtures/tasks-before.md over --note first, so every run starts from the same text; --keep-note skips that)",
 			"",
 			`--note defaults to ${DEFAULT_NOTE_PATH} (the container test vault's copy of tests/fixtures/tasks-before.md).`,
@@ -140,7 +145,14 @@ async function runSetup(args, state) {
 		await sleep(Math.max(args.waitMs, 1500)); // the plugin's own settle window + restore
 		reset = { copiedFrom: BEFORE_FIXTURE };
 	}
+	const data = args.data ?? DEFAULT_DATA_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
+		// T99/T100: every fold step below acts on the *active* editor, and the plugin stores folds
+		// under the note's vault-relative path. Make --note the active editor first, and derive
+		// the key from the vault root Obsidian reports, so this probe folds, rewrites and reads
+		// back one and the same note.
+		const target = await useNote(cdp, note);
+		await sleep(args.waitMs);
 		// Only lines inside the two blocks GP1 folds: Obsidian may keep the frontmatter folded.
 		const unfold = await unfoldAll(cdp, ["Outline", "Notes for Tuesday"], { waitMs: args.waitMs });
 		const cursor = await parkCursorOutsideFolds(cdp);
@@ -155,8 +167,15 @@ async function runSetup(args, state) {
 		const tuesdayClick = await foldAndConfirm(cdp, "Tuesday", "Notes for Tuesday", { waitMs: args.waitMs });
 
 		const visibleLines = await readVisibleLines(cdp);
+		// GP1's stored half: both folds must now be in data.json under this note's key. A missing
+		// record throws, naming the key looked up and the keys the file does hold.
+		const record = requireRecord(readPluginData(data), target.vaultPath, data);
+		const kinds = record.folds.map((fold) => fold.kind);
 		state.setup = {
 			note,
+			vaultPath: target.vaultPath,
+			storedKinds: kinds,
+			storedHeadingAndTask: kinds.includes("heading") && kinds.includes("task"),
 			reset,
 			unfold,
 			cursor,
@@ -190,6 +209,9 @@ async function runRewrite(args, state) {
 async function runVerify(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
+		// The rewrite went to --note on disk; read the editor that shows --note, not whichever
+		// note happens to be active.
+		const target = await useNote(cdp, note);
 		const foldedLines = await readVisibleLines(cdp);
 		const onDiskText = readFileSync(note, "utf8");
 		const expectedText = state.rewrite?.afterText;
@@ -206,6 +228,7 @@ async function runVerify(args, state) {
 
 		state.verify = {
 			note,
+			vaultPath: target.vaultPath,
 			expand,
 			// GP3: Tuesday stays folded across the rewrite (checked before expanding it)...
 			tuesdayStillFolded,
@@ -229,7 +252,8 @@ function renderReport(state) {
 	}
 
 	const setupSection = section("GP1 (--phase setup)", state.setup, (d) => [
-		`- Note: \`${d.note}\``,
+		`- Note: \`${d.note}\` (vault path \`${d.vaultPath}\`, made the active editor first)`,
+		`- Stored fold kinds for that vault path after folding: ${JSON.stringify(d.storedKinds)}`,
 		`- Note reset to the before-fixture: ${JSON.stringify(d.reset)}`,
 		`- Unfolded anything left folded first: ${JSON.stringify(d.unfold)}`,
 		`- Cursor parked outside every fold: ${JSON.stringify(d.cursor)}`,
@@ -259,6 +283,7 @@ function renderReport(state) {
 		state.setup &&
 		state.setup.draftClick.folded &&
 		state.setup.tuesdayClick.folded &&
+		state.setup.storedHeadingAndTask &&
 		state.verify &&
 		state.verify.tuesdayStillFolded &&
 		state.verify.draftProposalV2StillFolded &&
