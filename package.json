@@ -12,6 +12,8 @@
 		"test:e2e:restore": "node scripts/e2e-restore-probe.mjs",
 		"test:e2e:dormant-baseline": "node scripts/e2e-dormant-baseline-probe.mjs",
 		"test:e2e:dormant-baseline-spec": "node tests/e2e/dormant-baseline.e2e.ts",
+		"test:e2e:relaunch": "node tests/e2e/relaunch.e2e.ts",
+		"test:e2e:rename-delete": "node tests/e2e/rename-delete.e2e.ts",
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
 	"keywords": [

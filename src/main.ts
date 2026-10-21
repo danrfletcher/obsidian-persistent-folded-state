@@ -171,7 +171,12 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 					const info = this.app.workspace.activeEditor;
 					if (!info || info.file?.path !== file.path) return;
 					const cm = (info.editor as unknown as { cm?: EditorView } | undefined)?.cm;
-					if (!cm) return;
+					if (!cm) {
+						// R4 (PR-7): `editor.cm` is undocumented. If Obsidian stops providing it
+						// open-restore would otherwise do nothing at all with no trace of why.
+						if (info.editor) console.debug("persistent-folded-state: open restore skipped: the active editor exposes no CM6 view (`editor.cm`)");
+						return;
+					}
 					const text = cm.state.doc.toString();
 					restoreOnOpen(cm, file.path, text, {
 						store: this.store,

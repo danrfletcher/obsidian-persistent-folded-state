@@ -140,22 +140,24 @@ function defaultYieldToHost(win: Window): () => Promise<void> {
 	return () => new Promise((resolve) => win.setTimeout(resolve, 0));
 }
 
-function foldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof foldEffect.of> | null {
+/** The CM6 fold span for a block: end of its first line to end of its last (nothing to hide ->
+ * `null`). Shared by the fold and unfold effects below, which differ only in the effect type. */
+function foldSpanFor(view: EditorView, range: LineRange): { from: number; to: number } | null {
 	if (!isFoldable(range)) return null;
 	if (range.endLine > view.state.doc.lines) return null;
 	const from = view.state.doc.line(range.startLine).to;
 	const to = view.state.doc.line(range.endLine).to;
-	if (from >= to) return null;
-	return foldEffect.of({ from, to });
+	return from >= to ? null : { from, to };
+}
+
+function foldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof foldEffect.of> | null {
+	const span = foldSpanFor(view, range);
+	return span ? foldEffect.of(span) : null;
 }
 
 function unfoldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof unfoldEffect.of> | null {
-	if (!isFoldable(range)) return null;
-	if (range.endLine > view.state.doc.lines) return null;
-	const from = view.state.doc.line(range.startLine).to;
-	const to = view.state.doc.line(range.endLine).to;
-	if (from >= to) return null;
-	return unfoldEffect.of({ from, to });
+	const span = foldSpanFor(view, range);
+	return span ? unfoldEffect.of(span) : null;
 }
 
 function dispatchFoldAndUnfold(view: EditorView, toFold: readonly LineRange[], toUnfold: readonly LineRange[]): void {
@@ -511,8 +513,8 @@ function applyStoredFoldsVerbatim(view: EditorView, folds: readonly StoredAnchor
 }
 
 /**
- * G8/E4: runs once when a Markdown pane for `path` is constructed and the store already has an
- * entry for it (the no-entry case is E5/G15, handled entirely separately by the caller — see
+ * G8/E4: runs on each `file-open` for `path` (src/main.ts) — a pane (re)opening that note — when
+ * the store already has an entry for it (the no-entry case is E5/G15, handled entirely separately by the caller — see
  * src/editor-watcher.ts). Never throws; every failure is caught and logged by the caller, same
  * discipline as every other async restore path in this plugin.
  */
