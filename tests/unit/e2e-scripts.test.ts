@@ -71,6 +71,28 @@ describe("real-Obsidian scripts share scripts/e2e-lib.mjs", () => {
 		});
 	}
 
+	// T99/T100/T102: a fold click acts on the *active* editor and the plugin stores folds under the
+	// note's vault-relative path. A script that folds without making --note the active editor, or
+	// that looks the record up under a typed-in key, folds one note and checks another.
+	for (const path of FOLDING_SCRIPTS) {
+		it(`${path} makes --note the active editor and derives the stored key from it`, () => {
+			const src = code(path);
+			expect(src).toMatch(/\buseNote\(/);
+			expect(src).not.toMatch(/--vault-path/);
+			expect(src).not.toMatch(/\b(DEFAULT_\w*VAULT_PATH|args\.vaultPath)\b/);
+			expect(src).not.toMatch(/files\[\s*["'`]/);
+			expect(src).not.toMatch(/recordFor\([^)]*,\s*["'`]/);
+		});
+	}
+
+	it("rename-delete creates the Archive folder before it moves the note into it (T101)", () => {
+		const src = code("tests/e2e/rename-delete.e2e.ts");
+		const create = src.indexOf("ensureFolderExpression(archiveFolder)");
+		const move = src.indexOf("renameFileExpression(renamedVaultPath, movedVaultPath)");
+		expect(create).toBeGreaterThan(-1);
+		expect(move).toBeGreaterThan(create);
+	});
+
 	it("the lib header names the scripts that actually use it", () => {
 		const header = read(LIB).slice(0, 1500);
 		for (const name of ["relaunch.e2e.ts", "rename-delete.e2e.ts"]) {

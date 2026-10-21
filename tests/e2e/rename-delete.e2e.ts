@@ -39,8 +39,12 @@
  *   node tests/e2e/rename-delete.e2e.ts
  *   node tests/e2e/rename-delete.e2e.ts --cdp-port 9222 --note /config/test-vault/Projects/Quarry/Tasks.md
  *
- * Accepts [--cdp-port 9222] [--note <path>] [--vault-path <Projects/Quarry/Tasks.md>]
- * [--data <path>] [--wait-ms 1500] [--help].
+ * Accepts [--cdp-port 9222] [--note <path>] [--data <path>] [--wait-ms 1500] [--help].
+ *
+ * T99/T100/T101: the note's vault-relative key (what the plugin stores folds under) is derived
+ * from the vault root Obsidian reports, not typed in; --note is made the active editor before
+ * any fold step; and the Archive folder the move targets is created through Obsidian first
+ * (the move used to stop with ENOENT because nothing created it).
  *
  * Not run by `npm test` (vitest's own `include` is `tests/**\/*.test.ts`, which this file's
  * `.e2e.ts` extension deliberately does not match) and not run automatically by this coder turn
@@ -50,20 +54,23 @@ import { copyFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	ensureFolderExpression,
 	evaluate,
 	foldAndConfirm,
 	parkCursorOutsideFolds,
 	readPluginData,
 	readVisibleLines,
+	renameDeletePaths,
+	requireRecord,
 	sleep,
 	unfoldAll,
+	useNote,
 	withConnection,
 } from "../../scripts/e2e-lib.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PLUGIN_ID = "persistent-folded-state";
 const DEFAULT_NOTE_PATH = "/config/test-vault/Projects/Quarry/Tasks.md";
-const DEFAULT_VAULT_PATH = "Projects/Quarry/Tasks.md";
 const DEFAULT_DATA_PATH = `/config/test-vault/.obsidian/plugins/${PLUGIN_ID}/data.json`;
 const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
 
@@ -72,7 +79,6 @@ const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
 interface Args {
 	cdpPort: number;
 	note: string;
-	vaultPath: string;
 	data: string;
 	waitMs: number;
 	help: boolean;
@@ -82,7 +88,6 @@ function parseArgs(argv: string[]): Args {
 	const args: Args = {
 		cdpPort: 9222,
 		note: DEFAULT_NOTE_PATH,
-		vaultPath: DEFAULT_VAULT_PATH,
 		data: DEFAULT_DATA_PATH,
 		waitMs: 1500,
 		help: false,
@@ -91,7 +96,6 @@ function parseArgs(argv: string[]): Args {
 		const arg = argv[i];
 		if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--note") args.note = argv[++i] ?? args.note;
-		else if (arg === "--vault-path") args.vaultPath = argv[++i] ?? args.vaultPath;
 		else if (arg === "--data") args.data = argv[++i] ?? args.data;
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--help" || arg === "-h") args.help = true;
@@ -108,8 +112,7 @@ function printUsage(): void {
 			"file comment for the 'Obsidian CLI' judgement call), asserting data.json and the",
 			"editor's rendered folds at each step (G9/G10).",
 			"",
-			"Options: [--cdp-port 9222] [--note <path>] [--vault-path <Projects/Quarry/Tasks.md>]",
-			"         [--data <path>] [--wait-ms 1500]",
+			"Options: [--cdp-port 9222] [--note <path>] [--data <path>] [--wait-ms 1500]",
 		].join("\n"),
 	);
 }
@@ -169,22 +172,36 @@ async function main(): Promise<void> {
 	}
 
 	const problems: string[] = [];
-	const quarryFolder = dirname(args.vaultPath); // "Projects/Quarry"
-	const renamedVaultPath = join(quarryFolder, "Tasks Q4.md");
-	const movedVaultPath = join("Projects/Archive", "Tasks Q4.md");
-	const renamedNotePath = join(dirname(args.note), "Tasks Q4.md");
-	const movedNotePath = join(dirname(args.note), "..", "Archive", "Tasks Q4.md");
 
 	copyFileSync(BEFORE_FIXTURE, args.note);
 	if (existsSync(args.data)) rmSync(args.data);
 
 	await withConnection(args.cdpPort, async (cdp) => {
 		// 1. Fresh start: open the note, fold two blocks by hand, confirm both are stored.
-		const opened = (await evaluate(cdp, openFileExpression(args.vaultPath), { awaitPromise: true })) as {
-			opened: boolean;
-			reason?: string;
-		};
-		if (!opened.opened) throw new Error(`initial open failed: ${opened.reason ?? "unknown"}`);
+		// T99/T100: the key is derived from the vault root Obsidian reports, and the note is the
+		// active editor before anything is folded.
+		const target = await useNote(cdp, args.note);
+		const vaultPath = target.vaultPath;
+		const { renamed: renamedVaultPath, archiveFolder, moved: movedVaultPath } = renameDeletePaths(vaultPath);
+		const renamedNotePath = join(target.basePath, renamedVaultPath);
+		const movedNotePath = join(target.basePath, movedVaultPath);
+		// An earlier run (or an earlier interrupted one) can leave its renamed/moved copy behind,
+		// and a rename onto an existing file fails. Clear a leftover only when it is byte-for-byte
+		// this run's own fixture; anything else is somebody's note — stop and say so.
+		for (const [leftoverVaultPath, leftoverNotePath] of [
+			[renamedVaultPath, renamedNotePath],
+			[movedVaultPath, movedNotePath],
+		] as const) {
+			if (!existsSync(leftoverNotePath)) continue;
+			if (readFileSync(leftoverNotePath, "utf8") !== readFileSync(BEFORE_FIXTURE, "utf8")) {
+				throw new Error(`${JSON.stringify(leftoverVaultPath)} already exists and is not a copy of the fixture; move it away and re-run`);
+			}
+			const cleared = (await evaluate(cdp, deleteFileExpression(leftoverVaultPath), { awaitPromise: true })) as {
+				deleted: boolean;
+				reason?: string;
+			};
+			if (!cleared.deleted) throw new Error(`could not clear the leftover ${JSON.stringify(leftoverVaultPath)}: ${cleared.reason ?? "unknown"}`);
+		}
 		await sleep(args.waitMs);
 		// R3: start from a note Obsidian did not restore (partly) folded — a fold click on a block
 		// that is still folded would *unfold* it — then park the cursor outside every foldable
@@ -209,21 +226,26 @@ async function main(): Promise<void> {
 		await sleep(args.waitMs);
 
 		let data = readPluginData(args.data);
-		const original = data?.files[args.vaultPath];
+		const original = data?.files[vaultPath];
 		if (!original) {
-			problems.push("setup: no stored entry for the note after folding — cannot proceed");
+			// Name the key looked up and the keys the file holds (requireRecord's message).
+			try {
+				requireRecord(data, vaultPath, args.data);
+			} catch (err) {
+				problems.push(`setup: ${(err as Error).message} — cannot proceed`);
+			}
 			return;
 		}
 
 		// 2. Same-folder rename: Tasks.md -> Tasks Q4.md.
-		const renamed = (await evaluate(cdp, renameFileExpression(args.vaultPath, renamedVaultPath), { awaitPromise: true })) as {
+		const renamed = (await evaluate(cdp, renameFileExpression(vaultPath, renamedVaultPath), { awaitPromise: true })) as {
 			renamed: boolean;
 			reason?: string;
 		};
 		if (!renamed.renamed) problems.push(`rename failed: ${renamed.reason ?? "unknown"}`);
 		await sleep(args.waitMs);
 		data = readPluginData(args.data);
-		if (data?.files[args.vaultPath]) problems.push("G9: old path still has a stored entry after rename");
+		if (data?.files[vaultPath]) problems.push("G9: old path still has a stored entry after rename");
 		const afterRename = data?.files[renamedVaultPath];
 		if (!afterRename) {
 			problems.push("G9: no stored entry under the new path after rename");
@@ -251,7 +273,10 @@ async function main(): Promise<void> {
 			if (onDisk !== before) problems.push("F1: the note's bytes on disk changed across the rename — they must be identical");
 		}
 
-		// 3. Cross-folder move: Tasks Q4.md -> Projects/Archive/Tasks Q4.md.
+		// 3. Cross-folder move: Tasks Q4.md -> <Archive folder beside the note's folder>/Tasks Q4.md.
+		// T101: the Archive folder does not exist in a fresh vault, and a rename into a missing
+		// folder fails with ENOENT. Create it through Obsidian's vault first.
+		await evaluate(cdp, ensureFolderExpression(archiveFolder), { awaitPromise: true });
 		const moved = (await evaluate(cdp, renameFileExpression(renamedVaultPath, movedVaultPath), { awaitPromise: true })) as {
 			renamed: boolean;
 			reason?: string;
@@ -275,7 +300,7 @@ async function main(): Promise<void> {
 		if (!deleted.deleted) problems.push(`delete failed: ${deleted.reason ?? "unknown"}`);
 		await sleep(args.waitMs);
 		data = readPluginData(args.data);
-		for (const path of [args.vaultPath, renamedVaultPath, movedVaultPath]) {
+		for (const path of [vaultPath, renamedVaultPath, movedVaultPath]) {
 			if (data?.files[path]) problems.push(`G10: a stored entry for "${path}" still exists after the delete`);
 		}
 	});

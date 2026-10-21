@@ -67,8 +67,14 @@
  *   node tests/e2e/dormant-baseline.e2e.ts
  *   node tests/e2e/dormant-baseline.e2e.ts --cdp-port 9222 --note /config/test-vault/Quarry/Tasks.md
  *
- * Accepts [--cdp-port 9222] [--note <path>] [--vault-path <Quarry/Tasks.md>]
- * [--data <path to this plugin's data.json>] [--wait-ms 1500] [--help].
+ * Accepts [--cdp-port 9222] [--note <path>] [--data <path to this plugin's data.json>]
+ * [--wait-ms 1500] [--help].
+ *
+ * T102: every fold step acts on the *active* editor, and a run used to fold whichever note
+ * happened to be active (not --note), so the reopened --note showed nothing folded and held
+ * only Obsidian's auto-folded frontmatter. The vault key is now derived from the vault root
+ * Obsidian reports (the old --vault-path option is gone), and --note is made the active editor,
+ * and confirmed, before the folds in each case.
  *
  * Not run by `npm test` (vitest's own `include` is `tests/**\/*.test.ts`, which this file's
  * `.e2e.ts` extension deliberately does not match) and not run automatically by this coder
@@ -87,6 +93,7 @@ import {
 	recordFor,
 	sleep,
 	unfoldAll,
+	useNote,
 	visibleLinesInclude,
 	withConnection,
 	writePluginData,
@@ -95,7 +102,6 @@ import {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PLUGIN_ID = "persistent-folded-state";
 const DEFAULT_NOTE_PATH = "/config/test-vault/Quarry/Tasks.md";
-const DEFAULT_VAULT_PATH = "Quarry/Tasks.md";
 const DEFAULT_DATA_PATH = `/config/test-vault/.obsidian/plugins/${PLUGIN_ID}/data.json`;
 const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
 
@@ -104,7 +110,6 @@ type Cdp = Parameters<typeof foldAndConfirm>[0];
 interface Args {
 	cdpPort: number;
 	note: string;
-	vaultPath: string;
 	data: string;
 	waitMs: number;
 	help: boolean;
@@ -114,7 +119,6 @@ function parseArgs(argv: string[]): Args {
 	const args: Args = {
 		cdpPort: 9222,
 		note: DEFAULT_NOTE_PATH,
-		vaultPath: DEFAULT_VAULT_PATH,
 		data: DEFAULT_DATA_PATH,
 		waitMs: 1500,
 		help: false,
@@ -123,7 +127,6 @@ function parseArgs(argv: string[]): Args {
 		const arg = argv[i];
 		if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--note") args.note = argv[++i] ?? args.note;
-		else if (arg === "--vault-path") args.vaultPath = argv[++i] ?? args.vaultPath;
 		else if (arg === "--data") args.data = argv[++i] ?? args.data;
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--help" || arg === "-h") args.help = true;
@@ -139,8 +142,7 @@ function printUsage(): void {
 			"Runs both the close+reopen and re-enable-over-an-open-pane first-open-baseline cases",
 			"(T4/R2/R7) against a real, already-running Obsidian.",
 			"",
-			"Options: [--cdp-port 9222] [--note <path>] [--vault-path <Quarry/Tasks.md>]",
-			`         [--data <path>] [--wait-ms 1500]`,
+			"Options: [--cdp-port 9222] [--note <path>] [--data <path>] [--wait-ms 1500]",
 			"",
 			`--note defaults to ${DEFAULT_NOTE_PATH}, --data to ${DEFAULT_DATA_PATH}.`,
 			"Requires a real Obsidian launched with --remote-debugging-port, this plugin built and",
@@ -204,6 +206,11 @@ async function runCase(
 ): Promise<CaseResult> {
 	const problems: string[] = [];
 
+	// 0. T102: make --note the active editor and learn the key the plugin stores it under. Done
+	// before anything else so the unfold/park/fold steps below act on this note, not on
+	// whichever one an earlier case (or the operator) left active.
+	const { vaultPath } = await useNote(cdp, args.note);
+
 	// 1. Disable the plugin.
 	await evaluate(cdp, disablePluginExpression(), { awaitPromise: true });
 
@@ -240,7 +247,7 @@ async function runCase(
 	// 5. Either close+reopen the note (first case) or leave the already-open pane alone (second
 	// case — R7's "re-enable over an open pane").
 	if (reopen) {
-		const reopened = (await evaluate(cdp, closeAndReopenExpression(args.vaultPath), { awaitPromise: true })) as {
+		const reopened = (await evaluate(cdp, closeAndReopenExpression(vaultPath), { awaitPromise: true })) as {
 			reopened: boolean;
 			reason?: string;
 		};
@@ -251,9 +258,12 @@ async function runCase(
 
 	// 6. Assert: two anchors, the content hash, and both blocks still hidden.
 	const data = readPluginData(args.data);
-	const record = recordFor(data, args.vaultPath);
+	const record = recordFor(data, vaultPath);
 	if (!record) {
-		problems.push("no stored entry for the note at all after enabling the plugin");
+		problems.push(
+			`no stored entry for ${JSON.stringify(vaultPath)} at all after enabling the plugin ` +
+				`(data.json holds: ${JSON.stringify(data ? Object.keys(data.files) : null)})`,
+		);
 		return { name, ok: problems.length === 0, problems };
 	}
 

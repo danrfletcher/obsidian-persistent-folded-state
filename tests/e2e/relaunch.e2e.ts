@@ -48,9 +48,15 @@
  *   # relaunch Obsidian by hand, open --note
  *   node tests/e2e/relaunch.e2e.ts --phase after-relaunch
  *
- * Accepts [--cdp-port 9222] [--note <path>] [--vault-path <Projects/Quarry/Tasks.md>]
- * [--data <path>] [--wait-ms 1500] [--connect-retries 30] [--connect-retry-delay-ms 2000]
- * (after-relaunch only) [--help].
+ * Accepts [--cdp-port 9222] [--note <path>] [--data <path>] [--wait-ms 1500]
+ * [--connect-retries 30] [--connect-retry-delay-ms 2000] (after-relaunch only) [--help].
+ *
+ * T99/T100: the plugin stores a note's folds under its vault-relative path, and every fold step
+ * acts on the *active* editor. This script no longer takes the key on trust (the old
+ * `--vault-path` option, whose default named a note that was not the one open): it asks Obsidian
+ * for the vault root, derives the key from --note, makes --note the active editor before it
+ * folds or reads anything, and, when no record is stored, fails naming that key together with
+ * the keys data.json actually holds.
  *
  * Not run by `npm test` (vitest's own `include` is `tests/**\/*.test.ts`, which this file's
  * `.e2e.ts` extension deliberately does not match) and not run automatically by this coder turn
@@ -67,15 +73,16 @@ import {
 	parkCursorOutsideFolds,
 	readPluginData,
 	readVisibleLines,
+	requireRecord,
 	sleep,
 	unfoldAll,
+	useNote,
 	withConnection,
 } from "../../scripts/e2e-lib.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PLUGIN_ID = "persistent-folded-state";
 const DEFAULT_NOTE_PATH = "/config/test-vault/Projects/Quarry/Tasks.md";
-const DEFAULT_VAULT_PATH = "Projects/Quarry/Tasks.md";
 const DEFAULT_DATA_PATH = `/config/test-vault/.obsidian/plugins/${PLUGIN_ID}/data.json`;
 const BEFORE_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-before.md");
 const AFTER_FIXTURE = join(ROOT, "tests", "fixtures", "tasks-after.md");
@@ -89,7 +96,6 @@ interface Args {
 	phase?: Phase;
 	cdpPort: number;
 	note: string;
-	vaultPath: string;
 	data: string;
 	waitMs: number;
 	connectRetries: number;
@@ -101,7 +107,6 @@ function parseArgs(argv: string[]): Args {
 	const args: Args = {
 		cdpPort: 9222,
 		note: DEFAULT_NOTE_PATH,
-		vaultPath: DEFAULT_VAULT_PATH,
 		data: DEFAULT_DATA_PATH,
 		waitMs: 1500,
 		connectRetries: 30,
@@ -113,7 +118,6 @@ function parseArgs(argv: string[]): Args {
 		if (arg === "--phase") args.phase = argv[++i] as Phase;
 		else if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--note") args.note = argv[++i] ?? args.note;
-		else if (arg === "--vault-path") args.vaultPath = argv[++i] ?? args.vaultPath;
 		else if (arg === "--data") args.data = argv[++i] ?? args.data;
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--connect-retries") args.connectRetries = Number(argv[++i]);
@@ -135,8 +139,7 @@ function printUsage(): void {
 			"  --phase rewrite          overwrite --note with tests/fixtures/tasks-after.md (no CDP)",
 			"  --phase after-relaunch   reconnect (retrying) and assert the GP4 outcome",
 			"",
-			"Options: [--cdp-port 9222] [--note <path>] [--vault-path <Projects/Quarry/Tasks.md>]",
-			"         [--data <path>] [--wait-ms 1500]",
+			"Options: [--cdp-port 9222] [--note <path>] [--data <path>] [--wait-ms 1500]",
 			"         [--connect-retries 30] [--connect-retry-delay-ms 2000] (after-relaunch only)",
 		].join("\n"),
 	);
@@ -149,6 +152,9 @@ async function runBeforeQuit(args: Args): Promise<void> {
 	if (existsSync(args.data)) rmSync(args.data);
 
 	await withConnection(args.cdpPort, async (cdp) => {
+		// T99/T100: fold the note --note names, and look it up under the key the plugin uses.
+		const target = await useNote(cdp, args.note);
+		await sleep(args.waitMs);
 		// R3: start from a note Obsidian did not restore (partly) folded — a fold click on a block
 		// that is still folded would *unfold* it. Wait until the lines the folds below hide are
 		// back in the DOM (Obsidian's auto-folded frontmatter may stay folded; it is not listed).
@@ -179,17 +185,16 @@ async function runBeforeQuit(args: Args): Promise<void> {
 		}
 		await sleep(args.waitMs);
 
-		const data = readPluginData(args.data);
-		const record = data?.files[args.vaultPath];
-		if (!record) throw new Error("no stored entry for the note after folding — cannot proceed to quit");
+		const record = requireRecord(readPluginData(args.data), target.vaultPath, args.data);
 		const nonFrontmatter = record.folds.filter((f) => f.kind !== "frontmatter");
 		if (nonFrontmatter.length < 2) {
 			throw new Error(
-				`expected at least 2 stored anchors (Tuesday heading + Draft proposal task), got ${nonFrontmatter.length}`,
+				`expected at least 2 stored anchors (Tuesday heading + Draft proposal task) under ${JSON.stringify(target.vaultPath)}, ` +
+					`got ${nonFrontmatter.length}: ${JSON.stringify(record.folds.map((fold) => fold.kind))}`,
 			);
 		}
 
-		console.log("PASS before-quit: folds set and stored. Quit Obsidian now, then run --phase rewrite.");
+		console.log(`PASS before-quit: folds set and stored under ${JSON.stringify(target.vaultPath)}. Quit Obsidian now, then run --phase rewrite.`);
 	});
 }
 
@@ -208,12 +213,18 @@ async function runAfterRelaunch(args: Args): Promise<void> {
 	await withConnection(
 		args.cdpPort,
 		async (cdp) => {
+			// The operator opens --note after the relaunch; make sure it really is the active
+			// editor (and learn its vault key) before reading folds off the screen.
+			const target = await useNote(cdp, args.note);
 			await sleep(args.waitMs);
 
 			const data = readPluginData(args.data);
-			const record = data?.files[args.vaultPath];
+			const record = data?.files[target.vaultPath];
 			if (!record) {
-				problems.push("no stored entry for the note after relaunch");
+				problems.push(
+					`no stored entry for ${JSON.stringify(target.vaultPath)} after relaunch ` +
+						`(data.json holds: ${JSON.stringify(data ? Object.keys(data.files) : null)})`,
+				);
 			} else {
 				const onDiskText = readFileSync(args.note, "utf8");
 				const expectedHash = hashText(onDiskText);
