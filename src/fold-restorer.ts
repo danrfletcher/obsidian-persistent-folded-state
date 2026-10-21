@@ -272,7 +272,7 @@ function toDeferredFoldTarget(view: EditorView, anchor: Anchor | undefined, rang
  */
 export async function restoreSettledChange(
 	view: EditorView,
-	path: string,
+	triggerPath: string,
 	text: string,
 	deps: RestoreRunDeps,
 ): Promise<DeferredFoldTarget[]> {
@@ -285,7 +285,19 @@ export async function restoreSettledChange(
 	// entry under a key nothing on disk answers to any more. The later, narrower check further
 	// down (after the possibly-slow match) still applies for the case where the rename arrives
 	// *during* that match.
-	if (deps.getActivePath(view) !== path) return [];
+	//
+	// R7 (PR-7): a rename that lands inside the settle window is re-targeted rather than
+	// dropped. The pane's file kept the very text this run was handed, so it is the same note
+	// under its new path (the store entry was re-keyed by `handleRename`): restore against the
+	// path the pane shows now. A pane that moved to a *different* file shows different text and
+	// is still dropped (an identical-text different file is restored under its own path, which
+	// is also correct: the entry and the text belong together).
+	let path = triggerPath;
+	const activePath = deps.getActivePath(view);
+	if (activePath !== path) {
+		if (activePath === null || view.state.doc.toString() !== text) return [];
+		path = activePath;
+	}
 
 	const snapshot = deps.store.get(path);
 	if (!snapshot) {
