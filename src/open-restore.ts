@@ -280,6 +280,34 @@ function cleanupSpuriousNativeFolds(
 	}
 }
 
+/** R8 (PR-5): re-adds the stored entry for each refolded `range` that churn removed. */
+function restoreRefoldedEntries(
+	store: FoldStore,
+	path: string,
+	candidates: readonly AnchoredBlock[],
+	refolded: readonly LineRange[],
+): void {
+	const latest = store.get(path);
+	if (!latest) return;
+	const folds = new Map<string, StoredAnchor>();
+	for (const raw of latest.folds) {
+		const anchor = parseAnchor(raw);
+		if (anchor) folds.set(anchorKey(anchor), raw);
+	}
+	let changed = false;
+	for (const range of refolded) {
+		const candidate = candidates.find((c) => sameRange(c.range, range));
+		if (!candidate) continue;
+		const key = anchorKey(candidate.anchor);
+		if (folds.has(key)) continue;
+		folds.set(key, candidate.anchor as unknown as StoredAnchor);
+		changed = true;
+	}
+	if (changed) {
+		store.set(path, { contentHash: latest.contentHash, folds: Array.from(folds.values()), dormant: latest.dormant });
+	}
+}
+
 function rangeKey(r: LineRange): string {
 	return `${r.startLine}:${r.endLine}`;
 }
@@ -412,6 +440,11 @@ function scheduleNativeRestoreGuard(
 
 		dispatchFoldAndUnfold(live, toFold, toUnfold);
 		if (toUnfold.length > 0) cleanupSpuriousNativeFolds(store, path, candidates, toUnfold);
+		// R8 (PR-5): the native restore that churned the pane unfolded the matched targets in an
+		// ordinary (untagged) transaction, which the recorder takes for the user's own unfold and
+		// now resolves to the stored entry; this guard's refold is tagged OWN_FOLD and so is not
+		// recorded. Put back the entries for what it just refolded.
+		if (nativeChurn && toFold.length > 0) restoreRefoldedEntries(store, path, candidates, toFold);
 	};
 	for (const delay of delaysMs) {
 		win.setTimeout(check, delay);

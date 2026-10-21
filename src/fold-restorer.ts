@@ -387,7 +387,21 @@ export async function restoreSettledChange(
 
 		let dormantList = dormantResult.stillDormant;
 		for (let i = 0; i < storedAnchors.length; i++) {
-			if (matches[i]?.tier !== "none") continue;
+			const match = matches[i];
+			if (match?.tier !== "none") {
+				// R8 (PR-5): re-key the stored entry to the block it matched, as that block reads
+				// now. A fuzzy or sibling-shifted match otherwise leaves the old anchor stored, so
+				// the user's later unfold of this block (whose anchor `describeFold` builds from the
+				// current text) misses it and the next external write folds the block again.
+				const matchedBlock = match ? liveCandidates[match.target] : undefined;
+				if (!matchedBlock) continue;
+				const oldKey = anchorKey(storedAnchors[i]);
+				const newKey = anchorKey(matchedBlock.anchor);
+				if (oldKey === newKey || !activeFolds.has(oldKey)) continue; // E3: removed meanwhile
+				activeFolds.delete(oldKey);
+				if (!activeFolds.has(newKey)) activeFolds.set(newKey, matchedBlock.anchor as unknown as StoredAnchor);
+				continue;
+			}
 			const key = anchorKey(storedAnchors[i]);
 			if (!activeFolds.has(key)) continue; // E3: the user already removed it meanwhile
 			activeFolds.delete(key);
@@ -437,8 +451,14 @@ export async function restoreSettledChange(
 		});
 	}
 
+	// R8: a deferred target is keyed by the anchor now stored for its block (the re-keyed one),
+	// so the later `liveAnchorKeys` recheck (applyReadyDeferredFolds) still finds it.
 	const activeDeferred = plan.deferred
-		.map((target) => toDeferredFoldTarget(view, storedAnchors[target.anchorIndex], target.range))
+		.map((target) => {
+			const matched = matches[target.anchorIndex];
+			const block = matched && matched.tier !== "none" ? liveCandidates[matched.target] : undefined;
+			return toDeferredFoldTarget(view, block?.anchor ?? storedAnchors[target.anchorIndex], target.range);
+		})
 		.filter((target): target is DeferredFoldTarget => target !== null);
 	const dormantDeferred = dormantPlan.deferred
 		.map((target: FoldTarget) => toDeferredFoldTarget(view, dormantMatchedAnchors[target.anchorIndex], target.range))
