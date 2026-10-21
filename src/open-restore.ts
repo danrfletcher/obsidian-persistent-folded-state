@@ -236,11 +236,20 @@ function dispatchFoldAndUnfold(view: EditorView, toFold: readonly LineRange[], t
  * real, slow relaunch gets enough chances to be caught; `OpenRestoreDeps.guardDelaysMs` lets
  * tests shrink that schedule to run fast without waiting out the real one.
  *
- * Residual, accepted gap (unchanged from R9, still deferred): a native restore that purely
- * *adds* a stale fold without ever disturbing one of this guard's own targets (R9's case (c)) is
- * still only caught by the simple one-shot's first check, same as before T19's fix — there is no
- * available signal to tell that apart from a user folding some new, previously-untouched block in
- * isolation, and guessing wrong there would reintroduce R8's own regression. */
+ * R9/R10 (PR-7): the one-shot above is no longer spent by the `onLayoutReady` call that fires
+ * synchronously inside `restoreOnOpen` (that call runs before any late native fold can exist), so
+ * the first *timed* check is the one that decides — a native fold that purely adds a stale line
+ * after a layout-ready open is caught there. The churn correction only counts a fold as evidence
+ * if it was not live at the previous check, and only unfolds those: a fold that has survived a
+ * check is the user's and is never unfolded and never has its anchor cleaned up.
+ *
+ * Residual, accepted gap: a native restore that purely *adds* a stale fold after the first timed
+ * check has passed is still not caught — there is no available signal to tell that apart from a
+ * user folding some new, previously-untouched block in isolation, and guessing wrong there would
+ * reintroduce R8's own regression. Likewise, a user who unfolds a matched block and folds another
+ * line within one check interval looks, at check level, exactly like a native restore replacing
+ * the fold state in one transaction (CM6 gives the guard no per-transaction view), so that pair
+ * is corrected back; the two actions are only safe when a check runs between them. */
 const NATIVE_RESTORE_GUARD_DELAYS_MS: readonly number[] = [50, 300, 1000, 2500, 5000, 8000, 12000, 16000];
 
 /** T1: the one concrete side effect a late, untagged native-restore transaction has been
@@ -367,8 +376,15 @@ function scheduleNativeRestoreGuard(
 	// so it's treated as a fresh pane to correct rather than one whose folds might have been
 	// user-undone.
 	let lastView: EditorView = view;
+	// R10 (PR-7): what was live when the previous check finished (seeded with what the open's own
+	// dispatch left live). A fold counts as new churn evidence only if it was not in this set; one
+	// that has already survived a check is never unfolded or cleaned up again.
+	let previousLive = new Set<string>(knownLiveAtOpen.map(rangeKey));
 
-	const check = (): void => {
+	// `syncAtOpen`: true only for the `onLayoutReady` call that fires synchronously inside this very
+	// open (layout was already ready). R9 (PR-7): that call runs before any late native fold can have
+	// landed, so it must not spend the one-shot unfold decision below.
+	const check = (syncAtOpen: boolean): void => {
 		// T8: re-resolve fresh every time rather than trusting the closed-over `view` — see
 		// this function's own file comment (T8) for why.
 		const live = resolveView?.(path) ?? view;
@@ -379,6 +395,7 @@ function scheduleNativeRestoreGuard(
 			everLive.clear();
 			reverted.clear();
 			unfoldDecided = false;
+			previousLive = new Set<string>(knownLiveAtOpen.map(rangeKey));
 		}
 		const nativeFolded = liveFoldedLineRanges(live.state);
 		const cursorLine = cursorLineOf(live);
@@ -394,8 +411,10 @@ function scheduleNativeRestoreGuard(
 		// unprotected fold appears is native restore replacing the whole fold set wholesale, not
 		// a deliberate, isolated user unfold — a lone user action never coincides with some other,
 		// previously-untouched line spontaneously folding itself in the same check.
+		// R10 (PR-7): only folds that were not already live at the previous check are evidence.
+		const newStale = staleNow.filter((n) => !previousLive.has(rangeKey(n)));
 		const nativeChurn =
-			staleNow.length > 0 &&
+			newStale.length > 0 &&
 			foldTargets.some((target) => {
 				const key = rangeKey(target);
 				if (reverted.has(key) || !everLive.has(key)) return false;
@@ -424,17 +443,18 @@ function scheduleNativeRestoreGuard(
 		});
 
 		let toUnfold: LineRange[] = [];
-		if (!unfoldDecided) {
+		if (nativeChurn) {
+			// T19/T20/T22 + R10 (PR-7): a target went missing in the very check a brand-new
+			// unprotected fold appeared — native restore replacing the fold state wholesale, at any
+			// check in the window. Only the new fold is unfolded: one that already survived an
+			// earlier check is the user's.
+			if (!syncAtOpen) unfoldDecided = true;
+			toUnfold = newStale;
+		} else if (!unfoldDecided && !syncAtOpen) {
 			// The simple, one-shot decision — still exactly what T1/T8 need (a fast-arriving
 			// late native restore shows up at this, the very first live check) without
 			// re-litigating every later check's live state against an isolated user action.
 			unfoldDecided = true;
-			toUnfold = staleNow;
-		} else if (nativeChurn) {
-			// T19/T20/T22: even once the simple decision above already ran and found nothing
-			// (the common case when a real relaunch's native restore hasn't landed by the
-			// first check), a later check that catches the correlated "target missing + new
-			// stale fold" signal still corrects it, however many checks that takes.
 			toUnfold = staleNow;
 		}
 
@@ -445,15 +465,18 @@ function scheduleNativeRestoreGuard(
 		// now resolves to the stored entry; this guard's refold is tagged OWN_FOLD and so is not
 		// recorded. Put back the entries for what it just refolded.
 		if (nativeChurn && toFold.length > 0) restoreRefoldedEntries(store, path, candidates, toFold);
+		previousLive = new Set<string>(liveFoldedLineRanges(live.state).map(rangeKey));
 	};
 	for (const delay of delaysMs) {
-		win.setTimeout(check, delay);
+		win.setTimeout(() => check(false), delay);
 	}
 	// T8: one more check tied to Obsidian's own "layout (including every deferred leaf) is
 	// actually ready" event, rather than a third guessed delay — see this function's own file
 	// comment. Fires immediately if layout is already ready (redundant with, but no more
 	// costly than, the 300ms check above in that case).
-	onLayoutReady?.(check);
+	let registering = true;
+	onLayoutReady?.(() => check(registering));
+	registering = false;
 }
 
 /** G8 (hash unchanged): applies `folds` as stored, with no matching at all — content is
