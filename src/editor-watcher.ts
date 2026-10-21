@@ -337,6 +337,11 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			})
 				.then((deferred) => {
 					if (this.destroyed) return;
+					// R9 (PR-5): a run that a newer non-user change has superseded resolves
+					// to [] — it must not overwrite the newer run's own deferred targets
+					// (an E6-sized match can take longer than the 150ms settle, so the
+					// older run may resolve last).
+					if (this.generation !== startGeneration) return;
 					this.pendingDeferred = deferred;
 				})
 				.catch((err: unknown) => {

@@ -119,13 +119,24 @@ describe("planRestore: G13 — cursor inside a block that would be re-folded", (
 		expect(plan.deferred).toEqual([]);
 	});
 
-	it("a cursor exactly on the range's boundary line still counts as inside (deferred)", () => {
+	it("R5: a cursor on the block's first line is NOT inside — the fold starts at the end of that line, so it hides nothing under the cursor", () => {
 		const stored = storedFrom(before);
 		const candidates = candidatesFrom(before);
 		const range = candidates[0].range;
 		const matches = matchesFor(stored, { 0: { tier: "exact", target: 0 } });
 
 		const plan = planRestore(baseInput({ stored, matches, candidates, cursorLine: range.startLine }));
+		expect(plan.toFold).toEqual([{ anchorIndex: 0, range }]);
+		expect(plan.deferred).toEqual([]);
+	});
+
+	it("a cursor on the block's last line still counts as inside (deferred)", () => {
+		const stored = storedFrom(before);
+		const candidates = candidatesFrom(before);
+		const range = candidates[0].range;
+		const matches = matchesFor(stored, { 0: { tier: "exact", target: 0 } });
+
+		const plan = planRestore(baseInput({ stored, matches, candidates, cursorLine: range.endLine }));
 		expect(plan.toFold).toEqual([]);
 		expect(plan.deferred).toHaveLength(1);
 	});
@@ -206,6 +217,35 @@ describe("planRestore: idempotent re-apply", () => {
 		const plan = planRestore(baseInput({ stored, matches, candidates, alreadyFolded: [candidates[0].range] }));
 		expect(plan.toFold).toEqual([]);
 		expect(plan.deferred).toEqual([]);
+	});
+});
+
+describe("planRestore: R3 — a live fold starting on the block's first line counts as already folded", () => {
+	// A tasks note with a blank separator after the task: buildAnchors' range for the task runs
+	// through the blank line, but a fold made with Obsidian's own fold service stops short of it.
+	const text = "- [ ] Draft proposal\n\t- [ ] sub task\n\n- [ ] Send invoices";
+
+	it("a native fold ending a blank line short of the candidate's range is not folded again", () => {
+		const stored = storedFrom(text).slice(0, 1);
+		const candidates = candidatesFrom(text);
+		const range = candidates[0].range;
+		expect(range.endLine).toBeGreaterThan(2); // the candidate really does include the blank line
+		const matches = matchesFor(stored, { 0: { tier: "exact", target: 0 } });
+		const nativeFold = { startLine: range.startLine, endLine: 2 };
+
+		const plan = planRestore(baseInput({ stored, matches, candidates, alreadyFolded: [nativeFold] }));
+		expect(plan.toFold).toEqual([]);
+		expect(plan.deferred).toEqual([]);
+	});
+
+	it("a live fold that starts on a different line does not count", () => {
+		const stored = storedFrom(text).slice(0, 1);
+		const candidates = candidatesFrom(text);
+		const range = candidates[0].range;
+		const matches = matchesFor(stored, { 0: { tier: "exact", target: 0 } });
+
+		const plan = planRestore(baseInput({ stored, matches, candidates, alreadyFolded: [{ startLine: range.startLine + 1, endLine: range.endLine }] }));
+		expect(plan.toFold).toEqual([{ anchorIndex: 0, range }]);
 	});
 });
 

@@ -83,7 +83,7 @@ import type { EditorView } from "@codemirror/view";
 import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
 import { liveFoldedLineRanges } from "./live-folds";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
-import { planRestore, type FoldTarget } from "./restore-plan";
+import { isAlreadyFolded, planRestore, type FoldTarget } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
 import { hashText, type FoldStore } from "./fold-store";
 import {
@@ -238,10 +238,14 @@ function mapCandidatesForward(candidates: AnchoredBlock[], text: string, changes
 
 /** Builds a `DeferredFoldTarget` (R2) from a plan's own `FoldTarget` (anchor index + line range,
  * already in live-doc coordinates — see `restoreSettledChange`) — the character-offset span that
- * gets mapped forward through later changes until the cursor leaves it. */
+ * gets mapped forward through later changes until the cursor leaves it. R5 (PR-5): the span is
+ * the part the fold would hide, so `from` is the end of the block's first line (where the fold
+ * starts), not the start of that line: a cursor resting on the heading/task line itself is
+ * outside the span, matching `planRestore`'s own "inside" rule. */
 function toDeferredFoldTarget(view: EditorView, anchor: Anchor | undefined, range: LineRange): DeferredFoldTarget | null {
 	if (!anchor) return null; // defensive: `target.anchorIndex` should always index a real stored anchor
-	const { from, to } = blockSpan(view.state.doc, range);
+	const { from: blockFrom, to } = blockSpan(view.state.doc, range);
+	const from = view.state.doc.lineAt(blockFrom).to;
 	return { anchorKey: anchorKey(anchor), from, to };
 }
 
@@ -416,9 +420,9 @@ export async function restoreSettledChange(
 				continue;
 			}
 			const candidate = liveCandidates[match.candidateIndex];
-			const alreadyLive =
-				candidate !== undefined &&
-				alreadyFolded.some((r) => r.startLine === candidate.range.startLine && r.endLine === candidate.range.endLine);
+			// R15 (PR-6)/R3 (PR-5): the same start-line test the planner uses, so a native fold
+			// that ends a blank line short of (or past) the candidate still counts as live.
+			const alreadyLive = candidate !== undefined && isAlreadyFolded(alreadyFolded, candidate.range);
 			if (alreadyLive) {
 				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
 			} else {
@@ -442,7 +446,7 @@ export async function restoreSettledChange(
 	return [...activeDeferred, ...dormantDeferred];
 }
 
-/** R2: maps every still-deferred target's character span forward through one update's own
+/** R2: maps every still-deferred target's character span (from the end of its first line to the end of its last, R5) forward through one update's own
  * `ChangeDesc` — called unconditionally by src/editor-watcher.ts on every update that carries a
  * document change, so a line added or removed inside (or around) a deferred block keeps its
  * span over the same content rather than the stale line numbers it was captured with. A block
@@ -451,7 +455,9 @@ export async function restoreSettledChange(
 export function mapDeferredTargets(targets: readonly DeferredFoldTarget[], changes: ChangeDesc): DeferredFoldTarget[] {
 	const mapped: DeferredFoldTarget[] = [];
 	for (const target of targets) {
-		const from = changes.mapPos(target.from, -1);
+		// `from` is the end of the block's first line (R5): bias +1 keeps text typed at the end of
+		// that line (before the fold) outside the span, while `to` keeps its +1 bias.
+		const from = changes.mapPos(target.from, 1);
 		const to = changes.mapPos(target.to, 1);
 		if (to <= from) continue; // the block this would have folded no longer exists
 		mapped.push({ anchorKey: target.anchorKey, from, to });
@@ -479,7 +485,7 @@ export function applyReadyDeferredFolds(
 	for (const target of pending) {
 		if (!liveAnchorKeys.has(target.anchorKey)) continue; // R2: forgotten/unfolded while deferred
 
-		const inside = cursorPos >= target.from && cursorPos <= target.to;
+		const inside = cursorPos > target.from && cursorPos <= target.to; // R5: not on the first line
 		if (inside) {
 			stillPending.push(target);
 			continue;
