@@ -29,28 +29,77 @@ function stripComments(text: string): string {
 
 const sources = FILES.map((f) => ({ file: f, text: readFileSync(f, "utf8"), code: stripComments(readFileSync(f, "utf8")) }));
 
-const FORBIDDEN_IMPORTS: { label: string; pattern: RegExp }[] = [
-	{ label: 'import ... from "obsidian"', pattern: /from\s+["']obsidian["']/ },
-	{ label: 'import ... from "@codemirror/*"', pattern: /from\s+["']@codemirror\// },
-	{ label: 'import ... from "fs"', pattern: /from\s+["']fs["']/ },
-	{ label: 'import ... from "node:*"', pattern: /from\s+["']node:/ },
-	{ label: 'require("obsidian")', pattern: /require\(\s*["']obsidian["']\s*\)/ },
-	{ label: 'require("@codemirror/*")', pattern: /require\(\s*["']@codemirror\// },
-	{ label: 'require("fs")', pattern: /require\(\s*["']fs["']\s*\)/ },
-	{ label: 'require("node:*")', pattern: /require\(\s*["']node:/ },
+/** R6 (PR-3): every way a module can pull in another one, not just `from "x"`: a static import
+ * (`import x from "m"`, `export * from "m"`), a side-effect import (`import "m"`), a dynamic
+ * import (`import("m")`) and `require("m")`. The pure modules may only reach siblings, so
+ * every specifier found must be relative (`./...`). */
+const MODULE_SPECIFIER_PATTERNS: RegExp[] = [
+	/\bfrom\s*["']([^"']+)["']/g,
+	/\bimport\s*["']([^"']+)["']/g,
+	/\bimport\s*\(\s*["'`]([^"'`]+)["'`]/g,
+	/\brequire\s*\(\s*["'`]([^"'`]+)["'`]/g,
 ];
+
+/** Any `import(...)`/`require(...)` call whose argument is not a plain string literal can't be
+ * checked statically, so it is itself forbidden. */
+const NON_LITERAL_LOAD = /\b(?:import|require)\s*\(\s*(?!["'`])/;
+
+function moduleSpecifiers(code: string): string[] {
+	const found: string[] = [];
+	for (const pattern of MODULE_SPECIFIER_PATTERNS) {
+		for (const match of code.matchAll(pattern)) found.push(match[1]);
+	}
+	return found;
+}
 
 const FORBIDDEN_GLOBALS: { label: string; pattern: RegExp }[] = [
 	{ label: "fetch(", pattern: /\bfetch\s*\(/ },
 	{ label: "localStorage", pattern: /\blocalStorage\b/ },
-	{ label: "document", pattern: /\bdocument\./ },
+	// Any reference to `document`, not only `document.` — `document[...]`, `typeof document`,
+	// `const d = document` and a bare `document` are all DOM use.
+	{ label: "document", pattern: /\bdocument\b/ },
+	{ label: "window", pattern: /\bwindow\b/ },
+	{ label: "globalThis", pattern: /\bglobalThis\b/ },
+	{ label: "navigator", pattern: /\bnavigator\b/ },
+	{ label: "process", pattern: /\bprocess\b/ },
 ];
 
+describe("purity scan: the detectors catch the shapes they exist for (R6)", () => {
+	it.each([
+		['import "fs";', "fs"],
+		['import("node:fs")', "node:fs"],
+		["await import(`node:fs`)", "node:fs"],
+		['import x from "obsidian";', "obsidian"],
+		['export * from "@codemirror/state";', "@codemirror/state"],
+		['const fs = require("fs");', "fs"],
+	])("finds the module specifier in %s", (code, specifier) => {
+		expect(moduleSpecifiers(code)).toContain(specifier);
+	});
+
+	it("flags an import()/require() whose argument is not a string literal", () => {
+		expect('import(name)').toMatch(NON_LITERAL_LOAD);
+		expect("require(modules[0])").toMatch(NON_LITERAL_LOAD);
+		expect('import("./normalize")').not.toMatch(NON_LITERAL_LOAD);
+	});
+
+	it.each(["document[key]", "typeof document", "const d = document;", "document.body", "window.x", "globalThis.fetch"])(
+		"flags DOM/global use in %s",
+		(code) => {
+			expect(FORBIDDEN_GLOBALS.some(({ pattern }) => pattern.test(code))).toBe(true);
+		},
+	);
+});
+
 describe("purity (F1/F8/F9): src/normalize.ts and src/anchors.ts have no I/O", () => {
-	for (const { file, text, code } of sources) {
+	for (const { file, code } of sources) {
 		describe(file, () => {
-			it.each(FORBIDDEN_IMPORTS)("does not import or require $label", ({ pattern }) => {
-				expect(text).not.toMatch(pattern);
+			it("imports only relative sibling modules (no obsidian, @codemirror, fs, node:* or other package)", () => {
+				const specifiers = moduleSpecifiers(code);
+				for (const specifier of specifiers) expect(specifier, specifier).toMatch(/^\.\//);
+			});
+
+			it("has no import()/require() call with a non-literal argument", () => {
+				expect(code).not.toMatch(NON_LITERAL_LOAD);
 			});
 
 			it.each(FORBIDDEN_GLOBALS)("does not use $label", ({ pattern }) => {

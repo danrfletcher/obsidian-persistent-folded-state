@@ -72,7 +72,13 @@ export interface Anchor {
 }
 
 /** 1-indexed, inclusive line range for the block an `Anchor` describes. Kept beside the anchor,
- * never inside it, per the PR-3 brief. */
+ * never inside it, per the PR-3 brief.
+ *
+ * R4 (PR-3): for the lazily-closed kinds (heading, list, task, other) `endLine` runs up to the
+ * line before whatever closes the block, so it *includes* any blank separator lines at the end
+ * (in "# A\n- x\n\n# B" the list item x gets 2-3). That is harmless for anchors, but a consumer
+ * that wants where a block's content visibly ends (a fold end) must trim trailing blank lines
+ * itself; `endLine` is not that. */
 export interface LineRange {
 	startLine: number;
 	endLine: number;
@@ -139,13 +145,16 @@ const CONTENT_BASE = 1000;
 
 const HEADING_LINE = /^(#{1,6})\s/;
 /** Exactly one character inside the brackets — see the comment on the equivalent regex in
- * normalize.ts for why `[^\]]` (not `[^\]]*`) matters for not misreading `[[wikilinks]]`. */
-const TASK_LINE = /^(?:[-*+]|\d+[.)])\s+\[[^\]]\]/;
+ * normalize.ts for why `[^\]]` (not `[^\]]*`) matters for not misreading `[[wikilinks]]`. R2
+ * (PR-3): the closing `]` must also be followed by whitespace or the end of the line, so a
+ * one-character link label such as `- [a](http://x) foo` is a list item, not a task. */
+const TASK_LINE = /^(?:[-*+]|\d+[.)])\s+\[[^\]]\](?=\s|$)/;
 const LIST_LINE = /^(?:[-*+]|\d+[.)])\s+/;
 const FENCE_OPEN = /^(`{3,}|~{3,})(.*)$/;
 const QUOTE_LINE = /^>/;
 const QUOTE_PREFIX = /^>\s*/;
-const CALLOUT_CONTENT = /^\[!\w+\][+-]?/;
+/** A callout type may contain hyphens (`[!my-type]`, like Obsidian's own custom callouts). */
+const CALLOUT_CONTENT = /^\[![\w-]+\][+-]?/;
 
 interface Segment {
 	kind: AnchorKind;
@@ -168,6 +177,10 @@ function matchFenceOpen(trimmed: string): Fence | null {
 	const match = FENCE_OPEN.exec(trimmed);
 	if (match === null) return null;
 	const marker = match[1];
+	// R1 (PR-3): CommonMark (and Obsidian) don't let a backtick fence's info string contain a
+	// backtick — "```inline``` text" is inline code, not a fence that swallows the rest of the
+	// file. Tilde fences have no such restriction.
+	if (marker[0] === "`" && match[2].includes("`")) return null;
 	return { char: marker[0], length: marker.length, info: match[2] };
 }
 
@@ -327,6 +340,13 @@ function segmentLines(lines: string[]): Segment[] {
  * segmentation time and are never extended further. */
 const EXTENDABLE: ReadonlySet<AnchorKind> = new Set<AnchorKind>(["heading", "task", "list", "other"]);
 
+/** R3 (PR-3): kinds that stay on the stack (so an `other` line can still extend its own range)
+ * but never act as a structural parent: they are not part of a later segment's `parentChain`
+ * and don't scope its sibling count. Frontmatter and code are self-contained; callout/blockquote
+ * ranges are fixed at segmentation; an `other` paragraph is not a container, so indented list
+ * content after it belongs to the nearest real container (heading/list/task, else the root). */
+const NON_PARENT_KINDS: ReadonlySet<AnchorKind> = new Set<AnchorKind>(["frontmatter", "code", "callout", "blockquote", "other"]);
+
 interface Frame {
 	depth: number;
 	kind: AnchorKind | "root";
@@ -354,8 +374,9 @@ function buildFromSegments(segments: Segment[], totalLines: number): AnchoredBlo
 	for (const seg of segments) {
 		closeFramesAbove(seg.depth, seg.startLine);
 
-		const parentFrame = stack[stack.length - 1];
-		const parentChain: AnchorParentRef[] = stack
+		const containers = stack.filter((f) => f.kind === "root" || !NON_PARENT_KINDS.has(f.kind));
+		const parentFrame = containers[containers.length - 1];
+		const parentChain: AnchorParentRef[] = containers
 			.slice(1)
 			.map((f): AnchorParentRef => ({ kind: f.kind as AnchorKind, text: f.text }));
 		const siblingIndex = parentFrame.childCounts.get(seg.kind) ?? 0;
