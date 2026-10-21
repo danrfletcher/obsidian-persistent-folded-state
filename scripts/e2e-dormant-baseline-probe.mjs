@@ -419,7 +419,10 @@ async function runBaseline(args, state) {
 		if (existsSync(data)) unlinkSync(data); // cleared while disabled
 		const taskClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"));
 		await sleep(args.waitMs);
-		const headingClick = await evaluate(cdp, clickFoldIndicatorNearExpression("## Tuesday"));
+		// "Tuesday", not "## Tuesday": Live Preview hides a heading's "## " on lines the cursor isn't on,
+		// so the rendered .cm-line reads just "Tuesday" (same needle as e2e-restore-probe.mjs). In
+		// tasks-before.md the heading is the first line containing it.
+		const headingClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"));
 		await sleep(args.waitMs);
 		const enabled = await evaluate(cdp, enablePluginExpression(), { awaitPromise: true });
 		await sleep(args.waitMs);
