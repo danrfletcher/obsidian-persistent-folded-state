@@ -8,9 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EditorState } from "@codemirror/state";
+import { EditorState, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
+import { codeFolding, foldable, foldEffect, foldedRanges, foldService, unfoldEffect } from "@codemirror/language";
 import { editorInfoField } from "../../tests/mocks/obsidian";
 import { FoldStore } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
@@ -34,17 +34,77 @@ function makeStore(): { store: FoldStore; readSaved: () => { files: Record<strin
 	return { store, readSaved: () => stored };
 }
 
-function makeView(store: FoldStore, onSettledNonUserChange?: (path: string, text: string) => void): EditorView {
+function makeView(
+	store: FoldStore,
+	onSettledNonUserChange?: (path: string, text: string) => void,
+	extraExtensions: Extension[] = [],
+): EditorView {
 	const watcher = createEditorWatcher({ store, onSettledNonUserChange, window });
 	const state = EditorState.create({
 		doc: FIXTURE_TEXT,
 		// `codeFolding()` mirrors what real Obsidian always has registered in its own editor
 		// extensions (core fold-gutter support) — this plugin's own extension never supplies
 		// it; it only reads the live `foldState` such an extension provides (R4/R5).
-		extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } })), ...extraExtensions],
 	});
 	return new EditorView({ state, parent: document.body });
 }
+
+/** A real CM6 fold service (the facet `foldable()` consults, the same mechanism
+ * `@codemirror/lang-markdown` and Obsidian's own markdown mode use), written line by line here
+ * because the markdown language package is not a dependency of this project. It answers the way
+ * Obsidian's does: a fold starts at the END of the block's first line and runs to the end of the
+ * block's last non-blank line. Deliberately independent of `src/anchors.ts` — sharing code with
+ * the thing under test would prove nothing. */
+const markdownFoldService = (state: EditorState, lineStart: number): { from: number; to: number } | null => {
+	const doc = state.doc;
+	const first = doc.lineAt(lineStart);
+	const lastContentBefore = (lineNumber: number): number => {
+		let n = lineNumber;
+		while (n > first.number && doc.line(n).text.trim() === "") n--;
+		return n;
+	};
+	const rangeToLine = (endLine: number) => (endLine > first.number ? { from: first.to, to: doc.line(endLine).to } : null);
+	const text = first.text;
+
+	if (first.number === 1 && text === "---") {
+		for (let n = 2; n <= doc.lines; n++) if (doc.line(n).text === "---") return rangeToLine(n);
+		return null;
+	}
+	const heading = /^(#{1,6})\s/.exec(text);
+	if (heading) {
+		let end = doc.lines;
+		for (let n = first.number + 1; n <= doc.lines; n++) {
+			const next = /^(#{1,6})\s/.exec(doc.line(n).text);
+			if (next && next[1].length <= heading[1].length) {
+				end = n - 1;
+				break;
+			}
+		}
+		return rangeToLine(lastContentBefore(end));
+	}
+	if (text.startsWith("```")) {
+		for (let n = first.number + 1; n <= doc.lines; n++) if (doc.line(n).text.startsWith("```")) return rangeToLine(n);
+		return null;
+	}
+	if (text.startsWith(">")) {
+		let end = first.number;
+		while (end < doc.lines && doc.line(end + 1).text.startsWith(">")) end++;
+		return rangeToLine(end);
+	}
+	const item = /^(\s*)[-*+]\s/.exec(text);
+	if (item) {
+		let end = first.number;
+		for (let n = first.number + 1; n <= doc.lines; n++) {
+			const nextText = doc.line(n).text;
+			if (nextText.trim() === "") continue; // a blank line does not end an item by itself
+			if (/^\s*/.exec(nextText)![0].length <= item[1].length) break;
+			end = n;
+		}
+		return rangeToLine(end);
+	}
+	return null;
+};
 
 /** Line numbers (1-indexed) of one example of each foldable kind in the fixture note. */
 const LINES = {
@@ -68,16 +128,47 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 
 	it.each(Object.entries(LINES))("G1: folding the %s line adds one entry of that kind to the store", (kind, lineNumber) => {
 		const { store } = makeStore();
-		const view = makeView(store);
-		const from = lineStart(view, lineNumber);
+		const view = makeView(store, undefined, [foldService.of(markdownFoldService)]);
+		const line = view.state.doc.line(lineNumber);
 
-		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+		// PR-2 R6 / T131: the range is whatever CM6 itself reports as foldable on that line
+		// (`foldable()` runs the registered fold service), not a hand-made 1-character span —
+		// and, like Obsidian's own, it starts at the line's END and covers the block's body.
+		const range = foldable(view.state, line.from, line.to);
+		expect(range).not.toBeNull();
+		expect(range!.from).toBe(line.to);
+		expect(range!.to).toBeGreaterThan(range!.from + 1);
+
+		view.dispatch({ effects: [foldEffect.of(range!)] });
+		expect(foldedRanges(view.state).size).toBe(1); // CM6 really folded it
 
 		const record = store.get(NOTE_PATH);
 		expect(record?.folds).toHaveLength(1);
 		// PR-5: the recorder now stores a real Anchor (src/anchors.ts), whose code-block kind
 		// is "code" — not PR-2's placeholder FoldDescriptor, whose guess was "code-block".
 		expect((record?.folds[0] as { kind: string }).kind).toBe(kind === "codeBlock" ? "code" : kind);
+
+		// ... and unfolding the very range CM6 reported removes that entry again.
+		view.dispatch({ effects: [unfoldEffect.of(range!)] });
+		expect(foldedRanges(view.state).size).toBe(0);
+		expect(store.get(NOTE_PATH)?.folds).toHaveLength(0);
+	});
+
+	it("G1: the fold service's ranges end where the block's content ends, per kind (so the test above is not vacuous)", () => {
+		const { store } = makeStore();
+		const view = makeView(store, undefined, [foldService.of(markdownFoldService)]);
+		const rangeOf = (lineNumber: number) => {
+			const line = view.state.doc.line(lineNumber);
+			const range = foldable(view.state, line.from, line.to)!;
+			return { startLine: lineNumber, endLine: view.state.doc.lineAt(range.to).number };
+		};
+		expect(rangeOf(LINES.frontmatter)).toEqual({ startLine: 1, endLine: 3 });
+		expect(rangeOf(LINES.heading)).toEqual({ startLine: 10, endLine: 31 }); // to the last content line, no later heading
+		expect(rangeOf(LINES.list)).toEqual({ startLine: 14, endLine: 15 });
+		expect(rangeOf(LINES.task)).toEqual({ startLine: 17, endLine: 20 });
+		expect(rangeOf(LINES.blockquote)).toEqual({ startLine: 23, endLine: 24 });
+		expect(rangeOf(LINES.callout)).toEqual({ startLine: 26, endLine: 27 });
+		expect(rangeOf(LINES.codeBlock)).toEqual({ startLine: 29, endLine: 31 });
 	});
 
 	it("G1: unfolding removes the matching entry; the store flushes it (debounced)", async () => {
