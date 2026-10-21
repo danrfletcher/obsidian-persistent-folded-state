@@ -309,12 +309,28 @@ function runExactTier(
 	consumed: boolean[],
 	results: MatchResult[],
 ): PendingAnchor[] {
-	const groups = new Map<string, { storedIdxs: number[]; candidateIdxs: number[]; fallback: boolean }>();
+	interface ExactGroup {
+		storedIdxs: number[];
+		candidateIdxs: number[];
+		fallback: boolean;
+		/** `chainKey` of the group's stored anchors (every member shares it). */
+		chain: string;
+		/** Set when a candidate was withheld from this group because it tied with another group
+		 * for it (R14): members left unpaired are `ambiguous`, not `no-candidate`. */
+		contended: boolean;
+	}
+	const groups = new Map<string, ExactGroup>();
 
 	for (const p of pending) {
 		const anchor = stored[p.index];
 		const groupKey = `${chainKey(anchor)}\u0000${anchor.kind}\u0000${anchor.text}`;
-		const group = groups.get(groupKey) ?? { storedIdxs: [], candidateIdxs: [], fallback: p.fallback };
+		const group = groups.get(groupKey) ?? {
+			storedIdxs: [],
+			candidateIdxs: [],
+			fallback: p.fallback,
+			chain: chainKey(anchor),
+			contended: false,
+		};
 		group.storedIdxs.push(p.index);
 		if (!groups.has(groupKey)) {
 			// Every member of a group shares the same (chainKey, kind, text), so any member's
@@ -332,20 +348,53 @@ function runExactTier(
 	}
 
 	const resolvedStoredIdx = new Set<number>();
-	for (const group of groups.values()) {
-		// R8: inside a G14 fallback pool (this group's anchors have no matched parent of their
-		// own), the exact tier must claim only a *unique* file-wide match — two or more
-		// same-text candidates here are genuinely ambiguous (they may sit under two different,
-		// unrelated, both-unresolved parents), never order-paired as if they were true E1
-		// duplicates under one real parent (C18).
-		if (group.fallback && group.candidateIdxs.length > 1) {
-			for (const storedIdx of group.storedIdxs) {
-				results[storedIdx] = { tier: "none", reason: "ambiguous" };
-				resolvedStoredIdx.add(storedIdx);
-			}
-			continue;
+	const markAmbiguous = (group: ExactGroup): void => {
+		for (const storedIdx of group.storedIdxs) {
+			results[storedIdx] = { tier: "none", reason: "ambiguous" };
+			resolvedStoredIdx.add(storedIdx);
 		}
+	};
 
+	// R14 (PR-4): groups are built before anything is consumed, so two groups with different
+	// parent chains can list the same candidate (e.g. `# Home > x` and `# Home base > x` both
+	// resolving into the one remaining `# Home base > x`). One candidate may be claimed by only
+	// one stored anchor (C9), so a contended candidate goes to the group whose ancestry is the
+	// best fit: identical to the candidate's own parent chain beats a real but different scope
+	// (a parent matched through a rename), which beats the G14 file-wide fallback. If the best
+	// fit is itself shared by several groups, nobody takes it — those groups see it as ambiguous.
+	// A fallback group with several same-text candidates is ambiguous outright (R8), judged on
+	// its original candidate list, before contention removes anything from it.
+	for (const group of groups.values()) {
+		if (group.fallback && group.candidateIdxs.length > 1) {
+			group.candidateIdxs = [];
+			markAmbiguous(group);
+		}
+	}
+	const contenders = new Map<number, ExactGroup[]>();
+	for (const group of groups.values()) {
+		for (const c of group.candidateIdxs) {
+			const list = contenders.get(c) ?? [];
+			list.push(group);
+			contenders.set(c, list);
+		}
+	}
+	const fitRank = (group: ExactGroup, c: number): number => {
+		if (group.fallback) return 0;
+		return group.chain === chainKey(candidates[c]) ? 2 : 1;
+	};
+	for (const [c, list] of contenders) {
+		if (list.length < 2) continue;
+		const best = Math.max(...list.map((g) => fitRank(g, c)));
+		const top = list.filter((g) => fitRank(g, c) === best);
+		for (const group of list) {
+			if (top.length === 1 && group === top[0]) continue; // the clear best fit keeps it
+			group.candidateIdxs = group.candidateIdxs.filter((x) => x !== c);
+			if (top.length > 1 && top.includes(group)) group.contended = true;
+		}
+	}
+
+	for (const group of groups.values()) {
+		if (group.storedIdxs.every((i) => resolvedStoredIdx.has(i))) continue;
 		const pairs = new Map<number, number>(); // storedIdx -> candidateIdx
 		const usedCandidates = new Set<number>();
 
@@ -373,6 +422,14 @@ function runExactTier(
 			consumed[candidateIdx] = true;
 			results[storedIdx] = { tier: "exact", target: candidateIdx };
 			resolvedStoredIdx.add(storedIdx);
+		}
+
+		if (group.contended) {
+			for (const storedIdx of group.storedIdxs) {
+				if (pairs.has(storedIdx)) continue;
+				results[storedIdx] = { tier: "none", reason: "ambiguous" };
+				resolvedStoredIdx.add(storedIdx);
+			}
 		}
 	}
 

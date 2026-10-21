@@ -2,11 +2,17 @@
  * src/matcher.ts: G14 parent-first matching, a renamed parent's file-wide fallback across three
  * nesting levels, and G7's moved-block exclusion (C12, C13, C15, C27).
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as similarityModule from "../../src/similarity";
 import type { Anchor } from "../../src/anchors";
 import { matchAnchors } from "../../src/matcher";
 import { anchorsFrom, indexOfAnchor } from "../fixtures/matcher/build-anchors";
+
+// R15 (PR-4): restored after every test, not at the end of a test body, so a failed assertion
+// can't leave a mocked similarity() in place for the tests that follow.
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 describe("G14 C12: a child is matched among its matched parent's children first", () => {
 	it("an identical-text decoy under a different, unrelated parent is never considered", async () => {
@@ -177,6 +183,5 @@ describe("Scope resolution edge cases: an ambiguous ancestor still falls back co
 		const results = await matchAnchors([stored], candidates);
 		expect(results[0]).toEqual({ tier: "exact", target });
 
-		vi.restoreAllMocks();
 	});
 });

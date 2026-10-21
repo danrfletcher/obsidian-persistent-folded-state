@@ -108,6 +108,78 @@ describe("F6: no export, option or result field anywhere refers to a moved block
 	});
 });
 
+describe("R13 (PR-4): exports and option/reason names are pinned by snapshot", () => {
+	// A new export, option field or reason name must show up as a snapshot diff someone reviews,
+	// not pass silently through the /move/ regex above.
+	const typeSource = sources[1].code;
+
+	function interfaceFields(name: string): string[] {
+		const body = new RegExp(`export interface ${name} \\{([\\s\\S]*?)\\n\\}`).exec(typeSource)?.[1] ?? "";
+		return [...body.matchAll(/^\t(\w+)\??:/gm)].map((m) => m[1]).sort();
+	}
+
+	function stringUnion(name: string): string[] {
+		const decl = new RegExp(`export type ${name} =([^;]+);`).exec(typeSource)?.[1] ?? "";
+		return [...decl.matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+	}
+
+	it("src/matcher.ts runtime exports", () => {
+		expect(Object.keys(matcherModule).sort()).toMatchInlineSnapshot(`
+			[
+			  "CHUNK_SIZE",
+			  "FUZZY_THRESHOLD_LONG",
+			  "FUZZY_THRESHOLD_SHORT",
+			  "MAX_COMPARISONS",
+			  "MAX_FOLDS",
+			  "POSITIONAL_THRESHOLD",
+			  "SHORT_LONG_SPLIT",
+			  "matchAnchors",
+			]
+		`);
+	});
+
+	it("src/similarity.ts runtime exports", () => {
+		expect(Object.keys(similarityModule).sort()).toMatchInlineSnapshot(`
+			[
+			  "similarity",
+			]
+		`);
+	});
+
+	it("MatcherOptions field names", () => {
+		expect(interfaceFields("MatcherOptions")).toMatchInlineSnapshot(`
+			[
+			  "chunkSize",
+			  "fuzzyThresholdLong",
+			  "fuzzyThresholdShort",
+			  "maxComparisons",
+			  "maxFolds",
+			  "positionalThreshold",
+			  "shortLongSplit",
+			  "yieldToHost",
+			]
+		`);
+	});
+
+	it("MatchTier and NoMatchReason members", () => {
+		expect({ tiers: stringUnion("MatchTier"), reasons: stringUnion("NoMatchReason") }).toMatchInlineSnapshot(`
+			{
+			  "reasons": [
+			    "ambiguous",
+			    "below-threshold",
+			    "capped",
+			    "no-candidate",
+			  ],
+			  "tiers": [
+			    "exact",
+			    "fuzzy",
+			    "positional",
+			  ],
+			}
+		`);
+	});
+});
+
 describe("src/main.ts does not import the matcher yet (wiring it in is PR-5's job)", () => {
 	it("has no import of ./matcher or ./similarity", () => {
 		const mainText = readFileSync(MAIN_FILE, "utf8");
