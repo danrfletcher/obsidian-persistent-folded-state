@@ -66,9 +66,10 @@
  * replacement, not wiring a second pane into the live deferred-recheck queue.
  */
 import { foldEffect, unfoldEffect } from "@codemirror/language";
+import type { EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { anchorKey, buildAnchors, parseAnchor, type Anchor, type AnchoredBlock, type LineRange } from "./anchors";
-import { foldSpanForLineRange, liveFoldedLineRanges } from "./live-folds";
+import { foldSpanForLineRange, liveFoldCoversCandidate, liveFoldedLineRanges } from "./live-folds";
 import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
 import { planRestore } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
@@ -153,9 +154,29 @@ function foldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof fo
 	return span ? foldEffect.of(span) : null;
 }
 
+/** Unfolds a *live* fold range (one of `liveFoldedLineRanges`' outputs, never a `buildAnchors`
+ * candidate range). CM6 removes a fold only on an exact `{from,to}` match, so this is the live
+ * range's own span, not the trimmed one `foldEffectFor` would build: a native fold that runs
+ * through a trailing blank line has to be unfolded with that end (PR-1 R4). */
 function unfoldEffectFor(view: EditorView, range: LineRange): ReturnType<typeof unfoldEffect.of> | null {
-	const span = foldSpanFor(view, range);
-	return span ? unfoldEffect.of(span) : null;
+	const doc = view.state.doc;
+	if (!isFoldable(range) || range.startLine < 1 || range.endLine > doc.lines) return null;
+	const from = doc.line(range.startLine).to;
+	const to = doc.line(range.endLine).to;
+	return from < to ? unfoldEffect.of({ from, to }) : null;
+}
+
+/** PR-1 R4: the `buildAnchors` candidate that the live fold `range` is the fold of (exact range
+ * first, then the trailing-blank-run narrowing — `liveFoldCoversCandidate`), or `undefined`. */
+function candidateForLiveRange(
+	state: EditorState,
+	candidates: readonly AnchoredBlock[],
+	range: LineRange,
+): AnchoredBlock | undefined {
+	return (
+		candidates.find((c) => sameRange(c.range, range)) ??
+		candidates.find((c) => liveFoldCoversCandidate(state, range, c.range))
+	);
 }
 
 function dispatchFoldAndUnfold(view: EditorView, toFold: readonly LineRange[], toUnfold: readonly LineRange[]): void {
@@ -271,6 +292,7 @@ const NATIVE_RESTORE_GUARD_DELAYS_MS: readonly number[] = [50, 300, 1000, 2500, 
 function cleanupSpuriousNativeFolds(
 	store: FoldStore,
 	path: string,
+	state: EditorState,
 	candidates: readonly AnchoredBlock[],
 	staleRanges: readonly LineRange[],
 ): void {
@@ -286,7 +308,7 @@ function cleanupSpuriousNativeFolds(
 
 	let changed = false;
 	for (const range of staleRanges) {
-		const candidate = candidates.find((c) => sameRange(c.range, range));
+		const candidate = candidateForLiveRange(state, candidates, range); // `range` is a live fold
 		if (!candidate) continue;
 		if (folds.delete(anchorKey(candidate.anchor))) changed = true;
 	}
@@ -409,8 +431,10 @@ function scheduleNativeRestoreGuard(
 		// T19: every range live now that isn't protected and wasn't already live right after the
 		// initial dispatch — the same "stale offset" `reconcileNativeRestore` would have flagged
 		// at open time, just discovered on a later check instead.
+		// PR-1 R4: `n` is a live (trimmed) fold, `p` a candidate range, `k` another live range.
+		const covers = (n: LineRange, candidate: LineRange): boolean => liveFoldCoversCandidate(live.state, n, candidate);
 		const staleNow = nativeFolded.filter(
-			(n) => !protectedRanges.some((p) => sameRange(p, n)) && !knownLiveAtOpen.some((k) => sameRange(k, n))
+			(n) => !protectedRanges.some((p) => covers(n, p)) && !knownLiveAtOpen.some((k) => sameRange(k, n))
 		);
 
 		// T19: a target that was live and has gone missing *at the same moment* a brand-new
@@ -424,7 +448,7 @@ function scheduleNativeRestoreGuard(
 			foldTargets.some((target) => {
 				const key = rangeKey(target);
 				if (reverted.has(key) || !everLive.has(key)) return false;
-				const stillLive = nativeFolded.some((n) => sameRange(n, target));
+				const stillLive = nativeFolded.some((n) => covers(n, target));
 				const cursorInside = cursorLine !== null && target.startLine <= cursorLine && cursorLine <= target.endLine;
 				return !stillLive && !cursorInside;
 			});
@@ -432,7 +456,7 @@ function scheduleNativeRestoreGuard(
 		for (const target of foldTargets) {
 			const key = rangeKey(target);
 			if (reverted.has(key)) continue;
-			const isLive = nativeFolded.some((n) => sameRange(n, target));
+			const isLive = nativeFolded.some((n) => covers(n, target));
 			if (isLive) everLive.add(key);
 			// R9: never mark a target reverted when the same check also shows a brand-new
 			// unprotected fold — that's nativeChurn's own job to refold, not a user undo.
@@ -442,7 +466,7 @@ function scheduleNativeRestoreGuard(
 		const toFold = foldTargets.filter((target) => {
 			const key = rangeKey(target);
 			if (reverted.has(key)) return false; // never refold what the user just unfolded
-			if (nativeFolded.some((n) => sameRange(n, target))) return false; // already live
+			if (nativeFolded.some((n) => covers(n, target))) return false; // already live
 			// G13 holds at check time too, not just at open time — re-read the live cursor.
 			if (cursorLine !== null && target.startLine <= cursorLine && cursorLine <= target.endLine) return false;
 			return true;
@@ -465,7 +489,7 @@ function scheduleNativeRestoreGuard(
 		}
 
 		dispatchFoldAndUnfold(live, toFold, toUnfold);
-		if (toUnfold.length > 0) cleanupSpuriousNativeFolds(store, path, candidates, toUnfold);
+		if (toUnfold.length > 0) cleanupSpuriousNativeFolds(store, path, live.state, candidates, toUnfold);
 		// R8 (PR-5): the native restore that churned the pane unfolded the matched targets in an
 		// ordinary (untagged) transaction, which the recorder takes for the user's own unfold and
 		// now resolves to the stored entry; this guard's refold is tagged OWN_FOLD and so is not
@@ -504,7 +528,7 @@ function applyStoredFoldsVerbatim(view: EditorView, folds: readonly StoredAnchor
 		if (!anchor) continue;
 		const range = rangeByKey.get(anchorKey(anchor));
 		if (!range) continue;
-		if (nativeFolded.some((native) => sameRange(native, range))) continue; // already live
+		if (nativeFolded.some((native) => liveFoldCoversCandidate(view.state, native, range))) continue; // already live
 		toFold.push(range);
 	}
 	dispatchFoldAndUnfold(view, toFold, []);
@@ -625,16 +649,20 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 		const candidate = candidates[m.candidateIndex];
 		if (candidate && isFoldable(candidate.range)) matchedRanges.push(candidate.range);
 	}
-	const { toUnfold } = reconcileNativeRestore(nativeFolded, matchedRanges);
+	const { toUnfold } = reconcileNativeRestore(nativeFolded, matchedRanges, (native, matched) =>
+		liveFoldCoversCandidate(view.state, native, matched)
+	);
 	const toFold = [...plan.toFold, ...dormantPlan.toFold].map((t) => t.range);
 	dispatchFoldAndUnfold(view, toFold, toUnfold);
 	// R8: what the guard must still treat as live right after this dispatch — the native
 	// folds it didn't unfold (protected or already matching), plus everything just folded.
+	// PR-1 R4: read back from the view, in the live (trimmed) ranges the guard's checks compare
+	// against, not from `toFold`'s untrimmed candidate ranges.
 	// `matchedRanges` (protectedRanges) is passed through separately: the guard must never
 	// use it to decide what to *fold* (it includes G13-deferred and dormant-not-acted-on
 	// ranges), only what must never be unfolded. See scheduleNativeRestoreGuard's own doc
 	// comment and the T1/T8/R8 comments above `NATIVE_RESTORE_GUARD_DELAYS_MS`.
-	const knownLiveAtOpen: LineRange[] = [...nativeFolded.filter((n) => !toUnfold.some((u) => sameRange(u, n))), ...toFold];
+	const knownLiveAtOpen: LineRange[] = liveFoldedLineRanges(view.state);
 	scheduleNativeRestoreGuard(
 		view,
 		text,
@@ -676,7 +704,7 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 				continue;
 			}
 			const candidate = candidates[match.candidateIndex];
-			const alreadyLive = candidate !== undefined && nativeFolded.some((r) => sameRange(r, candidate.range));
+			const alreadyLive = candidate !== undefined && nativeFolded.some((r) => liveFoldCoversCandidate(view.state, r, candidate.range));
 			if (alreadyLive) {
 				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
 			} else {

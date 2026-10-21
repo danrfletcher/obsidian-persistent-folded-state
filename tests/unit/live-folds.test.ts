@@ -11,6 +11,7 @@ import type { AnchoredBlock } from "../../src/anchors";
 import {
 	foldSpanForLineRange,
 	groupCandidatesByStartLine,
+	liveFoldCoversCandidate,
 	resolveCandidateForLiveRange,
 	widenLiveRangeToCandidate,
 } from "../../src/live-folds";
@@ -126,5 +127,20 @@ describe("groupCandidatesByStartLine", () => {
 		expect(grouped.get(1)).toEqual([a, b]);
 		expect(grouped.get(5)).toEqual([c]);
 		expect(grouped.get(2)).toBeUndefined();
+	});
+});
+
+describe("liveFoldCoversCandidate (PR-1 R4): a live fold and its buildAnchors candidate are the same block", () => {
+	// '# A\n- x\n  - y\n\n# B': x's candidate range is 2-4 (blank line 4 swallowed); its fold is 2-3.
+	const state = stateFor("# A\n- x\n  - y\n\n# B");
+
+	it.each([
+		{ name: "the identical range", live: { startLine: 2, endLine: 4 }, candidate: { startLine: 2, endLine: 4 }, expected: true },
+		{ name: "a fold trimmed of the trailing blank line", live: { startLine: 2, endLine: 3 }, candidate: { startLine: 2, endLine: 4 }, expected: true },
+		{ name: "a different start line", live: { startLine: 1, endLine: 3 }, candidate: { startLine: 2, endLine: 4 }, expected: false },
+		{ name: "a fold that stops short of non-blank content", live: { startLine: 2, endLine: 2 }, candidate: { startLine: 2, endLine: 4 }, expected: false },
+		{ name: "a fold wider than the candidate", live: { startLine: 2, endLine: 4 }, candidate: { startLine: 2, endLine: 3 }, expected: false },
+	])("$name -> $expected", ({ live, candidate, expected }) => {
+		expect(liveFoldCoversCandidate(state, live, candidate)).toBe(expected);
 	});
 });

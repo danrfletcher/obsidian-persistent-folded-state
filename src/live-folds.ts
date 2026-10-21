@@ -73,6 +73,17 @@ export function widenLiveRangeToCandidate(state: EditorState, range: LineRange, 
 	return true;
 }
 
+/** PR-1 R4: true when `live` (one of `liveFoldedLineRanges`' outputs) is the fold of `candidate`
+ * (a `buildAnchors` range): the same range, or `live` narrower by only the trailing blank run
+ * `buildAnchors` swallows into `candidate` (`widenLiveRangeToCandidate`). The plugin's own restored
+ * folds end at the block's last content line (`foldSpanForLineRange`), as do click-made ones, so
+ * an exact comparison against the untrimmed candidate range never sees them as the same block.
+ * Every live-vs-candidate comparison in src/open-restore.ts goes through this. */
+export function liveFoldCoversCandidate(state: EditorState, live: LineRange, candidate: LineRange): boolean {
+	if (live.startLine === candidate.startLine && live.endLine === candidate.endLine) return true;
+	return widenLiveRangeToCandidate(state, live, candidate);
+}
+
 /** Resolves one of `liveFoldedLineRanges`' own outputs to whichever `AnchoredBlock` in
  * `candidatesByStart` (grouped by `range.startLine`) it represents: an exact rangeKey match
  * first, falling back to `widenLiveRangeToCandidate` (T22) so a live fold whose range is a
