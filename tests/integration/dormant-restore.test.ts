@@ -20,7 +20,11 @@ const NOTE_PATH = "Projects/Quarry/Tasks.md";
 
 const TEXT_WITH_TUESDAY = "Notes\n\n## Tuesday\n- [ ] Draft proposal\n";
 const TEXT_UNRELATED = "Notes\n\n## Zzz Qqq Www Completely Different Heading\n- [ ] Something else entirely\n";
-const TEXT_WITH_TUESDAY_AGAIN = "Notes\n\n## Tuesday\n- [ ] Draft proposal v2\n";
+// R3 (PR-6): the heading is *not* spelled exactly as the stored/dormant anchor ("tuesday"), so
+// the anchor `describeFold` would build for the refolded block ("tuesdays") has a different key.
+// A recorder that wrongly logged the dormant refold as a user fold would therefore add a second
+// entry instead of merging into the stored one, and the length-1 assertion below would catch it.
+const TEXT_WITH_TUESDAY_AGAIN = "Notes\n\n## Tuesdays\n- [ ] Draft proposal v2\n";
 
 function findOneBlock(blocks: AnchoredBlock[], predicate: (a: Anchor) => boolean): AnchoredBlock {
 	const matches = blocks.filter((b) => predicate(b.anchor));
@@ -119,13 +123,16 @@ describe("dormant folds (G6)", () => {
 		await settle();
 
 		const afterSecondBlocks = buildAnchors(TEXT_WITH_TUESDAY_AGAIN);
-		const tuesdayAgain = findOneBlock(afterSecondBlocks, (a) => a.kind === "heading" && a.text === "tuesday");
+		const tuesdayAgain = findOneBlock(afterSecondBlocks, (a) => a.kind === "heading" && a.text === "tuesdays");
+		expect(anchorKey(tuesdayAgain.anchor)).not.toBe(anchorKey(tuesday)); // the premise of the E11 check below
 		expect(liveFoldedLineRanges(view)).toContainEqual(tuesdayAgain.range);
 
 		const afterSecond = store.get(NOTE_PATH);
 		expect(afterSecond?.dormant).toEqual([]); // promoted out of dormant
 		expect(afterSecond?.folds).toHaveLength(1); // exactly one entry — never duplicated (E11)
 		expect(anchorKey(afterSecond!.folds[0] as unknown as Anchor)).toBe(anchorKey(tuesday));
+		// R4 (PR-6): the promoted entry is a plain anchor, not the dormant one with its timestamp.
+		expect(afterSecond!.folds[0]).not.toHaveProperty("dormantSince");
 	});
 
 	it("a dormant anchor 600,000ms old or older is forgotten and never refolds, even if later text would match it", async () => {

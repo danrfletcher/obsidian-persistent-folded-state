@@ -236,6 +236,14 @@ function mapCandidatesForward(candidates: AnchoredBlock[], text: string, changes
 	}));
 }
 
+/** R4 (PR-6): a dormant anchor promoted to the active list is stored as a plain anchor — the
+ * `dormantSince` it carried while dormant is stripped, so data.json's active folds never hold
+ * a stale dormant timestamp. */
+function toActiveAnchor(anchor: Anchor): StoredAnchor {
+	const { kind, indent, text, siblingIndex, parentChain } = anchor;
+	return { kind, indent, text, siblingIndex, parentChain } as unknown as StoredAnchor;
+}
+
 /** Builds a `DeferredFoldTarget` (R2) from a plan's own `FoldTarget` (anchor index + line range,
  * already in live-doc coordinates — see `restoreSettledChange`) — the character-offset span that
  * gets mapped forward through later changes until the cursor leaves it. R5 (PR-5): the span is
@@ -430,7 +438,7 @@ export async function restoreSettledChange(
 		for (let i = 0; i < dormantResult.matched.length; i++) {
 			const match = dormantResult.matched[i];
 			if (actedDormantIdx.has(i)) {
-				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				activeFolds.set(anchorKey(match.anchor), toActiveAnchor(match.anchor));
 				continue;
 			}
 			const candidate = liveCandidates[match.candidateIndex];
@@ -438,7 +446,7 @@ export async function restoreSettledChange(
 			// that ends a blank line short of (or past) the candidate still counts as live.
 			const alreadyLive = candidate !== undefined && isAlreadyFolded(alreadyFolded, candidate.range);
 			if (alreadyLive) {
-				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				activeFolds.set(anchorKey(match.anchor), toActiveAnchor(match.anchor));
 			} else {
 				dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
 			}

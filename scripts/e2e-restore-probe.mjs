@@ -236,9 +236,12 @@ function visibleLinesInclude(visibleLines, needle) {
 async function runSetup(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
-		const tuesdayClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"));
-		await sleep(args.waitMs);
+		// T1 (PR-5): Draft proposal first, then Tuesday. Tasks.md has no heading after "## Tuesday",
+		// so Tuesday's fold hides every line below it, Draft proposal's included — clicking
+		// Tuesday first leaves nothing to click for the task and GP1 never gets its second fold.
 		const draftClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Draft proposal"));
+		await sleep(args.waitMs);
+		const tuesdayClick = await evaluate(cdp, clickFoldIndicatorNearExpression("Tuesday"));
 		await sleep(args.waitMs);
 
 		const visibleLines = JSON.parse(await evaluate(cdp, READ_VISIBLE_LINES_EXPRESSION));

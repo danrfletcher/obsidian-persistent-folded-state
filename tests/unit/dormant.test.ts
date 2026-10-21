@@ -120,12 +120,22 @@ describe("retryDormant (G6)", () => {
 		expect(result.stillDormant).toEqual([]);
 	});
 
-	it("two dormant anchors cannot be consumed by the same candidate (never-break rule 4)", async () => {
-		const dormant = addDormant(addDormant([], TUESDAY, 0), WEDNESDAY, 0);
-		// Only one candidate exists; both dormant anchors are structurally identical apart from
-		// siblingIndex/text, but only one of them may claim it.
+	it("an entry MAX_DORMANT_AGE_MS - 1 old is still retried; the one at exactly MAX_DORMANT_AGE_MS is not (R5b)", async () => {
+		const almost = await retryDormant(addDormant([], TUESDAY, 1), [TUESDAY], MAX_DORMANT_AGE_MS); // 599,999 ms old
+		expect(almost.matched).toHaveLength(1);
+		const expired = await retryDormant(addDormant([], TUESDAY, 0), [TUESDAY], MAX_DORMANT_AGE_MS); // 600,000 ms old
+		expect(expired.matched).toEqual([]);
+		expect(expired.stillDormant).toEqual([]);
+	});
+
+	it("two near-identical dormant anchors cannot be consumed by the same candidate (never-break rule 4)", async () => {
+		// Both anchors match the single candidate with full confidence, so this only passes if the
+		// matcher refuses to hand one block to two anchors.
+		const twin: Anchor = { ...TUESDAY, siblingIndex: 1 };
+		const dormant = addDormant(addDormant([], TUESDAY, 0), twin, 0);
 		const result = await retryDormant(dormant, [TUESDAY], 100);
-		const totalClaims = result.matched.filter((m) => m.candidateIndex === 0).length;
-		expect(totalClaims).toBeLessThanOrEqual(1);
+		expect(result.matched.filter((m) => m.candidateIndex === 0)).toHaveLength(1);
+		expect(result.matched.length + result.stillDormant.length).toBeLessThanOrEqual(2);
+		expect(result.matched.length).toBe(1); // the second anchor did not also claim candidate 0
 	});
 });
