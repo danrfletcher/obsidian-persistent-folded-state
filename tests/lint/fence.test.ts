@@ -80,3 +80,49 @@ describe("fence: F1 — no write-capable vault/editor/adapter API reached for by
 	// disk) and was never what F1 was guarding against.
 });
 
+
+describe("fence: F3 — src/embed-host.ts is detection only", () => {
+	const hostText = readFileSync(join(SRC, "embed-host.ts"), "utf8");
+	// Comments are stripped first: the file's own doc comment legitimately names what it must not do.
+	const code = hostText.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+	const FORBIDDEN = [
+		{ label: "fold dispatch (.dispatch()", pattern: /\.dispatch\s*\(/ },
+		{ label: "foldEffect", pattern: /\bfoldEffect\b/ },
+		{ label: "unfoldEffect", pattern: /\bunfoldEffect\b/ },
+		{ label: "foldCode / unfoldCode", pattern: /\b(?:foldCode|unfoldCode|toggleFold)\b/ },
+		{ label: "registerMarkdownPostProcessor", pattern: /\bregisterMarkdownPostProcessor\b/ },
+		{ label: "registerMarkdownCodeBlockProcessor", pattern: /\bregisterMarkdownCodeBlockProcessor\b/ },
+		{ label: "registerEvent / registerDomEvent / registerEditorExtension", pattern: /\bregister(?:Event|DomEvent|EditorExtension|Interval)\b/ },
+		{ label: "canvas hooks", pattern: /canvas/i },
+		{ label: "hover hooks (hover-link, page-preview, hover-popover)", pattern: /hover-link|page-preview|hover-popover|HoverParent/i },
+		{ label: "Bases hooks", pattern: /\bbases?\b/i },
+		{ label: "a MutationObserver or event listener", pattern: /\bMutationObserver\b|\baddEventListener\b/ },
+	];
+
+	it.each(FORBIDDEN)("src/embed-host.ts has no $label", ({ pattern }) => {
+		expect(code).not.toMatch(pattern);
+	});
+
+	it("src/embed-host.ts uses no desktop-only API (E11): no electron, fs, path or process", () => {
+		expect(code).not.toMatch(/from\s+["'](?:electron|fs|path|node:[a-z/]+|child_process|os)["']|\brequire\s*\(|\bprocess\./);
+	});
+
+	it("src/embed-capabilities.ts imports nothing and reaches no host API", () => {
+		const text = readFileSync(join(SRC, "embed-capabilities.ts"), "utf8");
+		expect(text).not.toMatch(/^\s*import\s/m);
+	});
+
+	it("manifest.json still has isDesktopOnly: false (E11)", () => {
+		const manifest = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8")) as { isDesktopOnly: boolean };
+		expect(manifest.isDesktopOnly).toBe(false);
+	});
+});
+
+describe("fence: F3 — src/main.ts adds no post processor for embed detection", () => {
+	const mainText = readFileSync(join(SRC, "main.ts"), "utf8");
+
+	it("src/main.ts registers no markdown post processor (the command list is pinned in tests/unit/lifecycle.test.ts)", () => {
+		expect(mainText).not.toMatch(/registerMarkdownPostProcessor|registerMarkdownCodeBlockProcessor/);
+	});
+});
