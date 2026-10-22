@@ -186,6 +186,11 @@ export class MarkdownView {
 	getState(): Record<string, unknown> {
 		return { file: this.file?.path, mode: this.mode, source: this.sourceMode };
 	}
+	/** Real `TextFileView.data` / `getViewData()`: the note's current text. A test sets `data`. */
+	data = "";
+	getViewData(): string {
+		return this.data;
+	}
 	sourceSurface(): HTMLElement {
 		return this.containerEl.querySelector(".markdown-source-view") as HTMLElement;
 	}
@@ -238,6 +243,39 @@ export class Vault extends Events {
 	setExists(path: string, exists = true): void {
 		if (exists) this.paths.add(path);
 		else this.paths.delete(path);
+	}
+
+	private contents = new Map<string, string>();
+	/** Test helper: a note that exists and has this text (what `cachedRead` returns). */
+	setContent(path: string, text: string): void {
+		this.paths.add(path);
+		this.contents.set(path, text);
+	}
+	/** Every path a test has told this vault about. */
+	allPaths(): string[] {
+		return [...this.paths];
+	}
+	/** Real `Vault.getFileByPath`: the file, or null. */
+	getFileByPath(path: string): TFile | null {
+		return this.paths.has(path) ? new TFile(path) : null;
+	}
+	/** Real `Vault.cachedRead`: read-only; "" for a note with no text set. */
+	async cachedRead(file: TFile): Promise<string> {
+		return this.contents.get(file.path) ?? "";
+	}
+}
+
+/** Just enough of real `MetadataCache.getFirstLinkpathDest`: an exact path (with or without
+ * `.md`), else the first note whose name matches, else null. Ignores the source path. */
+export class MetadataCache {
+	constructor(private readonly vault: Vault) {}
+	getFirstLinkpathDest(linkpath: string, _sourcePath: string): TFile | null {
+		const wanted = linkpath.replace(/\.md$/i, "");
+		for (const path of this.vault.allPaths()) {
+			const bare = path.replace(/\.md$/i, "");
+			if (bare === wanted || bare.slice(bare.lastIndexOf("/") + 1) === wanted) return new TFile(path);
+		}
+		return null;
 	}
 }
 
@@ -307,6 +345,7 @@ export class Workspace extends Events {
 export class App {
 	workspace = new Workspace();
 	vault = new Vault();
+	metadataCache = new MetadataCache(this.vault);
 }
 
 // --- UI --------------------------------------------------------------------------------------

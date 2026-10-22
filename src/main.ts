@@ -81,6 +81,12 @@
  * compare, re-match, replace native restore) is `src/open-restore.ts`'s `restoreOnOpen`, fully
  * testable on its own against a directly constructed `EditorView` — this handler is deliberately
  * thin glue around it.
+ *
+ * PR-4 (embed recording, G1): `EmbedFoldRecorder` (src/embed-fold-recorder.ts) listens, with
+ * capture-phase document listeners, for the user's own click on the fold arrow Obsidian already
+ * shows inside an embed, and records it under the embed's key. It adds no command, no UI and no
+ * element to the page. `onunload()` removes every listener it added (E9). The readers handed to it
+ * only read: the host's text from its view, a target's text with `cachedRead`.
  */
 import { Events, Plugin } from "obsidian";
 import type { TFile } from "obsidian";
@@ -90,6 +96,7 @@ import { registerForgetNoteFoldsCommand } from "./commands";
 import { PersistentFoldedStateSettingTab } from "./settings-tab";
 import { createEditorWatcher } from "./editor-watcher";
 import { restoreOnOpen } from "./open-restore";
+import { EmbedFoldRecorder } from "./embed-fold-recorder";
 
 /** Event name for the "settled non-user change" deliverable (E9/E10), triggered on
  * `PersistentFoldedStatePlugin.events` with `(path: string, text: string)`. */
@@ -106,6 +113,8 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	 * seconds long in production to give a slow, real relaunch's native restore time to arrive.
 	 * Set before calling `onload()`; left `undefined` (the default) in production. */
 	guardDelaysMs?: readonly number[];
+	/** PR-4: records the user's folds inside embeds. Created in `onload()`, disposed in `onunload()`. */
+	private embedRecorder: EmbedFoldRecorder | null = null;
 
 	async onload(): Promise<void> {
 		this.store = new FoldStore({
@@ -147,6 +156,30 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 			if (document.visibilityState === "hidden") this.flushAtOnce();
 		});
 		this.registerDomEvent(window, "pagehide", () => this.flushAtOnce());
+
+		// G1 (PR-4): record the user's own folds inside embeds, in the main window and in every
+		// pop-out window. The recorder only reads the vault; it writes to the store alone.
+		const recorder = new EmbedFoldRecorder({
+			workspace: this.app.workspace,
+			store: this.store,
+			readHostText: (host) => host.view.getViewData(),
+			readNote: async (path) => {
+				const file = this.app.vault.getFileByPath(path);
+				return file === null ? null : await this.app.vault.cachedRead(file);
+			},
+			resolveLink: (linktext, sourcePath) => this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath)?.path ?? null,
+			// Live Preview only: where in the host's text a rendered embed sits. Used just to tell
+			// identical embeds apart; undocumented route, same as the file-open handler below.
+			positionOf: (host, el) => {
+				if (host.mode !== "live-preview") return null;
+				const cm = (host.view.editor as unknown as { cm?: EditorView } | undefined)?.cm;
+				return cm ? cm.posAtDOM(el) : null;
+			},
+		});
+		this.embedRecorder = recorder;
+		recorder.attach(document);
+		this.registerEvent(this.app.workspace.on("window-open", (_win, popout) => recorder.attach(popout.document)));
+		this.registerEvent(this.app.workspace.on("window-close", (_win, popout) => recorder.detach(popout.document)));
 
 		// G9/G10: re-key or remove the stored entry (and every entry nested beneath it, for a
 		// folder) on a rename/move or delete inside Obsidian. `registerEvent` tears both down
@@ -199,6 +232,9 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	onunload(): void {
 		// R14: must run before `flushAtOnce()` can do anything async — see the file comment.
 		this.editorWatcherDisposed.current = true;
+		// E9: no embed listener or observer outlives the plugin, and nothing queued is recorded.
+		this.embedRecorder?.dispose();
+		this.embedRecorder = null;
 		this.flushAtOnce();
 	}
 

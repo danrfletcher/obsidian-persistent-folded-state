@@ -30,8 +30,12 @@
  * They share the notes' dirty flag, debounce and flush chain. This PR only stores, loads and
  * forgets them; `handleRename`, `handleDelete` and `pruneOrphans` deliberately leave them alone
  * (embed variants are PR-8), and dormant expiry for them is PR-7.
+ *
+ * PR-4 (recording): a nested embed's identity also carries the chain of embeds that contain it
+ * (`EmbedIdentity.outer`, see src/types.ts), validated on load and folded into the in-memory key.
+ * A flat embed is stored exactly as before.
  */
-import type { EmbedFoldRecord, EmbedIdentity, FileFoldRecord, StoreData } from "./types";
+import type { EmbedFoldRecord, EmbedIdentity, EmbedLinkId, FileFoldRecord, StoreData } from "./types";
 import { parseAnchor } from "./anchors";
 import { expireDormant, parseDormantAnchor } from "./dormant";
 import { deleteFiles, pruneOrphanFiles, renameFiles } from "./vault-lifecycle";
@@ -92,10 +96,32 @@ type StoredAnchorArray = Record<string, unknown>[];
 
 /** In-memory key for an embed's identity. Derived from the structured fields on every call and
  * never persisted (the file stores the fields themselves), so it only has to be collision-free:
- * a JSON array of the four fields is, whatever characters the paths contain. Deliberately not
+ * a JSON array of the four fields (plus the chain of containing embeds, for a nested embed) is,
+ * whatever characters the paths contain. Deliberately not
  * exported: the embed key builder that reads identity out of a host's source text is PR-3's. */
 function embedMapKey(id: EmbedIdentity): string {
-	return JSON.stringify([id.host, id.target, id.subpath, id.occurrence]);
+	const flat = [id.host, id.target, id.subpath, id.occurrence];
+	if (id.outer === undefined || id.outer.length === 0) return JSON.stringify(flat);
+	// A nested embed (PR-4): the chain is part of the identity, so it never collides with a flat
+	// embed of the same inner content in the same host.
+	return JSON.stringify([...flat, id.outer.map((link) => [link.target, link.subpath, link.occurrence])]);
+}
+
+/** The `outer` chain of a nested embed record, `[]` when absent or empty (a flat embed), or null
+ * when present but malformed (the record is then dropped rather than read as a flat embed,
+ * which would give it the wrong identity). */
+function sanitizeOuter(value: unknown): EmbedLinkId[] | null {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) return null;
+	const chain: EmbedLinkId[] = [];
+	for (const entry of value) {
+		if (!isPlainObject(entry)) return null;
+		const { target, subpath, occurrence } = entry;
+		if (typeof target !== "string" || target === "" || typeof subpath !== "string") return null;
+		if (typeof occurrence !== "number" || !Number.isInteger(occurrence) || occurrence < 0) return null;
+		chain.push({ target, subpath, occurrence });
+	}
+	return chain;
 }
 
 /** Validates one raw `embeds` entry. Returns null for anything malformed: not an object; a
@@ -111,11 +137,14 @@ function sanitizeEmbedRecord(value: unknown): EmbedFoldRecord | null {
 	if (typeof occurrence !== "number" || !Number.isInteger(occurrence) || occurrence < 0) return null;
 	if (typeof contentHash !== "string") return null;
 	if (!Array.isArray(folds)) return null;
+	const outer = sanitizeOuter(value.outer);
+	if (outer === null) return null;
 	return {
 		host,
 		target,
 		subpath,
 		occurrence,
+		...(outer.length > 0 ? { outer } : {}),
 		contentHash,
 		folds: sanitizeAnchorArray(folds),
 		dormant: sanitizeDormantArray(dormant),
@@ -266,8 +295,13 @@ export class FoldStore {
 	}
 
 	/** Replaces the whole record for the embed `record` identifies (host, target, subpath and
-	 * occurrence). Debounced like `set()`. */
+	 * occurrence, and the chain of containing embeds for a nested one). Debounced like `set()`.
+	 * An empty `outer` is dropped, so a flat embed is always stored and written without the field. */
 	setEmbed(record: EmbedFoldRecord): void {
+		if (record.outer !== undefined && record.outer.length === 0) {
+			const { outer: _empty, ...flat } = record;
+			record = flat;
+		}
 		this.embeds.set(embedMapKey(record), record);
 		this.scheduleDebouncedFlush();
 	}

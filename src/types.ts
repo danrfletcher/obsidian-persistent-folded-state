@@ -44,6 +44,21 @@ export interface EmbedIdentity {
 	target: string;
 	subpath: string;
 	occurrence: number;
+	/** Only for an embed nested inside embedded content (G12): the embeds that contain it, from
+	 * the outermost inward, so the key reads host > outer[0] > ... > this embed. `target`,
+	 * `subpath` and `occurrence` above then describe the innermost embed, with its occurrence
+	 * counted in the text of the embed that contains it. Absent (never an empty array) for an
+	 * embed rendered directly in the host, so a flat record is byte-for-byte what it was before
+	 * nested embeds were recorded, and an older build ignores the field. */
+	outer?: EmbedLinkId[];
+}
+
+/** One link of a nested embed's chain: the same three fields an embed key carries besides the
+ * host. */
+export interface EmbedLinkId {
+	target: string;
+	subpath: string;
+	occurrence: number;
 }
 
 /** Per-embed record persisted in the optional `embeds` section of data.json. Same payload as a
