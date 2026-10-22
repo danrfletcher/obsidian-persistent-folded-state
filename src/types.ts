@@ -31,8 +31,36 @@ export interface FileFoldRecord {
 	dormant: StoredAnchor[];
 }
 
-/** The whole on-disk/in-memory shape saved to and loaded from data.json. */
+/** Who owns an embed's fold state: the embed itself, not a path. Persisted as these four
+ * structured fields (never as a composite string key), so a path containing `#`, `|`, `/`, `>`,
+ * spaces, unicode or quotes can never collide with another embed's identity.
+ * - `host`: vault-relative path of the note that contains the embed.
+ * - `target`: vault-relative path of the note the embed shows.
+ * - `subpath`: block id, heading, or `""` for a whole-note embed.
+ * - `occurrence`: 0-based index among identical embeds (same host, target and subpath) in the
+ *   host. */
+export interface EmbedIdentity {
+	host: string;
+	target: string;
+	subpath: string;
+	occurrence: number;
+}
+
+/** Per-embed record persisted in the optional `embeds` section of data.json. Same payload as a
+ * `FileFoldRecord`, computed over the embedded slice rather than a whole note. */
+export interface EmbedFoldRecord extends EmbedIdentity {
+	contentHash: string;
+	folds: StoredAnchor[];
+	dormant: StoredAnchor[];
+}
+
+/** The whole on-disk/in-memory shape saved to and loaded from data.json.
+ * `embeds` is optional and omitted while there are no embed records, so a file with only notes
+ * is byte-for-byte what 0.1.1 wrote. `version` stays 1: an older build reads `version` and
+ * `files`, ignores `embeds`, and so keeps every note's folds (dropping only embed state on its
+ * next save). */
 export interface StoreData {
 	version: number;
 	files: Record<string, FileFoldRecord>;
+	embeds?: EmbedFoldRecord[];
 }

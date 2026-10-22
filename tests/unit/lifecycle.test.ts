@@ -3,6 +3,8 @@ import { App, Plugin, type PluginManifest } from "obsidian";
 import type { Plugin as MockPlugin, Vault as MockVault } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
 import { FORGET_NOTE_FOLDS_COMMAND_ID } from "../../src/commands";
+import { SEED_EMBEDS, SEED_FILES } from "../fixtures/embed-seed";
+import type { EmbedFoldRecord } from "../../src/types";
 
 const manifest: PluginManifest = {
 	id: "persistent-folded-state",
@@ -188,4 +190,113 @@ describe("onload resilience: absent, corrupt, rejecting or wrong-shape loadData 
 			expect(addSettingTab).toHaveBeenCalledTimes(1);
 		});
 	}
+});
+
+// --- Embed records through the plugin lifecycle (ticket warkworth-21, PR-1) -------------------
+
+const SEED_DISK = { version: 1, files: SEED_FILES, embeds: SEED_EMBEDS };
+
+function embedRecord(contentHash: string): EmbedFoldRecord {
+	return { host: "Late.md", target: "Source.md", subpath: "", occurrence: 0, contentHash, folds: [], dormant: [] };
+}
+
+describe("lifecycle: embeds survive disable then re-enable (E9)", () => {
+	it("bytes in data.json are identical across disable and re-enable, and the reloaded store returns the same records", async () => {
+		let stored: unknown = structuredClone(SEED_DISK);
+		const app = new App();
+		const loadData = async () => structuredClone(stored);
+		const saveData = vi.fn(async (data: unknown) => {
+			stored = structuredClone(data);
+		});
+		for (const path of Object.keys(SEED_FILES)) (app.vault as unknown as MockVault).setExists(path);
+
+		const first = new PersistentFoldedStatePlugin(app, manifest);
+		first.loadData = loadData;
+		first.saveData = saveData;
+		await first.onload();
+		(app.workspace as unknown as { triggerLayoutReady(): void }).triggerLayoutReady();
+		await first.store.flush();
+		const before = JSON.stringify(stored);
+		expect(first.store.embedRecords()).toEqual(SEED_EMBEDS);
+
+		first.unload(); // "disable"
+		const afterDisable = JSON.stringify(stored);
+
+		const second = new PersistentFoldedStatePlugin(app, manifest);
+		second.loadData = loadData;
+		second.saveData = saveData;
+		await second.onload(); // "re-enable"
+		await second.store.flush();
+
+		expect(afterDisable).toBe(before);
+		expect(JSON.stringify(stored)).toBe(before);
+		expect(saveData).not.toHaveBeenCalled(); // nothing changed, so nothing was written at all
+		expect(second.store.embedRecords()).toEqual(SEED_EMBEDS);
+		expect(second.store.embedRecords()).toEqual(first.store.embedRecords());
+		expect(second.store.get("Rocketship.md")).toEqual(SEED_FILES["Rocketship.md"]);
+	});
+
+	it("still registers exactly one command after a disable and re-enable", async () => {
+		const app = new App();
+		const first = new PersistentFoldedStatePlugin(app, manifest);
+		first.loadData = async () => structuredClone(SEED_DISK);
+		await first.onload();
+		first.unload();
+
+		const second = new PersistentFoldedStatePlugin(app, manifest);
+		second.loadData = async () => structuredClone(SEED_DISK);
+		await second.onload();
+		expect((second as unknown as MockPlugin).getCommands().map((c) => c.id)).toEqual([FORGET_NOTE_FOLDS_COMMAND_ID]);
+	});
+});
+
+describe("lifecycle: embed changes flush on unload, pagehide and visibilitychange (E9)", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	async function pluginWithPendingEmbed() {
+		const plugin = makePlugin();
+		await plugin.onload();
+		plugin.store.setEmbed(embedRecord("pending")); // schedules a flush 150ms out
+		await vi.advanceTimersByTimeAsync(40);
+		expect(((await plugin.loadData()) as unknown)).toBeNull(); // not yet on disk
+		return plugin;
+	}
+
+	it("onunload writes a change made well inside the 150ms window", async () => {
+		const plugin = await pluginWithPendingEmbed();
+		plugin.onunload();
+		await vi.advanceTimersByTimeAsync(0);
+		const saved = (await plugin.loadData()) as { embeds: EmbedFoldRecord[] };
+		expect(saved.embeds).toEqual([embedRecord("pending")]);
+	});
+
+	it("pagehide writes it", async () => {
+		const plugin = await pluginWithPendingEmbed();
+		window.dispatchEvent(new Event("pagehide"));
+		await vi.advanceTimersByTimeAsync(0);
+		const saved = (await plugin.loadData()) as { embeds: EmbedFoldRecord[] };
+		expect(saved.embeds).toEqual([embedRecord("pending")]);
+	});
+
+	it("visibilitychange to hidden writes it", async () => {
+		const plugin = await pluginWithPendingEmbed();
+		Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+		document.dispatchEvent(new Event("visibilitychange"));
+		await vi.advanceTimersByTimeAsync(0);
+		const saved = (await plugin.loadData()) as { embeds: EmbedFoldRecord[] };
+		expect(saved.embeds).toEqual([embedRecord("pending")]);
+	});
+
+	it("visibilitychange to visible does not force the write early", async () => {
+		const plugin = await pluginWithPendingEmbed();
+		Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+		document.dispatchEvent(new Event("visibilitychange"));
+		await vi.advanceTimersByTimeAsync(0);
+		expect(((await plugin.loadData()) as unknown)).toBeNull();
+	});
 });

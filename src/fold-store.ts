@@ -23,8 +23,15 @@
  * The actual re-key/removal/prune logic is pure and lives in `src/vault-lifecycle.ts`; this file
  * only converts between its own `Map` and that module's plain-object shape and handles the
  * dirty/flush bookkeeping.
+ *
+ * Embeds (ticket warkworth-21, PR-1): a second owner of fold state next to the notes map. Embed
+ * records live in an optional `embeds` array in the same data.json (version stays 1), identified
+ * by the structured fields host/target/subpath/occurrence and never by a persisted composite key.
+ * They share the notes' dirty flag, debounce and flush chain. This PR only stores, loads and
+ * forgets them; `handleRename`, `handleDelete` and `pruneOrphans` deliberately leave them alone
+ * (embed variants are PR-8), and dormant expiry for them is PR-7.
  */
-import type { FileFoldRecord, StoreData } from "./types";
+import type { EmbedFoldRecord, EmbedIdentity, FileFoldRecord, StoreData } from "./types";
 import { parseAnchor } from "./anchors";
 import { expireDormant, parseDormantAnchor } from "./dormant";
 import { deleteFiles, pruneOrphanFiles, renameFiles } from "./vault-lifecycle";
@@ -83,6 +90,52 @@ function sanitizeDormantArray(value: unknown): StoredAnchorArray {
 
 type StoredAnchorArray = Record<string, unknown>[];
 
+/** In-memory key for an embed's identity. Derived from the structured fields on every call and
+ * never persisted (the file stores the fields themselves), so it only has to be collision-free:
+ * a JSON array of the four fields is, whatever characters the paths contain. Deliberately not
+ * exported: the embed key builder that reads identity out of a host's source text is PR-3's. */
+function embedMapKey(id: EmbedIdentity): string {
+	return JSON.stringify([id.host, id.target, id.subpath, id.occurrence]);
+}
+
+/** Validates one raw `embeds` entry. Returns null for anything malformed: not an object; a
+ * missing or empty `host`/`target`; a non-string `subpath`; an `occurrence` that is not a
+ * non-negative integer; a missing `contentHash`; `folds` not an array. Inside a valid record,
+ * `folds` and `dormant` keep only entries that pass `parseAnchor`/`parseDormantAnchor`. */
+function sanitizeEmbedRecord(value: unknown): EmbedFoldRecord | null {
+	if (!isPlainObject(value)) return null;
+	const { host, target, subpath, occurrence, contentHash, folds, dormant } = value;
+	if (typeof host !== "string" || host === "") return null;
+	if (typeof target !== "string" || target === "") return null;
+	if (typeof subpath !== "string") return null;
+	if (typeof occurrence !== "number" || !Number.isInteger(occurrence) || occurrence < 0) return null;
+	if (typeof contentHash !== "string") return null;
+	if (!Array.isArray(folds)) return null;
+	return {
+		host,
+		target,
+		subpath,
+		occurrence,
+		contentHash,
+		folds: sanitizeAnchorArray(folds),
+		dormant: sanitizeDormantArray(dormant),
+	};
+}
+
+/** Sanitises the optional `embeds` section. A missing section, or one that is not an array
+ * (object, string, number, null), yields no records. A bad record is dropped on its own and its
+ * neighbours survive. Two records with the same identity collapse to one, last wins. Never
+ * throws. */
+function sanitizeEmbeds(raw: unknown): EmbedFoldRecord[] {
+	if (!Array.isArray(raw)) return [];
+	const byIdentity = new Map<string, EmbedFoldRecord>();
+	for (const entry of raw) {
+		const record = sanitizeEmbedRecord(entry);
+		if (record !== null) byIdentity.set(embedMapKey(record), record);
+	}
+	return [...byIdentity.values()];
+}
+
 /** Pure sanitiser for whatever `loadData()` resolved to (E8). Never throws: anything that isn't
  * the expected shape — `null`, an array, a string, a number, the wrong `version`, a `files` that
  * isn't an object — yields an empty store. Inside `files`, each record is checked on its own: a
@@ -90,7 +143,9 @@ type StoredAnchorArray = Record<string, unknown>[];
  * survive (so one bad entry never costs the whole store). `dormant` defaults to `[]` if missing
  * or malformed; both `folds` and `dormant` keep only the entries inside them that are real,
  * valid `Anchor`s (PR-5; see `sanitizeAnchorArray`), and `dormant` additionally requires a
- * well-formed `dormantSince` on each entry (PR-6; see `sanitizeDormantArray`). This does not
+ * well-formed `dormantSince` on each entry (PR-6; see `sanitizeDormantArray`). The optional
+ * `embeds` section is sanitised on its own terms (see `sanitizeEmbeds`) and left out of the result
+ * entirely while empty, so a notes-only file sanitises to exactly the shape it always did. This does not
  * prune a dormant entry for being *expired* — that's `FoldStore.load()`'s job (G6), driven by an
  * injectable clock rather than baked into this otherwise clock-free, pure sanitiser. */
 export function sanitizeStoreData(raw: unknown): StoreData {
@@ -110,7 +165,8 @@ export function sanitizeStoreData(raw: unknown): StoreData {
 			dormant: sanitizeDormantArray(value.dormant),
 		};
 	}
-	return { version: STORE_VERSION, files };
+	const embeds = sanitizeEmbeds(raw.embeds);
+	return embeds.length > 0 ? { version: STORE_VERSION, files, embeds } : { version: STORE_VERSION, files };
 }
 
 /** Normalizes line endings so the same text hashes the same regardless of CRLF vs LF, then runs
@@ -132,6 +188,9 @@ export function hashText(text: string): string {
 
 export class FoldStore {
 	private files = new Map<string, FileFoldRecord>();
+	/** Embed records by `embedMapKey(identity)`. Untouched by `handleRename`, `handleDelete` and
+	 * `pruneOrphans`: those treat keys as file paths, and embed variants belong to PR-8. */
+	private embeds = new Map<string, EmbedFoldRecord>();
 	private dirty = false;
 	private flushTimer: number | null = null;
 	/** Serialises every flush (scheduled or immediate) so overlapping calls never race: each
@@ -177,6 +236,7 @@ export class FoldStore {
 			files.set(path, { ...record, dormant: expireDormant(record.dormant, now) });
 		}
 		this.files = files;
+		this.embeds = new Map((sanitized.embeds ?? []).map((record) => [embedMapKey(record), record]));
 		this.dirty = false;
 		this.cancelScheduledFlush();
 	}
@@ -188,6 +248,70 @@ export class FoldStore {
 	/** Number of notes with a stored record. */
 	get size(): number {
 		return this.files.size;
+	}
+
+	/** Number of embeds with a stored record. */
+	get embedSize(): number {
+		return this.embeds.size;
+	}
+
+	/** The record for the embed with this identity, looked up by its structured fields. */
+	getEmbed(id: EmbedIdentity): EmbedFoldRecord | undefined {
+		return this.embeds.get(embedMapKey(id));
+	}
+
+	/** Every stored embed record, in insertion order. */
+	embedRecords(): EmbedFoldRecord[] {
+		return [...this.embeds.values()];
+	}
+
+	/** Replaces the whole record for the embed `record` identifies (host, target, subpath and
+	 * occurrence). Debounced like `set()`. */
+	setEmbed(record: EmbedFoldRecord): void {
+		this.embeds.set(embedMapKey(record), record);
+		this.scheduleDebouncedFlush();
+	}
+
+	/** Removes one embed's record. A miss is a no-op that never reaches `saveData`; a hit
+	 * flushes at once, like `forget`. */
+	forgetEmbed(id: EmbedIdentity): boolean {
+		if (!this.embeds.delete(embedMapKey(id))) return false;
+		this.dirty = true;
+		this.flushAndLog();
+		return true;
+	}
+
+	/** Removes every embed record hosted by `host` (an exact path match: records where `host` is
+	 * only the *target* are untouched). Flushes once, at once, if anything was removed. Returns
+	 * how many records were removed; zero is a no-op that never reaches `saveData`. */
+	forgetEmbedsForHost(host: string): number {
+		const removed = this.removeEmbedsForHost(host);
+		if (removed === 0) return 0;
+		this.dirty = true;
+		this.flushAndLog();
+		return removed;
+	}
+
+	/** G15 (command): forgets the note's own record and every embed record it hosts, in one
+	 * immediate flush. Nothing found means nothing written. */
+	forgetNote(path: string): { note: boolean; embeds: number } {
+		const note = this.files.delete(path);
+		const embeds = this.removeEmbedsForHost(path);
+		if (note || embeds > 0) {
+			this.dirty = true;
+			this.flushAndLog();
+		}
+		return { note, embeds };
+	}
+
+	private removeEmbedsForHost(host: string): number {
+		let removed = 0;
+		for (const [key, record] of this.embeds) {
+			if (record.host !== host) continue;
+			this.embeds.delete(key);
+			removed++;
+		}
+		return removed;
 	}
 
 	/** Replaces the whole record for `path`. Schedules a debounced flush (E9/E12) — this is the
@@ -212,13 +336,16 @@ export class FoldStore {
 		return true;
 	}
 
-	/** G12 (settings button): empties the whole map and flushes at once. Returns the number of
-	 * notes that were cleared, for the confirmation Notice. A no-op (and no flush) if already
-	 * empty, for the same reason as `forget`'s miss case. */
+	/** G12/G15 (settings button): empties the notes map *and* the embeds map and flushes at once.
+	 * Returns the number of notes that were cleared, for the confirmation Notice (read
+	 * `embedSize` beforehand for the embed count). A store holding only embeds is not empty:
+	 * it is cleared and flushed, returning 0. A no-op (and no flush) if both are already empty,
+	 * for the same reason as `forget`'s miss case. */
 	forgetAll(): number {
 		const count = this.files.size;
-		if (count === 0) return 0;
+		if (count === 0 && this.embeds.size === 0) return 0;
 		this.files.clear();
+		this.embeds.clear();
 		this.dirty = true;
 		this.flushAndLog();
 		return count;
@@ -296,6 +423,8 @@ export class FoldStore {
 				version: STORE_VERSION,
 				files: Object.fromEntries(this.files),
 			};
+			// Omitted while empty: a notes-only store writes exactly what 0.1.1 wrote.
+			if (this.embeds.size > 0) snapshot.embeds = [...this.embeds.values()];
 			this.dirty = false;
 			try {
 				await this.saveDataFn(snapshot);

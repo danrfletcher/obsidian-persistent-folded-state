@@ -148,6 +148,12 @@ export class Editor {
 export class MarkdownView {
 	file: TFile | null = null;
 	editor?: Editor;
+	/** Real `MarkdownView.getMode()` returns "source" (Source mode and Live Preview alike) or
+	 * "preview" (Reading view). A test sets `mode` directly. */
+	mode: "source" | "preview" = "source";
+	getMode(): "source" | "preview" {
+		return this.mode;
+	}
 }
 
 /** Just enough of real Obsidian's `Vault` (PR-7, G9/G10) to exercise `app.vault.on("rename"/

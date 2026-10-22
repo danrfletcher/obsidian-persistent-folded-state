@@ -70,6 +70,28 @@ describe("fence: no extra UI surface beyond this PR's command/button/modal (F7)"
 	});
 });
 
+// Ticket warkworth-21 PR-1 (F4/F9): embed state is stored in the plugin's own data.json through
+// loadData/saveData only. No new file, folder or vault note may be created, and no node fs/net
+// module reached for, by any src file (including ones added later in this stack).
+const NO_NEW_FILES_OR_NETWORK: { label: string; pattern: RegExp }[] = [
+	{ label: "node:fs import", pattern: /from\s+[\"'](node:)?fs(\/promises)?[\"']/ },
+	{ label: "adapter write/mkdir/append/remove/rename", pattern: /\badapter\.(write|writeBinary|append|appendBinary|mkdir|rmdir|remove|rename|copy)\w*\s*\(/ },
+	{ label: "vault.createFolder/createBinary/copy/rename/delete/trash", pattern: /\bvault\.(createFolder|createBinary|copy|rename|delete|trash)\s*\(/ },
+	{ label: "fileManager.renameFile/trashFile/processFrontMatter", pattern: /\bfileManager\.(renameFile|trashFile|processFrontMatter)\s*\(/ },
+	{ label: "localStorage", pattern: /\blocalStorage\b/ },
+];
+
+describe("fence: embed state adds no new file, folder, note or network surface (F4/F9)", () => {
+	it.each(NO_NEW_FILES_OR_NETWORK)("src/ does not use $label", ({ pattern }) => {
+		expect(srcText).not.toMatch(pattern);
+	});
+
+	it("the command list stays exactly one registration, with no ribbon, status bar or view", () => {
+		expect(srcText.match(/\.addCommand\s*\(/g) ?? []).toHaveLength(1);
+		expect(srcText).not.toMatch(/\b(addRibbonIcon|addStatusBarItem|registerView)\s*\(/);
+	});
+});
+
 describe("fence: manifest.json", () => {
 	const manifest = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8"));
 

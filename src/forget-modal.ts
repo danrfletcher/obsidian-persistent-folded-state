@@ -14,7 +14,7 @@ export class ForgetAllFoldsModal extends Modal {
 		const { contentEl } = this;
 		this.setTitle("Forget all stored folds?");
 		contentEl.createEl("p", {
-			text: "This clears every note's stored fold state on this device. It cannot be undone.",
+			text: "This clears every note's and every embed's stored fold state on this device. It cannot be undone.",
 		});
 		new Setting(contentEl)
 			.addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
