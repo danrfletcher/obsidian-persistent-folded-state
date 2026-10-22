@@ -300,3 +300,69 @@ describe("lifecycle: embed changes flush on unload, pagehide and visibilitychang
 		expect(((await plugin.loadData()) as unknown)).toBeNull();
 	});
 });
+
+// Ticket warkworth-21 PR-5 (F1): the embed restore adds no fold control, element or command, and
+// no observer outlives the plugin.
+describe("lifecycle: the embed restore adds no UI and leaves nothing behind (PR-5, F1)", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+		document.body.replaceChildren();
+	});
+
+	it("onload adds no element to the page, and the command list and settings tab are exactly what they were", async () => {
+		const plugin = makePlugin();
+		const addSettingTab = vi.spyOn(plugin, "addSettingTab");
+		const bodyBefore = document.body.innerHTML;
+
+		await plugin.onload();
+
+		expect(document.body.innerHTML).toBe(bodyBefore);
+		expect((plugin as unknown as MockPlugin).getCommands().map((command) => command.id)).toEqual([FORGET_NOTE_FOLDS_COMMAND_ID]);
+		expect(addSettingTab).toHaveBeenCalledTimes(1);
+		plugin.onunload();
+	});
+
+	it("every MutationObserver the plugin starts is disconnected by onunload, and none is left observing", async () => {
+		const observed: MutationObserver[] = [];
+		const disconnected: MutationObserver[] = [];
+		const observe = vi.spyOn(MutationObserver.prototype, "observe").mockImplementation(function (this: MutationObserver) {
+			observed.push(this);
+		});
+		const disconnect = vi.spyOn(MutationObserver.prototype, "disconnect").mockImplementation(function (this: MutationObserver) {
+			disconnected.push(this);
+		});
+		const plugin = makePlugin();
+
+		await plugin.onload();
+		// The restorer's render watcher (the recorder arms its own only per click).
+		expect(observed.length).toBeGreaterThanOrEqual(1);
+		plugin.onunload();
+
+		for (const observer of observed) expect(disconnected).toContain(observer);
+		expect(observe).toHaveBeenCalled();
+		expect(disconnect).toHaveBeenCalled();
+	});
+
+	it("rendering an embed with nothing stored changes nothing on the page and writes nothing", async () => {
+		const plugin = makePlugin();
+		const saveData = vi.spyOn(plugin, "saveData");
+		await plugin.onload();
+		const embed = document.createElement("div");
+		embed.className = "internal-embed markdown-embed inline-embed is-loaded";
+		embed.setAttribute("src", "Lessons");
+		embed.innerHTML = '<div class="markdown-embed-content"><ul><li><div class="list-collapse-indicator collapse-indicator"></div>x</li></ul></div>';
+		document.body.append(embed);
+		const markup = document.body.innerHTML;
+
+		await vi.advanceTimersByTimeAsync(2000);
+
+		expect(document.body.innerHTML).toBe(markup);
+		expect(saveData).not.toHaveBeenCalled();
+		expect(plugin.store.embedSize).toBe(0);
+		plugin.onunload();
+	});
+});

@@ -119,3 +119,37 @@ describe("fence: built main.js (run `npm run build` first)", () => {
 		it.skip("main.js has not been built yet — run `npm run build` before this suite to check the bundle too", () => {});
 	}
 });
+
+// Ticket warkworth-21 PR-5 (F1/F3/F7): the embed restore adds no UI surface and acts only on
+// workspace markdown views.
+describe("fence: PR-5 embed restore adds no UI surface and acts only on workspace markdown views", () => {
+	const RESTORE = ["embed-fold-restorer.ts", "embed-restore-plan.ts", "embed-render-coalescer.ts"].map((name) => ({
+		name,
+		code: readFileSync(join(SRC, name), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, ""),
+	}));
+
+	it.each(RESTORE.map((r) => [r.name, r.code] as const))("%s registers no command, setting, modal, ribbon, status bar item or view (F7)", (_name, code) => {
+		expect(code).not.toMatch(/\.addCommand\s*\(|\.addSettingTab\s*\(|extends Modal\b|\baddRibbonIcon\b|\baddStatusBarItem\b|\bregisterView\b|\bregisterMarkdownPostProcessor\b/);
+	});
+
+	it.each(RESTORE.map((r) => [r.name, r.code] as const))("%s reaches for no network or telemetry API (F8)", (_name, code) => {
+		for (const { pattern } of FORBIDDEN) expect(code).not.toMatch(pattern);
+	});
+
+	it("every restore pass goes through detectEmbedHost, which accepts only a workspace markdown view in Live Preview or Reading view (F3)", () => {
+		const restorer = RESTORE[0].code;
+		expect(restorer).toMatch(/detectEmbedHost\(this\.deps\.workspace, el\)/);
+		expect(restorer).toMatch(/if \(host === null \|\| !this\.supported\(host, el\)\) return;/);
+		// No path from a DOM element to a fold that skips the host check: the only click is after it.
+		expect(restorer.indexOf("detectEmbedHost(")).toBeGreaterThan(-1);
+		expect(restorer.indexOf("detectEmbedHost(")).toBeLessThan(restorer.indexOf("indicator.click("));
+	});
+
+	it("src/ still has one command and one settings tab, and the restorer is created and disposed in main.ts", () => {
+		const main = readFileSync(join(SRC, "main.ts"), "utf8");
+		expect(srcText.match(/\.addCommand\s*\(/g) ?? []).toHaveLength(1);
+		expect(srcText.match(/\.addSettingTab\s*\(/g) ?? []).toHaveLength(1);
+		expect(main).toMatch(/new EmbedFoldRestorer\(/);
+		expect(main).toMatch(/this\.embedRestorer\?\.dispose\(\)/);
+	});
+});

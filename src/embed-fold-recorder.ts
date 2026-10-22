@@ -43,7 +43,7 @@
  */
 import type { Workspace } from "obsidian";
 import { anchorKey, buildAnchors, parseAnchor } from "./anchors";
-import type { Anchor } from "./anchors";
+import type { Anchor, AnchoredBlock } from "./anchors";
 import { classifyFoldToggle } from "./embed-click-classifier";
 import type { FoldToggleSignals } from "./embed-click-classifier";
 import { EMBED_CAPABILITIES } from "./embed-capabilities";
@@ -55,10 +55,10 @@ import { sliceEmbed } from "./embed-slice";
 import { normalizeText } from "./normalize";
 import type { EmbedFoldRecord, EmbedIdentity, EmbedLinkId, StoredAnchor } from "./types";
 
-const EMBED_SELECTOR = ".internal-embed.markdown-embed";
-const INDICATOR_SELECTOR = ".list-collapse-indicator, .heading-collapse-indicator";
+export const EMBED_SELECTOR = ".internal-embed.markdown-embed";
+export const INDICATOR_SELECTOR = ".list-collapse-indicator, .heading-collapse-indicator";
 const SURFACE_SELECTOR = ".markdown-source-view, .markdown-reading-view";
-const COLLAPSED_CLASS = "is-collapsed";
+export const COLLAPSED_CLASS = "is-collapsed";
 
 /** A pointerdown counts toward a click only if it came this long (ms) or less before it. */
 const POINTER_WINDOW_MS = 3000;
@@ -114,17 +114,29 @@ export function displayText(anchorText: string): string {
  * arrows as the slice has foldable blocks and the kinds agree. Otherwise nothing is guessed.
  */
 export function anchorForToggle(sliceText: string, toggle: ToggleRef): Anchor | null {
-	const foldable = buildAnchors(sliceText).filter(
-		(block) => block.range.endLine > block.range.startLine && familyOf(block.anchor) !== null
-	);
-	const byText = foldable.filter((b) => familyOf(b.anchor) === toggle.family && displayText(b.anchor.text) === toggle.text);
+	const blocks = buildAnchors(sliceText);
+	const index = blockIndexForToggle(blocks, toggle);
+	return index === null ? null : blocks[index].anchor;
+}
+
+/**
+ * The same decision as `anchorForToggle`, but as the index of the block in `blocks` (the output
+ * of `buildAnchors(sliceText)`, in that order). The restore (src/embed-fold-restorer.ts) needs
+ * the block, not just its anchor, to pair every arrow of an embed with the slice block it folds.
+ */
+export function blockIndexForToggle(blocks: readonly AnchoredBlock[], toggle: ToggleRef): number | null {
+	const foldable: number[] = [];
+	blocks.forEach((block, i) => {
+		if (block.range.endLine > block.range.startLine && familyOf(block.anchor) !== null) foldable.push(i);
+	});
+	const byText = foldable.filter((i) => familyOf(blocks[i].anchor) === toggle.family && displayText(blocks[i].anchor.text) === toggle.text);
 	if (byText.length > 0) {
 		if (byText.length !== toggle.sameTotal) return null;
-		return byText[toggle.sameBefore]?.anchor ?? null;
+		return byText[toggle.sameBefore] ?? null;
 	}
 	if (foldable.length !== toggle.total) return null;
 	const hit = foldable[toggle.index];
-	return hit !== undefined && familyOf(hit.anchor) === toggle.family ? hit.anchor : null;
+	return hit !== undefined && familyOf(blocks[hit].anchor) === toggle.family ? hit : null;
 }
 
 /**
@@ -463,42 +475,18 @@ export class EmbedFoldRecorder {
 		if (parsed === null) return null;
 		if (this.capabilities[host.mode][embedKindOf(parsed.subpath)].verdict !== "supported") return null;
 
-		const chain: Element[] = [];
-		for (let el: Element | null = embedEl; el !== null; el = el.parentElement?.closest(EMBED_SELECTOR) ?? null) chain.unshift(el);
-		const levels = chain.map((el, i): EmbedLevelFacts => {
-			const container = i === 0 ? (el.closest(SURFACE_SELECTOR) ?? host.view.containerEl) : chain[i - 1];
-			const parentEmbed = i === 0 ? null : chain[i - 1];
-			const siblings = Array.from(container.querySelectorAll(EMBED_SELECTOR)).filter(
-				(s) => (s.parentElement?.closest(EMBED_SELECTOR) ?? null) === parentEmbed
-			);
-			return { src: el.getAttribute("src") ?? "", siblingSrcs: siblings.map((s) => s.getAttribute("src") ?? ""), index: siblings.indexOf(el) };
-		});
-
-		const own = Array.from(embedEl.querySelectorAll(INDICATOR_SELECTOR)).filter((t) => t.closest(EMBED_SELECTOR) === embedEl);
-		const described = own.map((t) => ({
-			family: t.classList.contains("heading-collapse-indicator") ? ("heading" as const) : ("list" as const),
-			text: rowText(t),
-		}));
-		const index = own.indexOf(indicator);
+		const { levels, outermost } = embedLevels(embedEl, host.view.containerEl);
+		const arrows = describeArrows(embedEl);
+		const index = arrows.findIndex((a) => a.indicator === indicator);
 		if (index === -1) return null;
-		const mine = described[index];
-		const same = described.filter((d) => d.family === mine.family && d.text === mine.text);
-		const toggle: ToggleRef = {
-			family: mine.family,
-			text: mine.text,
-			sameBefore: described.slice(0, index).filter((d) => d.family === mine.family && d.text === mine.text).length,
-			sameTotal: same.length,
-			index,
-			total: own.length,
-		};
 
 		let position: number | null = null;
 		try {
-			position = this.deps.positionOf?.(host, chain[0]) ?? null;
+			position = this.deps.positionOf?.(host, outermost) ?? null;
 		} catch {
 			position = null;
 		}
-		return { host, levels, toggle, position };
+		return { host, levels, toggle: arrows[index].toggle, position };
 	}
 
 	private arm(indicator: Element, ctx: ToggleContext, fromKey: boolean): void {
@@ -568,38 +556,125 @@ export class EmbedFoldRecorder {
 	private async record(job: Job): Promise<void> {
 		if (this.disposed) return;
 		const { ctx } = job;
-		const hostPath = ctx.host.file.path;
+		const resolved = await resolveEmbedChain({
+			hostPath: ctx.host.file.path,
+			hostText: job.hostText,
+			levels: ctx.levels,
+			position: ctx.position,
+			resolveLink: this.deps.resolveLink,
+			readNote: this.deps.readNote,
+			isCancelled: () => this.disposed,
+		});
+		if (resolved === null) return;
 
-		let text = job.hostText;
-		let source = hostPath;
-		const chain: EmbedLinkId[] = [];
-		let sliceText = "";
-		let sliceHash = "";
-		for (let i = 0; i < ctx.levels.length; i++) {
-			const sourcePath = source;
-			const link = locateEmbed(text, sourcePath, ctx.levels[i], (lt) => this.deps.resolveLink(lt, sourcePath), i === 0 ? ctx.position : null);
-			if (link === null) return;
-			chain.push(link);
-			const targetText = await this.deps.readNote(link.target);
-			if (this.disposed || targetText === null) return;
-			const slice = sliceEmbed(targetText, link.subpath);
-			if (slice === null) return;
-			text = slice.text;
-			source = link.target;
-			sliceText = slice.text;
-			sliceHash = slice.hash;
-		}
-		const innermost = chain[chain.length - 1];
-		if (innermost === undefined) return;
-
-		const anchor = anchorForToggle(sliceText, ctx.toggle);
+		const anchor = anchorForToggle(resolved.sliceText, ctx.toggle);
 		if (anchor === null) return;
 
-		const identity: EmbedIdentity = { host: hostPath, ...innermost };
-		if (chain.length > 1) identity.outer = chain.slice(0, -1);
-		const next = applyEmbedFold(this.deps.store.getEmbed(identity), identity, sliceHash, anchor, job.folded);
+		const next = applyEmbedFold(this.deps.store.getEmbed(resolved.identity), resolved.identity, resolved.sliceHash, anchor, job.folded);
 		if (next !== null) this.deps.store.setEmbed(next);
 	}
+}
+
+/** One arrow of an embed, with what is needed to find its block in the embed's slice. */
+export interface EmbedArrow {
+	indicator: Element;
+	toggle: ToggleRef;
+}
+
+/**
+ * The fold arrows that belong to `embedEl` itself (not to an embed nested inside it), in DOM
+ * order, each with the `ToggleRef` that finds its block in the embed's slice. Read-only.
+ */
+export function describeArrows(embedEl: Element): EmbedArrow[] {
+	const own = Array.from(embedEl.querySelectorAll(INDICATOR_SELECTOR)).filter((t) => t.closest(EMBED_SELECTOR) === embedEl);
+	const described = own.map((t) => ({
+		family: t.classList.contains("heading-collapse-indicator") ? ("heading" as const) : ("list" as const),
+		text: rowText(t),
+	}));
+	return own.map((indicator, index): EmbedArrow => {
+		const mine = described[index];
+		const same = (d: { family: string; text: string }): boolean => d.family === mine.family && d.text === mine.text;
+		return {
+			indicator,
+			toggle: {
+				family: mine.family,
+				text: mine.text,
+				sameBefore: described.slice(0, index).filter(same).length,
+				sameTotal: described.filter(same).length,
+				index,
+				total: own.length,
+			},
+		};
+	});
+}
+
+/**
+ * The chain of embed elements from the outermost one down to `embedEl`, as the facts
+ * `locateEmbed` needs at each level. `outermost` is the host-level embed element.
+ */
+export function embedLevels(embedEl: Element, hostContainer: Element): { levels: EmbedLevelFacts[]; outermost: Element } {
+	const chain: Element[] = [];
+	for (let el: Element | null = embedEl; el !== null; el = el.parentElement?.closest(EMBED_SELECTOR) ?? null) chain.unshift(el);
+	const levels = chain.map((el, i): EmbedLevelFacts => {
+		const container = i === 0 ? (el.closest(SURFACE_SELECTOR) ?? hostContainer) : chain[i - 1];
+		const parentEmbed = i === 0 ? null : chain[i - 1];
+		const siblings = Array.from(container.querySelectorAll(EMBED_SELECTOR)).filter(
+			(s) => (s.parentElement?.closest(EMBED_SELECTOR) ?? null) === parentEmbed
+		);
+		return { src: el.getAttribute("src") ?? "", siblingSrcs: siblings.map((s) => s.getAttribute("src") ?? ""), index: siblings.indexOf(el) };
+	});
+	return { levels, outermost: chain[0] };
+}
+
+/** An embed's key, and the slice of its target it shows, resolved from the host's text. */
+export interface ResolvedEmbed {
+	identity: EmbedIdentity;
+	sliceText: string;
+	sliceHash: string;
+}
+
+export interface ResolveEmbedArgs {
+	hostPath: string;
+	hostText: string;
+	levels: EmbedLevelFacts[];
+	position: number | null;
+	resolveLink: (linktext: string, sourcePath: string) => string | null;
+	readNote: (path: string) => Promise<string | null>;
+	/** Checked after each read; true stops the resolution (the caller was disposed). */
+	isCancelled?: () => boolean;
+}
+
+/**
+ * Follows the chain host > outer embed > ... > this embed through the source text, counting each
+ * link's occurrence in the text that contains it (G7, E1), and cuts the innermost embed's slice
+ * (PR-3). Shared by the recorder and the restore so both key an embed exactly the same way.
+ * Null when any link cannot be located, a target is missing, or the slice is broken.
+ */
+export async function resolveEmbedChain(args: ResolveEmbedArgs): Promise<ResolvedEmbed | null> {
+	let text = args.hostText;
+	let source = args.hostPath;
+	const chain: EmbedLinkId[] = [];
+	let sliceText = "";
+	let sliceHash = "";
+	for (let i = 0; i < args.levels.length; i++) {
+		const sourcePath = source;
+		const link = locateEmbed(text, sourcePath, args.levels[i], (lt) => args.resolveLink(lt, sourcePath), i === 0 ? args.position : null);
+		if (link === null) return null;
+		chain.push(link);
+		const targetText = await args.readNote(link.target);
+		if ((args.isCancelled?.() ?? false) || targetText === null) return null;
+		const slice = sliceEmbed(targetText, link.subpath);
+		if (slice === null) return null;
+		text = slice.text;
+		source = link.target;
+		sliceText = slice.text;
+		sliceHash = slice.hash;
+	}
+	const innermost = chain[chain.length - 1];
+	if (innermost === undefined) return null;
+	const identity: EmbedIdentity = { host: args.hostPath, ...innermost };
+	if (chain.length > 1) identity.outer = chain.slice(0, -1);
+	return { identity, sliceText, sliceHash };
 }
 
 function safeDecode(value: string): string {

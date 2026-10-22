@@ -13,6 +13,7 @@
 		"test:e2e:dormant-baseline": "node scripts/e2e-dormant-baseline-probe.mjs",
 		"test:e2e:embed-probe": "node scripts/e2e-embed-probe.mjs",
 		"test:e2e:dormant-baseline-spec": "node tests/e2e/dormant-baseline.e2e.ts",
+		"test:e2e:embed-restore": "node tests/e2e/embed-restore.e2e.ts",
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
 	"keywords": [
