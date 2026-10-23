@@ -14,19 +14,26 @@
  *   indented child (a tab counts as 4 columns); an id at the end of a paragraph covers the
  *   paragraph (up to the previous blank line or heading); an id alone on its own line refers to
  *   the block above it. Ids inside fenced code do not count. A list item inside a callout or
- *   blockquote (`> - item ^id`) works the same way, with its `>` markers removed from the slice.
+ *   blockquote (`> - item ^id`) works the same way, with its `>` markers removed from the slice. An id on a
+ *   later line of a multi-line list item (`- item\n  more text ^id\n  - child`) covers the whole
+ *   item, children included.
  * - `"Heading"` or `"A#B"`: heading embed. From the heading line to just before the next heading
  *   of the same or a higher level; deeper headings stay inside. `#` lines in fenced code are not
  *   headings. `A#B` finds heading B inside heading A's section. Headings are compared after
- *   `normalizeText`.
+ *   `normalizeText`; a heading that contains characters Obsidian drops from a heading link
+ *   (`: # | ^`, see `linkFold`) also matches the link text without them (`Lesson 8: Collections`
+ *   is linked as `#Lesson 8 Collections`).
  *
  * `null` means broken (the target text is empty, the subpath is malformed, or the block id or
  * heading is not there). That is different from a slice whose text is `""` (a real but empty
  * embed), so a later PR can tell "broken" from "empty". Never throws.
  *
- * The slice is dedented so its first line has indent 0, line endings are LF (CRLF and bare CR
- * read the same), and trailing blank lines are dropped, so the text and hash do not depend on
- * the target's line-ending style or on blank lines after the slice. Edits elsewhere in the
+ * A block or heading slice is dedented so its first line has indent 0. A whole-note slice is not:
+ * it is cut as written, so the relative structure of its lines is exactly the note's (dedenting
+ * by an indented first line would turn `  - a\n- b\n  - c` into a list where `c` is no longer
+ * `b`'s child). Line endings are LF (CRLF and bare CR read the same) and trailing blank lines are
+ * dropped, so the text and hash do not depend on the target's line-ending style or on blank
+ * lines after the slice. Edits elsewhere in the
  * target leave the text and hash unchanged. Every function makes one pass over the lines.
  */
 import { hashText } from "./fold-store";
@@ -100,7 +107,8 @@ function parseNote(text: string): Note {
 	let fenceQuoted = false;
 	for (let i = bodyStart; i < lines.length; i++) {
 		// A fence inside a blockquote or callout is written `> ``` `: markers are stripped before
-		// looking for it, and it ends at the first line that is no longer quoted.
+		// looking for it, and it ends at the first line that is no longer quoted (a lazy
+		// continuation line included; as in src/embed-key.ts, not checked against Obsidian, PR-3 R8).
 		const quoted = lines[i].includes(">") && quoteDepth(lines[i]) > 0;
 		if (fenceChar !== "" && fenceQuoted && !quoted) fenceChar = "";
 		// While an unquoted fence is open its closing line is tested raw: a `> ```` line inside an
@@ -146,14 +154,15 @@ function dedent(line: string, columns: number): string {
 	return line.slice(i);
 }
 
-/** Lines `[start, end]` (inclusive) as a slice: dedented by the first line's indent, trailing
- * blank lines dropped. With `unquote` the blockquote / callout markers are removed from every
- * line first (a block inside a callout is shown without the callout's `>`). */
-function cut(note: Note, start: number, end: number, unquote = false): EmbedSlice {
+/** Lines `[start, end]` (inclusive) as a slice: dedented by the first line's indent (unless
+ * `dedentFirst` is false), trailing blank lines dropped. With `unquote` the blockquote / callout
+ * markers are removed from every line first (a block inside a callout is shown without the
+ * callout's `>`). */
+function cut(note: Note, start: number, end: number, unquote = false, dedentFirst = true): EmbedSlice {
 	const lineAt = (i: number): string => (unquote ? stripQuote(note.lines[i]) : note.lines[i]);
 	let last = end;
 	while (last > start && lineAt(last).trim() === "") last--;
-	const columns = indentColumns(lineAt(start));
+	const columns = dedentFirst ? indentColumns(lineAt(start)) : 0;
 	const out: string[] = [];
 	for (let i = start; i <= last; i++) out.push(dedent(lineAt(i), columns));
 	const text = out.join("\n");
@@ -164,7 +173,8 @@ function sliceWholeNote(note: Note): EmbedSlice {
 	let last = note.lines.length - 1;
 	while (last >= note.bodyStart && note.lines[last].trim() === "") last--;
 	if (last < note.bodyStart) return { text: "", hash: hashText("") };
-	return cut(note, note.bodyStart, last);
+	// Not dedented: the note's own structure is what the rendered embed shows.
+	return cut(note, note.bodyStart, last, false, false);
 }
 
 /** Start of the paragraph that ends at line `end`: walks up to the previous blank line, heading,
@@ -177,6 +187,40 @@ function paragraphStart(note: Note, end: number): number {
 		start--;
 	}
 	return start;
+}
+
+/** The list item (in `[bodyStart, idx)`) that the non-item line `idx` continues: the nearest line
+ * above it, without a blank line, heading or code line between, and at the same quote depth, that
+ * is a list item. Null when the line starts a paragraph of its own. */
+function owningListItem(note: Note, idx: number): number | null {
+	const depth = quoteDepth(note.lines[idx]);
+	for (let j = idx - 1; j >= note.bodyStart; j--) {
+		const above = note.lines[j];
+		const text = depth > 0 ? stripQuote(above) : above;
+		if (text.trim() === "" || note.inCode[j] === 1 || headingLevel(text) > 0) return null;
+		if (quoteDepth(above) !== depth) return null;
+		if (LIST_ITEM.test(text)) return j;
+	}
+	return null;
+}
+
+/** The list item starting at line `itemIdx` with every deeper-indented line under it, as a slice.
+ * `idLine` is the line that carries the block id (the item line itself, or a continuation line);
+ * the item's children are looked for after it. Inside a callout or blockquote the indents are
+ * compared with the markers stripped and the item ends where the quote does. */
+function cutListItem(note: Note, itemIdx: number, idLine: number): EmbedSlice {
+	const line = note.lines[itemIdx];
+	const depth = quoteDepth(line);
+	const base = indentColumns(depth > 0 ? stripQuote(line) : line);
+	let end = idLine;
+	for (let j = idLine + 1; j < note.lines.length; j++) {
+		const child = depth > 0 ? stripQuote(note.lines[j]) : note.lines[j];
+		if (child.trim() === "") continue;
+		if (depth > 0 && quoteDepth(note.lines[j]) < depth) break;
+		if (indentColumns(child) <= base) break;
+		end = j;
+	}
+	return cut(note, itemIdx, end, depth > 0);
 }
 
 function sliceBlock(note: Note, id: string): EmbedSlice | null {
@@ -213,27 +257,27 @@ function sliceBlock(note: Note, id: string): EmbedSlice | null {
 
 	// A list item in a callout or blockquote ('> - item ^id'): indents are compared after the
 	// markers are stripped, and the item's children end where the quote does.
-	const item = stripQuote(line);
-	if (LIST_ITEM.test(item)) {
-		const depth = quoteDepth(line);
-		const base = indentColumns(item);
-		let end = idx;
-		for (let j = idx + 1; j < note.lines.length; j++) {
-			const child = depth > 0 ? stripQuote(note.lines[j]) : note.lines[j];
-			if (child.trim() === "") continue;
-			if (depth > 0 && quoteDepth(note.lines[j]) < depth) break;
-			if (indentColumns(child) <= base) break;
-			end = j;
-		}
-		return cut(note, idx, end, depth > 0);
-	}
+	if (LIST_ITEM.test(stripQuote(line))) return cutListItem(note, idx, idx);
+
+	// An id on a later line of a multi-line list item ('- item\n  more text ^id\n  - child') is
+	// the id of the whole item: the item starts at the nearest list item line above it.
+	const owner = owningListItem(note, idx);
+	if (owner !== null) return cutListItem(note, owner, idx);
 
 	if (headingLevel(line) > 0) return cut(note, idx, idx);
 	return cut(note, paragraphStart(note, idx), idx);
 }
 
-/** Finds the first heading in `[from, limit)` whose normalized text is `wanted`, and where its
- * section ends (the next heading of the same or a higher level, or `limit`). One scan. */
+/** Characters Obsidian leaves out of the link text it writes for a heading (`: # | ^`, `%%`,
+ * `[[` and `]]`), each standing for a space. Applied to both sides of a heading comparison, so a
+ * heading `Lesson 8: Collections` is found by the link text `Lesson 8 Collections` too. */
+function linkFold(normalized: string): string {
+	return normalized.replace(/[:#|^]|%%|\[\[|\]\]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Finds the first heading in `[from, limit)` whose normalized text is `wanted` (or equals it
+ * once `linkFold` is applied to both), and where its section ends (the next heading of the same
+ * or a higher level, or `limit`). One scan. */
 function findHeading(
 	note: Note,
 	from: number,
@@ -242,12 +286,14 @@ function findHeading(
 ): { index: number; end: number } | null {
 	let index = -1;
 	let level = 0;
+	const wantedFolded = linkFold(wanted);
 	for (let i = from; i < limit; i++) {
 		if (note.inCode[i] === 1) continue;
 		const lvl = headingLevel(note.lines[i]);
 		if (lvl === 0) continue;
 		if (index === -1) {
-			if (normalizeText(note.lines[i].trim()) === wanted) {
+			const text = normalizeText(note.lines[i].trim());
+			if (text === wanted || linkFold(text) === wantedFolded) {
 				index = i;
 				level = lvl;
 			}

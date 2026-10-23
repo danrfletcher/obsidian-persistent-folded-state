@@ -52,6 +52,7 @@ import type { Anchor, AnchoredBlock } from "./anchors";
 import { EMBED_CAPABILITIES } from "./embed-capabilities";
 import type { EmbedCapability, EmbedHostModeId, EmbedKind } from "./embed-capabilities";
 import { planEmbedPass } from "./embed-anchor-dormancy";
+import { HEADING_RENAME_GRACE_MS } from "./embed-dormancy";
 import { COLLAPSED_CLASS, EMBED_SELECTOR, blockIndexForToggle, describeArrows, embedKindOf, embedLevels, resolveEmbedChain } from "./embed-fold-recorder";
 import { detectEmbedHost } from "./embed-host";
 import type { EmbedHost } from "./embed-host";
@@ -68,6 +69,14 @@ import type { EmbedFoldRecord, EmbedIdentity } from "./types";
 export const EMBED_VERIFY_DELAY_MS = 400;
 /** How many times one pass starts over because the embed's record changed under it. */
 const MAX_RESTARTS = 3;
+/** A render of an embed that arrives within this long (ms) of the restorer's own arrow click on
+ * it is taken as that click's echo, not as a render of its own (PR-5 R3). */
+const OWN_CLICK_ECHO_MS = 600;
+/** How many echo renders in a row may each start a pass that clicks again. A fourth is not
+ * scheduled: if Obsidian re-renders an embed on a toggle and puts the fold back from its own
+ * memory, the restorer would otherwise click it every ~150 ms for ever. Real renders (a source
+ * edit, the host re-opened) are not echoes and always start a pass. */
+const MAX_ECHO_PASSES = 3;
 
 export interface EmbedFoldRestorerDeps {
 	workspace: Workspace;
@@ -99,7 +108,10 @@ export interface EmbedFoldRestorerDeps {
 	hostComparisonBudget?: number;
 	/** PR-7 (G6, E6): brings the dormancy of the host's embed records up to date with its source
 	 * text; called once per host per render pass, before the embeds are read. Optional. */
-	dormancy?: { reconcileHost(hostPath: string, hostText: string): Promise<void> };
+	dormancy?: { reconcileHost(hostPath: string, hostText: string): Promise<{ deferred: number } | void> };
+	/** How long after a reconcile that held heading-linked records back (PR-8 R1) the host is
+	 * looked at again. Defaults to `HEADING_RENAME_GRACE_MS` plus a margin; a test shortens it. */
+	dormancyRecheckMs?: number;
 	/** Wall clock in ms for the dormant retry (PR-7). Defaults to `Date.now`. */
 	now?: () => number;
 }
@@ -133,12 +145,22 @@ export class EmbedFoldRestorer {
 	private readonly verifier: EmbedRenderCoalescer<Element, number>;
 	private readonly generations = new WeakMap<Element, number>();
 	private readonly inFlight = new Set<Promise<void>>();
-	/** One comparison budget per host path, for the render pass in progress (E7). Dropped once the
-	 * restorer is quiet (no pass running and no render window open), so the next render starts a
-	 * new pass with a full budget. */
+	/** One comparison budget per host path, for the render burst in progress (E7). A host's budget
+	 * is dropped once that host is quiet (no pass running for one of its embeds and no render
+	 * window open on one), so the next render of it starts a new burst with a full budget, however
+	 * busy other hosts are (PR-6 R7). */
 	private readonly budgets = new Map<string, HostComparisonBudget>();
-	/** The dormancy reconcile of each host in the pass in progress (PR-7); dropped with `budgets`. */
-	private readonly reconciled = new Map<string, Promise<void>>();
+	/** The dormancy reconcile of each host in the burst in progress (PR-7), with the host text it
+	 * was made for; dropped with `budgets`, and made again when the text has changed (PR-7 R6). */
+	private readonly reconciled = new Map<string, { text: string; done: Promise<void> }>();
+	/** How many passes are running for each host path. */
+	private readonly hostPasses = new Map<string, number>();
+	/** When the restorer last clicked an arrow of each embed (ms). */
+	private readonly lastOwnClick = new WeakMap<Element, number>();
+	/** How many echo renders in a row each embed has had since a pass last left it alone. */
+	private readonly echoStreak = new WeakMap<Element, number>();
+	/** The pending second look at a host whose reconcile held records back. */
+	private readonly rechecks = new Map<string, number>();
 	private renderSeq = 0;
 	private disposed = false;
 
@@ -179,6 +201,19 @@ export class EmbedFoldRestorer {
 		this.verifier.cancelAll();
 		this.budgets.clear();
 		this.reconciled.clear();
+		for (const timer of this.rechecks.values()) window.clearTimeout(timer);
+		this.rechecks.clear();
+	}
+
+	/** Schedules a pass for every embed on the page, or only those of `hostPath`. Used when the
+	 * records changed without a render: a heading rename migrated them (PR-8 R1), or the wait on
+	 * a heading-linked record is over. */
+	rescan(hostPath?: string): void {
+		for (const doc of this.observers.keys()) {
+			for (const el of Array.from(doc.querySelectorAll(EMBED_SELECTOR))) {
+				if (hostPath === undefined || this.hostPathOf(el) === hostPath) this.scheduleRender(el);
+			}
+		}
 	}
 
 	/** How many embeds have a render window open. */
@@ -199,6 +234,14 @@ export class EmbedFoldRestorer {
 
 	private scheduleRender(el: Element): void {
 		if (this.disposed || !el.isConnected) return;
+		const clickedAt = this.lastOwnClick.get(el);
+		if (clickedAt !== undefined && (this.deps.now ?? Date.now)() - clickedAt < OWN_CLICK_ECHO_MS) {
+			const streak = (this.echoStreak.get(el) ?? 0) + 1;
+			this.echoStreak.set(el, streak);
+			if (streak > MAX_ECHO_PASSES) return; // the restorer's own clicks keep coming back as renders: stop
+		} else {
+			this.echoStreak.delete(el);
+		}
 		this.verifier.cancel(el);
 		this.renders.render(el, ++this.renderSeq);
 	}
@@ -230,8 +273,28 @@ export class EmbedFoldRestorer {
 
 	// --- A pass --------------------------------------------------------------------------------
 
+	/** The path of the host a rendered embed sits in, or null when it is in none. */
+	private hostPathOf(el: Element): string | null {
+		try {
+			return detectEmbedHost(this.deps.workspace, el)?.file.path ?? null;
+		} catch {
+			return null;
+		}
+	}
+
+	/** Drops `hostPath`'s budget and reconcile once none of its embeds has a pass running or a
+	 * render window open. */
+	private releaseHostIfQuiet(hostPath: string): void {
+		if ((this.hostPasses.get(hostPath) ?? 0) > 0) return;
+		if (this.renders.hasWhere((el) => this.hostPathOf(el) === hostPath)) return;
+		this.budgets.delete(hostPath);
+		this.reconciled.delete(hostPath);
+	}
+
 	private startPass(el: Element, verifyAfter: boolean): void {
 		if (this.disposed || !el.isConnected) return;
+		const hostPath = this.hostPathOf(el);
+		if (hostPath !== null) this.hostPasses.set(hostPath, (this.hostPasses.get(hostPath) ?? 0) + 1);
 		const generation = (this.generations.get(el) ?? 0) + 1;
 		this.generations.set(el, generation);
 		const task: Promise<void> = this.restore(el, generation)
@@ -239,33 +302,55 @@ export class EmbedFoldRestorer {
 				console.error("persistent-folded-state: embed restore failed", err);
 			})
 			.then(() => {
-				if (verifyAfter && !this.disposed && el.isConnected && this.generations.get(el) === generation) {
+				if (verifyAfter && !this.disposed && el.isConnected && this.generations.get(el) === generation && (this.echoStreak.get(el) ?? 0) < MAX_ECHO_PASSES) {
 					this.verifier.render(el, generation);
 				}
 			})
 			.finally(() => {
 				this.inFlight.delete(task);
-				if (this.inFlight.size === 0 && this.renders.pendingCount === 0) {
-					this.budgets.clear();
-					this.reconciled.clear();
+				if (hostPath !== null) {
+					const left = (this.hostPasses.get(hostPath) ?? 1) - 1;
+					if (left > 0) this.hostPasses.set(hostPath, left);
+					else this.hostPasses.delete(hostPath);
+					this.releaseHostIfQuiet(hostPath);
 				}
 			});
 		this.inFlight.add(task);
 	}
 
-	/** Reconciles the host's embed records once per render pass (dropped with the budgets). A
+	/** Reconciles the host's embed records once per render burst (dropped with the budgets), and
+	 * again when the host text is no longer the text the earlier reconcile was made for: a record
+	 * revived or stamped by that edit must be seen before its embed is restored (PR-7 R6). A
 	 * failure is logged and leaves every record as it was. */
 	private reconcileHost(hostPath: string, hostText: string): Promise<void> {
 		const dormancy = this.deps.dormancy;
 		if (dormancy === undefined) return Promise.resolve();
-		let done = this.reconciled.get(hostPath);
-		if (done === undefined) {
-			done = dormancy.reconcileHost(hostPath, hostText).catch((err: unknown) => {
+		const earlier = this.reconciled.get(hostPath);
+		if (earlier !== undefined && earlier.text === hostText) return earlier.done;
+		// One reconcile at a time per host: the second waits for the first.
+		const done = (earlier?.done ?? Promise.resolve())
+			.then(() => dormancy.reconcileHost(hostPath, hostText))
+			.then((result) => {
+				if (result !== undefined && result.deferred > 0) this.scheduleRecheck(hostPath);
+			})
+			.catch((err: unknown) => {
 				console.error("persistent-folded-state: embed dormancy failed", err);
 			});
-			this.reconciled.set(hostPath, done);
-		}
+		this.reconciled.set(hostPath, { text: hostText, done });
 		return done;
+	}
+
+	/** A reconcile held heading-linked records back: once the wait is over the host is reconciled
+	 * again, which needs a fresh pass because nothing else re-renders its embeds. */
+	private scheduleRecheck(hostPath: string): void {
+		if (this.disposed || this.rechecks.has(hostPath)) return;
+		const timer = window.setTimeout(() => {
+			this.rechecks.delete(hostPath);
+			if (this.disposed) return;
+			this.reconciled.delete(hostPath);
+			this.rescan(hostPath);
+		}, this.deps.dormancyRecheckMs ?? HEADING_RENAME_GRACE_MS + 500);
+		this.rechecks.set(hostPath, timer);
 	}
 
 	private budgetFor(hostPath: string): HostComparisonBudget {
@@ -338,13 +423,16 @@ export class EmbedFoldRestorer {
 			// The same builder and matcher a note's folds use, over the slice text alone (G3). The
 			// dormant anchors (PR-7, G14) are retried in the same matcher call, on every settled
 			// render of this embed (E5), sharing the host's comparison budget (E7).
-			const hasDormant = (snapshot?.dormant.length ?? 0) > 0;
-			const candidates: AnchoredBlock[] = storedAnchors.length > 0 || hasDormant ? buildAnchors(resolved.sliceText) : [];
+			// Always built, even with nothing stored: the arrows are paired with blocks through it,
+			// and an arrow that cannot be paired is left alone (PR-5 R2), so an embed with no state
+			// can still have Obsidian's own folds on paired arrows undone.
+			const candidates: AnchoredBlock[] = buildAnchors(resolved.sliceText);
+			const budget = this.budgetFor(host.file.path);
 			const rematch = await planEmbedPass({
 				record: snapshot,
 				sliceHash: resolved.sliceHash,
 				candidates,
-				budget: this.budgetFor(host.file.path),
+				budget,
 				yieldToHost: () => new Promise<void>((resolve) => window.setTimeout(resolve, 0)),
 				matcherOptions: this.deps.matcherOptions,
 				now: (this.deps.now ?? Date.now)(),
@@ -355,7 +443,13 @@ export class EmbedFoldRestorer {
 			if (this.stale(el, generation)) return;
 			// E3: a fold or unfold Dan made while this pass was matching wins. Start over from the
 			// record as it is now, so the pass never undoes (or re-does) what he just did.
-			if (recordFoldsKey(this.deps.store.getEmbed(resolved.identity)) !== recordFoldsKey(snapshot)) continue;
+			if (recordFoldsKey(this.deps.store.getEmbed(resolved.identity)) !== recordFoldsKey(snapshot)) {
+				// The outcome is thrown away and the next go pays again: give this attempt's
+				// comparisons back, so one embed that keeps being clicked cannot use up the
+				// budget meant for its siblings (PR-6 R8).
+				budget.refund(rematch.comparisons);
+				continue;
+			}
 
 			// From here to the clicks there is no await: what the arrows show is what is planned against.
 			const arrows = describeArrows(el);
@@ -366,7 +460,10 @@ export class EmbedFoldRestorer {
 			const plan = planEmbedRestore({ matches, candidates, arrows: live });
 			// Out of comparison budget: some stored folds could not be placed this pass, so what the
 			// embed shows is not second-guessed either. Folds that were placed are applied; nothing is
-			// unfolded, and the record is not touched (E7).
+			// unfolded, and the record is not touched (E7). This is a deliberate reading of the spec's
+			// "embeds that run out of budget are not folded": the folds that were placed are confident
+			// matches, so applying them is safe, and only the ones that could not be placed are left
+			// out (PR-6 R6).
 			if (rematch.budgetExhausted) plan.unfold = [];
 
 			// G3/G4: the slice changed and the folds were placed on it: the record now describes the
@@ -383,7 +480,10 @@ export class EmbedFoldRestorer {
 					});
 				}
 			}
-			for (const i of [...plan.fold, ...plan.unfold]) {
+			const toClick = [...plan.fold, ...plan.unfold];
+			if (toClick.length === 0) this.echoStreak.delete(el); // the embed is as stored: any echo loop is over
+			else this.lastOwnClick.set(el, (this.deps.now ?? Date.now)());
+			for (const i of toClick) {
 				const indicator = arrows[i].indicator as HTMLElement;
 				if (typeof indicator.click === "function") indicator.click();
 			}

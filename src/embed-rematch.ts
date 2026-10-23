@@ -59,6 +59,13 @@ export class HostComparisonBudget {
 		this.left = Math.max(0, this.left - count);
 	}
 
+	/** Gives back comparisons spent by work whose result was thrown away (an embed's pass that
+	 * started over because its record changed, E3), so that the second go at the same embed does
+	 * not take budget meant for its siblings. Never goes above `total`. */
+	refund(count: number): void {
+		this.left = Math.min(this.total, this.left + Math.max(0, count));
+	}
+
 	/** Runs `task` after every earlier `exclusive` task has finished, whether it succeeded or not. */
 	exclusive<T>(task: () => Promise<T>): Promise<T> {
 		const run = this.tail.then(task, task);

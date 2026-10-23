@@ -32,6 +32,22 @@ anchor builder (`src/anchors.ts`, `src/normalize.ts`). PR-4 added the pure match
 Not in this PR: the dormant-fold retry window and first-open baseline adoption (PR-6), restore
 on reopen/restart/rename/delete (PR-7).
 
+## Embed folds: known limits
+
+- A fold arrow inside an embed that the plugin cannot pair with a line of the embedded text (its
+  rendered text differs too much from the source line, for example) is left exactly as Obsidian
+  shows it. A fold Dan makes on it is not recorded, and the stored folds never undo it, so when a
+  fold of that kind is on screen the embed can differ from the stored set ("the stored set wins"
+  is not strict for it). The plugin does not guess which line such an arrow belongs to.
+- When an embed runs out of the per-host comparison budget while its stored folds are matched to
+  a changed source, the folds that were placed are applied, and the ones that could not be placed
+  are left out; nothing is unfolded.
+- A link to a heading (`![[Note#Heading]]`) whose embed has stored folds waits 10 seconds after it
+  stops matching the host's text before its folds go dormant, so a heading Dan renames in Obsidian
+  (which rewrites the link) moves the folds to the new heading instead of starting the 10-minute
+  clock on the old one. The wait is measured while the note is open; a link edited by hand starts
+  its dormant period about 10 seconds later than a block or whole-note link does.
+
 ## Fold state is per device
 
 Fold state is stored in this plugin's own `data.json`, which (like every Obsidian plugin's

@@ -334,9 +334,10 @@ describe.each(MODES)("%s host: a stored anchor with no confident match stays unf
 		const host = r.w.addHost("Host.md", mode, "![[Lessons]]\n");
 		await settleRestore(r.w, r.restorer);
 
-		// Whatever the matcher decides, only its decision is folded, and never more than one block per stored anchor.
+		// Every line the fold could land on was rewritten past the matcher's thresholds, so nothing
+		// is folded (rule 4: a below-threshold match folds nothing; PR-5 R1).
 		// PR-7 (G14): an anchor with no confident match is not lost: it is in the record's folds or, if unplaced, dormant.
-		expect(foldedRows(host.embeds[0]).length).toBeLessThanOrEqual(1);
+		expect(foldedRows(host.embeds[0])).toEqual([]);
 		const record = r.w.store.embedRecords()[0];
 		expect(record.folds.length + record.dormant.length).toBe(1);
 	});
@@ -851,5 +852,52 @@ describe.each(MODES)("%s host: F1, nothing is added to the DOM of a rendered emb
 		const before = host.embeds[0].outerHTML;
 		await settleRestore(r.w, r.restorer);
 		expect(host.embeds[0].outerHTML).toBe(before);
+	});
+});
+
+describe.each(MODES)("%s host: the restorer's own clicks cannot keep it busy for ever (PR-5 R3)", (mode) => {
+	/** Obsidian that re-renders an embed on every toggle and puts the fold back from its own memory. */
+	function revertOnClick(embed: HTMLElement): { clicks: () => number } {
+		let clicks = 0;
+		for (const arrow of ownArrows(embed)) {
+			arrow.addEventListener("click", () => {
+				clicks++;
+				queueMicrotask(() => {
+					arrow.classList.remove("is-collapsed");
+					embed.append(document.createElement("span")); // a childList mutation: a render, as far as the restorer can tell
+				});
+			});
+		}
+		return { clicks: () => clicks };
+	}
+
+	it("a fold that is put back each time is clicked a bounded number of times, then left", async () => {
+		const r = rig();
+		await foldAndClose(r, mode, "Host.md", "![[Lessons]]\n", ["Lesson 2"]);
+		const host = r.w.addHost("Host.md", mode, "![[Lessons]]\n");
+		const spy = revertOnClick(host.embeds[0]);
+
+		await vi.advanceTimersByTimeAsync(10_000);
+		await drain(r.w, r.restorer);
+		const after10s = spy.clicks();
+		expect(after10s).toBeGreaterThanOrEqual(1);
+		expect(after10s).toBeLessThanOrEqual(4);
+
+		await vi.advanceTimersByTimeAsync(30_000);
+		await drain(r.w, r.restorer);
+		expect(spy.clicks()).toBe(after10s); // nothing more happens
+	});
+
+	it("a real render later, not caused by the restorer's click, is restored as usual", async () => {
+		const r = rig();
+		await foldAndClose(r, mode, "Host.md", "![[Lessons]]\n", ["Lesson 2"]);
+		const host = r.w.addHost("Host.md", mode, "![[Lessons]]\n");
+		revertOnClick(host.embeds[0]);
+		await vi.advanceTimersByTimeAsync(10_000);
+		await drain(r.w, r.restorer);
+
+		r.w.rerender(host.embeds[0], "Host.md"); // Dan edits the source: a new embed element, with no revert behaviour
+		await settleRestore(r.w, r.restorer);
+		expect(foldedRows(host.embeds[0]).map((t) => t.slice(0, 8))).toEqual(["Lesson 2"]);
 	});
 });

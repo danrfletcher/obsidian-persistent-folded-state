@@ -5,7 +5,7 @@
  * Pure: no DOM. Expected anchors are written out literally.
  */
 import { describe, expect, it } from "vitest";
-import { anchorForToggle, applyEmbedFold, displayText, embedKindOf, locateEmbed } from "../../src/embed-fold-recorder";
+import { anchorForToggle, applyEmbedFold, describeArrows, displayText, embedKindOf, embedLevels, locateEmbed, resolveEmbedChain } from "../../src/embed-fold-recorder";
 import type { EmbedLevelFacts, ToggleRef } from "../../src/embed-fold-recorder";
 import { sliceEmbed } from "../../src/embed-slice";
 import type { Anchor } from "../../src/anchors";
@@ -21,6 +21,27 @@ const COUNT: StoredAnchorLike = { kind: "task", indent: 2, text: "count word fre
 
 const IDENTITY: EmbedIdentity = { host: "Host.md", target: "Lessons.md", subpath: "", occurrence: 0 };
 const toggle = (over: Partial<ToggleRef>): ToggleRef => ({ family: "list", text: "", sameBefore: 0, sameTotal: 1, index: 0, total: 1, ...over });
+
+describe("applyEmbedFold and a dormant record (PR-7 R7)", () => {
+	const dormantRecord = (): EmbedFoldRecord => ({ ...(applyEmbedFold(undefined, IDENTITY, "h1", LESSON_1, true) as EmbedFoldRecord), dormantSince: 5_000 });
+
+	it("a fold click rebuilds the record without dormantSince: the click proves the embed is live", () => {
+		const next = applyEmbedFold(dormantRecord(), IDENTITY, "h1", LESSON_2, true);
+		expect(next?.folds).toEqual([LESSON_1, LESSON_2]);
+		expect(Object.keys(next ?? {})).not.toContain("dormantSince");
+	});
+
+	it("an unfold click rebuilds it without dormantSince too, keeping the other folds", () => {
+		const first = { ...dormantRecord(), folds: [LESSON_1, LESSON_2] } as EmbedFoldRecord;
+		const next = applyEmbedFold(first, IDENTITY, "h1", LESSON_2, false);
+		expect(next?.folds).toEqual([LESSON_1]);
+		expect(Object.keys(next ?? {})).not.toContain("dormantSince");
+	});
+
+	it("a click that changes nothing returns null and so leaves the stamp where it was", () => {
+		expect(applyEmbedFold(dormantRecord(), IDENTITY, "h1", LESSON_1, true)).toBeNull();
+	});
+});
 
 describe("applyEmbedFold: fold upserts, unfold removes", () => {
 	it("a first fold creates the record with only that fold in it", () => {
@@ -156,13 +177,20 @@ describe("anchorForToggle: described against the slice text, not the source note
 	});
 
 	it("when the rendered text still differs from the source line, the arrow's position is used if the counts agree", () => {
-		const text = ["- [ ] Run `npm test`", "  - [ ] a", "- [ ] Plain", "  - [ ] b"].join("\n");
-		expect(anchorForToggle(text, toggle({ text: "run npm test", index: 0, total: 2 }))?.text).toBe("run `npm test`");
+		const text = ["- [ ] Run npm test<sup>1</sup>", "  - [ ] a", "- [ ] Plain", "  - [ ] b"].join("\n");
+		expect(anchorForToggle(text, toggle({ text: "run npm test", index: 0, total: 2 }))?.text).toBe("run npm test<sup>1</sup>");
 	});
 
 	it("when the text still differs and the counts disagree, nothing is guessed", () => {
-		const text = ["- [ ] Run `npm test`", "  - [ ] a", "- [ ] Plain", "  - [ ] b"].join("\n");
+		const text = ["- [ ] Run npm test<sup>1</sup>", "  - [ ] a", "- [ ] Plain", "  - [ ] b"].join("\n");
 		expect(anchorForToggle(text, toggle({ text: "run npm test", index: 0, total: 3 }))).toBeNull();
+	});
+
+	it("a row with inline code, an embed or a heading link is found by its text, not only by position (PR-4 R5)", () => {
+		const text = ["- [ ] Run `npm test`", "  - [ ] a", "- [ ] ![[Lessons]]", "  - [ ] b", "- [ ] See [[Note#Sec]]", "  - [ ] c"].join("\n");
+		expect(anchorForToggle(text, toggle({ text: "run npm test", index: 5, total: 9 }))?.siblingIndex).toBe(0);
+		expect(anchorForToggle(text, toggle({ text: "", index: 5, total: 9 }))?.siblingIndex).toBe(1);
+		expect(anchorForToggle(text, toggle({ text: "see note > sec", index: 5, total: 9 }))?.siblingIndex).toBe(2);
 	});
 
 	it("a heading arrow finds the heading, not a list row of the same text", () => {
@@ -205,6 +233,15 @@ describe("displayText: an anchor's text as Obsidian renders the row", () => {
 		["open [the docs](https://example.com/a)", "open the docs"],
 		["plain text", "plain text"],
 		["keeps ^mid id here", "keeps ^mid id here"],
+		["![[lessons]]", ""],
+		["![[lessons#^x|small]]", ""],
+		["intro ![[lessons]] outro", "intro outro"],
+		["![alt](pic.png) caption", "caption"],
+		["see [[note#sec]]", "see note > sec"],
+		["see [[#sec]]", "see sec"],
+		["see [[note#sec|the section]]", "see the section"],
+		["run `npm test` first", "run npm test first"],
+		["run ``a `b` c`` now", "run a `b` c now"],
 	])("%s -> %s", (input, shown) => {
 		expect(displayText(input)).toBe(shown);
 	});
@@ -252,6 +289,74 @@ describe("locateEmbed: which embed of the text is this element (G7, E1)", () => 
 		const text = "![[Lessons]]\n\n![[Lessons]]\n";
 		const endOfSecond = text.lastIndexOf("]]") + 2;
 		expect(locateEmbed(text, "Host.md", level({ siblingSrcs: ["Lessons"] }), resolve, endOfSecond)?.occurrence).toBe(1);
+	});
+
+	describe("an embed inside a list item, with the position the editor reports (PR-4 R3)", () => {
+		const text = "- ![[Lessons]]\n- ![[Lessons]]\n";
+		// Only one of the two is in the DOM (the other is outside Live Preview's rendered range),
+		// so the position is what tells them apart.
+		const dom = { siblingSrcs: ["Lessons"] };
+		const occurrenceAt = (pos: number): number | undefined => locateEmbed(text, "Host.md", level(dom), resolve, pos)?.occurrence;
+		const second = text.indexOf("![[", 5);
+
+		it("at the '![' of each embed", () => {
+			expect(occurrenceAt(text.indexOf("![["))).toBe(0);
+			expect(occurrenceAt(second)).toBe(1);
+		});
+
+		it("at the start of the line: the embed on that line, not the previous identical one", () => {
+			expect(occurrenceAt(0)).toBe(0);
+			expect(occurrenceAt(text.indexOf("\n") + 1)).toBe(1);
+		});
+
+		it("inside the list marker: the embed on that line", () => {
+			expect(occurrenceAt(text.indexOf("\n") + 2)).toBe(1);
+		});
+
+		it("at the end of each embed", () => {
+			expect(occurrenceAt(text.indexOf("]]") + 2)).toBe(0);
+			expect(occurrenceAt(text.lastIndexOf("]]") + 2)).toBe(1);
+		});
+
+		it("a quoted, numbered or checkbox item works the same way", () => {
+			for (const prefix of ["> - ", "1. ", "  - [ ] ", "> > * "]) {
+				const t = `${prefix}![[Lessons]]\n${prefix}![[Lessons]]\n`;
+				const lineTwo = t.indexOf("\n") + 1;
+				expect(locateEmbed(t, "Host.md", level(dom), resolve, lineTwo)?.occurrence).toBe(1);
+			}
+		});
+
+		it("two embeds on one line: a position after the first still means the first", () => {
+			const t = "![[Lessons]] ![[Lessons]]\n";
+			expect(locateEmbed(t, "Host.md", level(dom), resolve, t.indexOf("]]") + 2)?.occurrence).toBe(0);
+			expect(locateEmbed(t, "Host.md", level(dom), resolve, t.lastIndexOf("![["))?.occurrence).toBe(1);
+		});
+	});
+
+	describe("a DOM that shows every identical embed decides, whatever position is reported (PR-4 R3)", () => {
+		const dom = ["Lessons", "Lessons"];
+
+		it("a position that is the previous embed's, the previous line's end or nonsense does not move the embed", () => {
+			for (const prefix of ["- ", "> - ", "1. ", "  - [ ] ", ""]) {
+				const t = `${prefix}![[Lessons]]\n${prefix}![[Lessons]]\n`;
+				const lineTwo = t.indexOf("\n") + 1;
+				for (const position of [0, t.indexOf("\n"), lineTwo - 1, 3]) {
+					expect(locateEmbed(t, "Host.md", level({ siblingSrcs: dom, index: 1 }), resolve, position)?.occurrence).toBe(1);
+					expect(locateEmbed(t, "Host.md", level({ siblingSrcs: dom, index: 0 }), resolve, t.length)?.occurrence).toBe(0);
+				}
+			}
+		});
+
+		it("with the DOM and the position agreeing, nothing changes", () => {
+			const t = "- ![[Lessons]]\n- ![[Lessons]]\n";
+			expect(locateEmbed(t, "Host.md", level({ siblingSrcs: dom, index: 1 }), resolve, t.lastIndexOf("![["))?.occurrence).toBe(1);
+		});
+
+		it("a DOM that shows fewer embeds than the text does not decide: the position does", () => {
+			const t = "- ![[Lessons]]\n- ![[Lessons]]\n- ![[Lessons]]\n";
+			const third = t.lastIndexOf("![[");
+			expect(locateEmbed(t, "Host.md", level({ siblingSrcs: dom, index: 0 }), resolve, third)?.occurrence).toBe(2);
+		});
 	});
 
 	it("other embeds in between do not count", () => {
@@ -312,5 +417,88 @@ describe("locateEmbed: which embed of the text is this element (G7, E1)", () => 
 		const text = "![[Lessons]]\n![[Lessons]]\n![[Other]]\n";
 		const dom = ["Lessons", "Lessons", "Other"];
 		expect(locateEmbed(text, "Host.md", level({ siblingSrcs: dom, index: 2 }), resolve, null)).toBeNull();
+	});
+});
+
+describe("resolveEmbedChain: the cases that give no key", () => {
+	const resolveLink = (lt: string): string | null => (lt === "Lessons" ? "Lessons.md" : null);
+	const levels: EmbedLevelFacts[] = [{ src: "Lessons", siblingSrcs: ["Lessons"], index: 0 }];
+	const base = { hostPath: "Host.md", hostText: "![[Lessons]]\n", levels, position: null, resolveLink };
+
+	it("keys the embed and cuts its slice when every step resolves", async () => {
+		const out = await resolveEmbedChain({ ...base, readNote: async () => "- a\n  - b\n" });
+		expect(out?.identity).toEqual({ host: "Host.md", target: "Lessons.md", subpath: "", occurrence: 0 });
+		expect(out?.sliceText).toBe("- a\n  - b");
+	});
+
+	it("no levels at all (an embed with no element chain) gives no key", async () => {
+		expect(await resolveEmbedChain({ ...base, levels: [], readNote: async () => "x" })).toBeNull();
+	});
+
+	it("a missing target note gives no key", async () => {
+		expect(await resolveEmbedChain({ ...base, readNote: async () => null })).toBeNull();
+	});
+
+	it("a caller that was cancelled while the note was read gets no key, even though the note was there", async () => {
+		expect(await resolveEmbedChain({ ...base, readNote: async () => "- a\n", isCancelled: () => true })).toBeNull();
+	});
+
+	it("a heading the target does not have gives no key", async () => {
+		const out = await resolveEmbedChain({
+			...base,
+			hostText: "![[Lessons#Nope]]\n",
+			levels: [{ src: "Lessons#Nope", siblingSrcs: ["Lessons#Nope"], index: 0 }],
+			readNote: async () => "# Other\n- a\n",
+		});
+		expect(out).toBeNull();
+	});
+});
+
+describe("embedLevels and describeArrows over a real DOM", () => {
+	const build = (html: string): HTMLElement => {
+		const root = document.createElement("div");
+		root.innerHTML = html;
+		document.body.appendChild(root);
+		return root;
+	};
+
+	it("an embed outside any editor surface falls back to the host container for its siblings", () => {
+		const container = build('<div class="internal-embed markdown-embed" src="A"></div><div class="internal-embed markdown-embed" src="B"></div>');
+		const second = container.querySelectorAll(".internal-embed")[1];
+		const { levels, outermost } = embedLevels(second, container);
+		expect(levels).toEqual([{ src: "B", siblingSrcs: ["A", "B"], index: 1 }]);
+		expect(outermost).toBe(second);
+		container.remove();
+	});
+
+	it("an embed with no src attribute reads as an empty src", () => {
+		const container = build('<div class="internal-embed markdown-embed"></div>');
+		const only = container.querySelector(".internal-embed") as Element;
+		expect(embedLevels(only, container).levels).toEqual([{ src: "", siblingSrcs: [""], index: 0 }]);
+		container.remove();
+	});
+
+	it("a nested embed is listed under its parent, and the outer one is the outermost", () => {
+		const container = build('<div class="internal-embed markdown-embed" src="Outer"><div class="internal-embed markdown-embed" src="Inner"></div></div>');
+		const inner = container.querySelector('[src="Inner"]') as Element;
+		const { levels, outermost } = embedLevels(inner, container);
+		expect(levels.map((l) => l.src)).toEqual(["Outer", "Inner"]);
+		expect(levels[1]).toEqual({ src: "Inner", siblingSrcs: ["Inner"], index: 0 });
+		expect((outermost as Element).getAttribute("src")).toBe("Outer");
+		container.remove();
+	});
+
+	it("arrows of a nested embed are not the outer embed's own", () => {
+		const container = build(
+			'<div class="internal-embed markdown-embed" src="A">' +
+				'<span class="list-collapse-indicator"></span>' +
+				'<div class="internal-embed markdown-embed" src="B"><div><span class="list-collapse-indicator"></span>Inner row</div></div>' +
+				"</div>"
+		);
+		const outer = container.querySelector('[src="A"]') as Element;
+		const arrows = describeArrows(outer);
+		expect(arrows).toHaveLength(1);
+		expect(arrows[0].toggle).toMatchObject({ family: "list", sameBefore: 0, sameTotal: 1, index: 0, total: 1 });
+		container.remove();
 	});
 });

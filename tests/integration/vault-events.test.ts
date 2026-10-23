@@ -14,7 +14,7 @@ import { EditorView } from "@codemirror/view";
 import { codeFolding } from "@codemirror/language";
 import { TFile as MockTFile, Vault as MockVault, Workspace as MockWorkspace, editorInfoField } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
-import { EmbedDormancyTracker } from "../../src/embed-dormancy";
+import { EmbedDormancyTracker, HEADING_RENAME_GRACE_MS } from "../../src/embed-dormancy";
 
 function setExists(app: App, path: string): void {
 	(app.vault as unknown as MockVault).setExists(path);
@@ -250,6 +250,51 @@ describe("vault-events: a rename never starts an embed's dormant clock (PR-7, G6
 
 		expect(writes.map((spy) => spy.mock.calls.length)).toEqual(WRITES.map(() => 0));
 		await plugin.store.flush();
+	});
+
+	// R5: a host with no rendered embed (source mode, or the heading embed deleted while the host
+	// was closed) has no restore pass to look a second time, so the open handler must.
+	describe("opening a host that renders no embed, with a heading-linked record", () => {
+		const headingRecord = { host: HOST, target: SOURCE, subpath: "Chapter Two", occurrence: 0, contentHash: "h", folds: [], dormant: [] };
+
+		async function openHost() {
+			const app = new App();
+			const vault = app.vault as unknown as MockVault;
+			vault.setContent(HOST, "The heading embed was deleted while this note was closed.\n");
+			vault.setContent(SOURCE, "# Chapter Two\n- [ ] Lesson 8\n");
+			const plugin = makePlugin(app, { value: { version: 1, files: {}, embeds: [{ ...headingRecord }] } as unknown });
+			await plugin.onload();
+			(app.workspace as unknown as MockWorkspace).trigger("file-open", new MockTFile(HOST));
+			return plugin;
+		}
+
+		it("is held back at the open, then stamped dormant once the heading wait has passed, with nothing rendered", async () => {
+			vi.useFakeTimers();
+			try {
+				const plugin = await openHost();
+				await vi.advanceTimersByTimeAsync(1000);
+				expect(plugin.store.embedRecords()[0].dormantSince).toBeUndefined();
+
+				await vi.advanceTimersByTimeAsync(HEADING_RENAME_GRACE_MS);
+				expect(plugin.store.embedRecords()[0].dormantSince).toBeTypeOf("number");
+				plugin.onunload();
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("makes no second look after the plugin is unloaded", async () => {
+			vi.useFakeTimers();
+			try {
+				const plugin = await openHost();
+				await vi.advanceTimersByTimeAsync(1000);
+				plugin.onunload();
+				await vi.advanceTimersByTimeAsync(HEADING_RENAME_GRACE_MS * 2);
+				expect(plugin.store.embedRecords()[0].dormantSince).toBeUndefined();
+			} finally {
+				vi.useRealTimers();
+			}
+		});
 	});
 });
 

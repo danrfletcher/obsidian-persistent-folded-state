@@ -21,9 +21,11 @@
  *  - an arrow that is collapsed and whose block is not in the set is unfolded (a stray: Obsidian's
  *    own memory, or a whole-note embed sharing the source's folds). This is also what makes an
  *    embed with no stored state, or an empty stored set, render fully expanded;
- *  - an arrow whose block could not be told (`block` null) is never guessed at: it is left as it
- *    is while the set is non-empty, and unfolded when collapsed only if the set is empty (nothing
- *    in the embed should be folded then, whichever block it is);
+ *  - an arrow whose block could not be told (`block` null) is never guessed at and never touched,
+ *    whether the set is empty or not (PR-5 R2): the recorder cannot pair it either, so a fold Dan
+ *    made on it was not recorded, and undoing it would lose a fold he just made. A collapsed
+ *    arrow of that kind stays collapsed even when the stored set says nothing should be folded,
+ *    so "the stored set wins" is not strict for it; this is a known limit (README, "Embed folds: known limits");
  *  - an arrow already in the right state is left alone, so a restore that finds the live set equal
  *    to the stored set plans nothing.
  */
@@ -73,10 +75,7 @@ export function planEmbedRestore(input: EmbedRestoreInput): EmbedRestorePlan {
 	const fold: number[] = [];
 	const unfold: number[] = [];
 	input.arrows.forEach((arrow, i) => {
-		if (arrow.block === null) {
-			if (arrow.collapsed && wanted.size === 0) unfold.push(i);
-			return;
-		}
+		if (arrow.block === null) return; // never guessed at, never touched (PR-5 R2)
 		const shouldFold = wanted.has(arrow.block);
 		if (shouldFold && !arrow.collapsed) fold.push(i);
 		else if (!shouldFold && arrow.collapsed) unfold.push(i);

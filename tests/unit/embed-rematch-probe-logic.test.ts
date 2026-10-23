@@ -6,7 +6,7 @@
  * rule would silently skew.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildAnchors } from "../../src/anchors";
 import { SOURCE_TEXT, World, arrowFor } from "../fixtures/embed-recording-world";
 import { sliceEmbed } from "../../src/embed-slice";
-import { arrowPointExpression, embedRecords, foldProblems, parseArgs, readEmbedsExpression, refreshedRecordProblems, rewriteSource, sha256, sourceFoldProblems, storedFoldProblems } from "../../scripts/e2e-embed-rematch-probe.mjs";
+import { ARROW_GLYPH_OFFSET_PX, arrowClickPoint, arrowPointExpression, clickWroteProblems, embedRecords, foldProblems, noteWriteProblem, parseArgs, readEmbedsExpression, refreshedRecordProblems, rewriteSource, rewriteSourceViaDocker, sha256, sourceFoldProblems, storedFoldProblems } from "../../scripts/e2e-embed-rematch-probe.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const FIXTURES = join(ROOT, "tests", "fixtures", "embed-rematch");
@@ -29,9 +29,13 @@ const tempDirs: string[] = [];
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
-function tempVault(): string {
-	const dir = mkdtempSync(join(tmpdir(), "pfs-rematch-probe-"));
-	tempDirs.push(dir);
+/** A scratch vault. Named test-vault by default, as the probe's test-vault guard requires; pass
+ * another name for a vault the guard has to refuse. */
+function tempVault(name = "test-vault"): string {
+	const parent = mkdtempSync(join(tmpdir(), "pfs-rematch-probe-"));
+	tempDirs.push(parent);
+	const dir = join(parent, name);
+	mkdirSync(dir);
 	return dir;
 }
 
@@ -128,7 +132,7 @@ describe("the rewrite phase, run as the tester runs it (Obsidian quit: no CDP)",
 		writeFileSync(join(vault, SOURCE), readFileSync(BEFORE_FILE, "utf8"), "utf8");
 		const state = join(vault, "state.json");
 
-		const run = spawnSync(process.execPath, [PROBE, "--phase", "rewrite", "--vault-root", vault, "--state", state], { encoding: "utf8" });
+		const run = spawnSync(process.execPath, [PROBE, "--phase", "rewrite", "--vault-root", vault, "--state", state, "--cdp-port", "1"], { encoding: "utf8" });
 
 		expect(run.status).toBe(0);
 		expect(run.stdout).toContain("PASS rewrite");
@@ -137,6 +141,29 @@ describe("the rewrite phase, run as the tester runs it (Obsidian quit: no CDP)",
 		expect(readFileSync(join(vault, HOST), "utf8")).toBe(hostText);
 		const saved = JSON.parse(readFileSync(state, "utf8"));
 		expect(saved.rewrite).toMatchObject({ sourceSha: sha256(after.toString("utf8")), hostSha: sha256(hostText), live: false });
+	});
+
+	it("refuses to overwrite the source in a vault that is not a test vault, and leaves it untouched", () => {
+		const vault = tempVault("Real Vault");
+		const original = readFileSync(BEFORE_FILE, "utf8");
+		writeFileSync(join(vault, SOURCE), original, "utf8");
+
+		const run = spawnSync(process.execPath, [PROBE, "--phase", "rewrite", "--vault-root", vault, "--state", join(vault, "state.json"), "--cdp-port", "1"], { encoding: "utf8" });
+
+		expect(run.status).toBe(1);
+		expect(run.stderr).toContain("test-vault guard");
+		expect(readFileSync(join(vault, SOURCE), "utf8")).toBe(original);
+	});
+
+	it("--write-before is refused in a vault that is not a test vault, before it writes", () => {
+		const vault = tempVault("Real Vault");
+		writeFileSync(join(vault, SOURCE), "real note\n", "utf8");
+
+		const run = spawnSync(process.execPath, [PROBE, "--phase", "before-quit", "--write-before", "--vault-root", vault, "--state", join(vault, "state.json"), "--cdp-port", "1"], { encoding: "utf8" });
+
+		expect(run.status).toBe(1);
+		expect(run.stderr).toContain("test-vault guard");
+		expect(readFileSync(join(vault, SOURCE), "utf8")).toBe("real note\n");
 	});
 
 	it("rewriteSource returns the hash and size of what it wrote", () => {
@@ -201,5 +228,109 @@ describe("the page-side expressions, evaluated against the DOM the plugin tests 
 		expect(scrolled).toHaveBeenCalledTimes(1);
 		expect(evaluate(host, arrowPointExpression(HOST, src, "No such row"))).toBeNull();
 		expect(evaluate(host, arrowPointExpression(HOST, "Another#^zzz", "Lesson 8"))).toBeNull();
+	});
+});
+
+describe("where the probe clicks an arrow (PR-6 T1)", () => {
+	it("presses on the glyph at the arrow's left edge, not its centre where the checkbox sits", () => {
+		const rect = { left: 100, top: 40, width: 42, height: 24 };
+		expect(arrowClickPoint(rect, ARROW_GLYPH_OFFSET_PX)).toEqual({ x: 106, y: 52 });
+		expect(arrowClickPoint(rect, ARROW_GLYPH_OFFSET_PX).x).toBeLessThan(rect.left + rect.width / 2);
+	});
+
+	it("stays inside an arrow narrower than twice the offset", () => {
+		expect(arrowClickPoint({ left: 10, top: 0, width: 8, height: 8 }, 6)).toEqual({ x: 14, y: 4 });
+	});
+
+	it("the page expression computes the point with that same function", () => {
+		const expression = arrowPointExpression(HOST, "Competitive Coding Fundamentals#^0169a6", "Lesson 8");
+		expect(expression).toContain(arrowClickPoint.toString());
+		expect(expression).toContain(`arrowClickPoint(r, ${ARROW_GLYPH_OFFSET_PX})`);
+		expect(expression).not.toContain("r.width / 2, y");
+	});
+});
+
+describe("a click must not write to a note (PR-6 T1, F7)", () => {
+	it("reports a note whose bytes differ after the click, and nothing for unchanged notes", () => {
+		const before = { [SOURCE]: "- [ ] Lesson 8 ^0169a6\n", [HOST]: "![[x]]\n" };
+		expect(clickWroteProblems("after the click", before, { ...before })).toEqual([]);
+		const problems = clickWroteProblems("after the click", before, { ...before, [SOURCE]: "- [x] Lesson 8 ^0169a6\n" });
+		expect(problems).toHaveLength(1);
+		expect(problems[0]).toContain(SOURCE);
+		expect(problems[0]).toContain("task checkbox");
+	});
+});
+
+describe("the live rewrite goes through the container (PR-6 T2)", () => {
+	it("runs docker exec with the text on stdin and the path as an argument, never through a shell string", () => {
+		const run = vi.fn(() => ({ status: 0, stderr: "" }));
+		const written = rewriteSourceViaDocker("desktop-warkworth", "/config/test-vault/Competitive Coding Fundamentals.md", "new text\n", run as never);
+		expect(run).toHaveBeenCalledWith(
+			"docker",
+			["exec", "-i", "desktop-warkworth", "sh", "-c", 'cat > "$1"', "sh", "/config/test-vault/Competitive Coding Fundamentals.md"],
+			{ input: "new text\n", encoding: "utf8" },
+		);
+		expect(written).toEqual({ sourcePath: "desktop-warkworth:/config/test-vault/Competitive Coding Fundamentals.md", sourceSha: sha256("new text\n"), bytes: 9 });
+	});
+
+	it("throws with the container's complaint when the write fails", () => {
+		const run = () => ({ status: 1, stderr: "sh: cannot create: Permission denied\n" });
+		expect(() => rewriteSourceViaDocker("box", "/v/x.md", "t", run as never)).toThrow(/exit 1: sh: cannot create: Permission denied/);
+		expect(() => rewriteSourceViaDocker("box", "/v/x.md", "t", (() => ({ error: new Error("docker not found") })) as never)).toThrow(/docker not found/);
+	});
+
+	it("--container-vault-root defaults to /config/test-vault and can be set", () => {
+		expect(parseArgs([]).containerVaultRoot).toBe("/config/test-vault");
+		expect(parseArgs(["--container-vault-root", "/vault"]).containerVaultRoot).toBe("/vault");
+	});
+});
+
+describe("noteWriteProblem: when the probe may overwrite the source note", () => {
+	const none = () => false;
+	const args = (over: Record<string, unknown> = {}) => ({ ...parseArgs([]), ...over });
+
+	it("allows the default test vault when Obsidian has it open, or cannot be asked (host write)", () => {
+		expect(noteWriteProblem(args(), "/config/test-vault", false, none)).toBeNull();
+		expect(noteWriteProblem(args(), null, false, none)).toBeNull();
+	});
+
+	it("refuses a vault root that is not a test vault, with or without Obsidian reachable", () => {
+		const real = args({ vaultRoot: "/Users/dan/Vault" });
+		expect(noteWriteProblem(real, "/Users/dan/Vault", false, none)).toMatch(/not a test vault/);
+		expect(noteWriteProblem(real, null, false, none)).toMatch(/not a test vault/);
+	});
+
+	it("refuses when the connected Obsidian has another vault open", () => {
+		expect(noteWriteProblem(args(), "/Users/dan/Vault", false, none)).toMatch(/has \/Users\/dan\/Vault open/);
+	});
+
+	it("a source that climbs out of the vault root is refused", () => {
+		expect(noteWriteProblem(args({ source: "../Vault/Competitive Coding Fundamentals.md" }), "/config/test-vault", false, none)).toMatch(/outside --vault-root/);
+		expect(noteWriteProblem(args({ source: "/Users/dan/Vault/x.md" }), "/config/test-vault", false, none)).toMatch(/outside --vault-root/);
+	});
+
+	it("the write from inside the container needs Obsidian to confirm the container's vault", () => {
+		const docker = args({ docker: "box", vaultRoot: "/host/mount/test-vault", containerVaultRoot: "/config/test-vault" });
+		expect(noteWriteProblem(docker, "/config/test-vault", true, none)).toBeNull();
+		expect(noteWriteProblem(docker, null, true, none)).toMatch(/could not read/);
+		// The container's Obsidian has some other vault open: its path is not the --container-vault-root.
+		expect(noteWriteProblem(docker, "/config/real-vault", true, none)).toMatch(/has \/config\/real-vault open/);
+	});
+
+	it("refuses a container vault root that is not a test vault even when Obsidian has it open and --vault-root is a test vault", () => {
+		const docker = args({ docker: "box", vaultRoot: "/host/mount/test-vault", containerVaultRoot: "/config/Dan Vault" });
+		// The write from inside the container (--live --docker) and a host write beside the container.
+		expect(noteWriteProblem(docker, "/config/Dan Vault", true, none)).toMatch(/--container-vault-root \/config\/Dan Vault is not a test vault/);
+		expect(noteWriteProblem(docker, "/config/Dan Vault", false, none)).toMatch(/--container-vault-root .* is not a test vault/);
+		expect(noteWriteProblem(docker, null, true, none)).toMatch(/is not a test vault/);
+		// A trailing slash on a test-vault root is still a test vault; a name that merely ends in test-vault is not.
+		expect(noteWriteProblem({ ...docker, containerVaultRoot: "/config/test-vault/" }, "/config/test-vault/", true, none)).toBeNull();
+		expect(noteWriteProblem({ ...docker, containerVaultRoot: "/config/not-test-vault" }, "/config/not-test-vault", true, none)).toMatch(/is not a test vault/);
+	});
+
+	it("a host write beside a container still checks Obsidian's view against the container root", () => {
+		const docker = args({ docker: "box", vaultRoot: "/host/mount/test-vault", containerVaultRoot: "/config/test-vault" });
+		expect(noteWriteProblem(docker, "/config/test-vault", false, none)).toBeNull();
+		expect(noteWriteProblem(docker, "/host/mount/test-vault", false, none)).toMatch(/has \/host\/mount\/test-vault open/);
 	});
 });

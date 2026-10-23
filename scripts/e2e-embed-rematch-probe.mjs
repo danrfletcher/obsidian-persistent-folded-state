@@ -31,8 +31,10 @@
  *                           of both files. Screenshot PR-6-folded.png. Then quit Obsidian by hand if
  *                           the next step is GP6; otherwise leave it running.
  *   --phase rewrite         Writes the "after" fixture over the source on disk, byte for byte, as an
- *                           agent or `git pull` would. Pure filesystem, no CDP, so it works with
- *                           Obsidian quit (GP6, then relaunch it and open the host). With --live
+ *                           agent or `git pull` would. The write is a plain file write, so it works
+ *                           with Obsidian quit (GP6, then relaunch it and open the host); it only
+ *                           asks a running Obsidian which vault it has open, for the test-vault
+ *                           guard below. With --live
  *                           (Obsidian running, host open: GP4, Checkpoint 2) it also waits out the
  *                           settle window and asserts the embed shows Lesson 8 (revised) still folded
  *                           with its sibling unfolded and the stored record refreshed.
@@ -53,21 +55,37 @@
  * or `npm run test:e2e:embed-rematch -- --phase before-quit`.
  *
  * Options: [--cdp-port 9222] [--docker <container>] [--vault-root /config/test-vault]
+ *   [--container-vault-root /config/test-vault]
  *   [--host <vault path>] [--source <vault path>] [--before <file>] [--after <file>]
  *   [--data <path>] [--state <path>] [--screenshots screenshots] [--wait-ms 1500]
  *   [--connect-retries 30] [--connect-retry-delay-ms 2000] [--help]
  *
+ * With --docker, `--phase rewrite --live` writes the source from inside the container (`docker exec`
+ * at --container-vault-root): a write from the host through the bind mount does not make the
+ * container's Obsidian re-render the embed (PR-6 T2). Without --live the host write is used, as
+ * Obsidian is quit then.
+ *
  * --docker bridges the container's loopback CDP port over `docker exec` (the container has no
  * Node); then --vault-root is the vault directory as this process sees it.
  *
+ * Test-vault guard (PR-8 R6): this probe overwrites the source note (--write-before, --phase
+ * rewrite), so before either write it checks that --vault-root is a test vault (a folder named
+ * test-vault, or one holding a .pfs-test-vault file), that --source stays inside it, and, when a
+ * connected Obsidian can be asked, that Obsidian has that vault open (in a container: at
+ * --container-vault-root). With --docker, --container-vault-root must itself be a folder named
+ * test-vault (the container's folder cannot be checked for a marker file). The write made from
+ * inside the container (--docker --live) needs that answer; a host write with Obsidian quit goes ahead on the name check alone. It stops otherwise.
+ *
  * Not run by the coder turn: there is no Obsidian in the coder's environment.
  */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { connectCdp } from "./lib/cdp-client.mjs";
+import { TEST_VAULT_NAME, testVaultNameProblem, testVaultProblem } from "./lib/test-vault-guard.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ID = "persistent-folded-state";
@@ -152,11 +170,81 @@ export function rewriteSource(sourcePath, afterText) {
 	return { sourcePath, sourceSha: sha256(afterText), bytes: Buffer.byteLength(afterText, "utf8") };
 }
 
+/** What went wrong if a click on an arrow changed a note on disk: a click that lands on the
+ * task-list checkbox instead of the arrow toggles the task in the source note (F7: the plugin never
+ * writes to a note, and a fold must not either). PR-6 T1. */
+export function clickWroteProblems(where, before, after) {
+	const problems = [];
+	for (const [name, text] of Object.entries(before)) {
+		if (after[name] !== text) problems.push(`${where}: ${name} changed on disk (the click toggled a task checkbox or wrote the note instead of folding the embed)`);
+	}
+	return problems;
+}
+
+/** Writes `afterText` over a note from INSIDE the container (`docker exec ... cat >`), so the
+ * container's Obsidian sees the same file-system event it would for an agent writing in the
+ * container. A write made on the host through the bind mount does not raise one (PR-6 T2), so the
+ * embed is not re-rendered and a --live check would time out for a reason that is not the plugin's.
+ * `run` is injectable for tests. */
+export function rewriteSourceViaDocker(container, containerPath, afterText, run = spawnSync) {
+	const result = run("docker", ["exec", "-i", container, "sh", "-c", 'cat > "$1"', "sh", containerPath], { input: afterText, encoding: "utf8" });
+	if (result.error || result.status !== 0) {
+		throw new Error(`could not write ${containerPath} in container ${container}: ${result.error ? String(result.error.message ?? result.error) : `exit ${result.status}: ${String(result.stderr ?? "").trim()}`}`);
+	}
+	return { sourcePath: `${container}:${containerPath}`, sourceSha: sha256(afterText), bytes: Buffer.byteLength(afterText, "utf8") };
+}
+
+/** Why this probe must not overwrite the source note, or null when it may (PR-8 R6 for this probe:
+ * the note is `<--vault-root>/<--source>` in the vault Obsidian has open, and --vault-root may be
+ * Dan's real vault). `openVaultPath` is what the connected Obsidian reports as its vault, or null
+ * when it could not be read. The note must be inside a vault that is a test vault (a folder named
+ * test-vault, or one holding .pfs-test-vault). When Obsidian is reachable it must have exactly that
+ * vault open (in a container: at --container-vault-root, which must itself be named test-vault
+ * whenever --docker is given, since the container's Obsidian sees the note there). A host write may go ahead with Obsidian
+ * unreachable (GP6 writes while it is quit); the write made from inside the container (`viaDocker`)
+ * needs Obsidian to confirm the container's vault. `exists` is injectable for tests. */
+export function noteWriteProblem(args, openVaultPath, viaDocker, exists = existsSync) {
+	const root = resolve(args.vaultRoot);
+	const rel = relative(root, resolve(root, args.source));
+	if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return `${args.source} is outside --vault-root ${root}: refusing to overwrite it`;
+	const expectedOpen = args.docker ? args.containerVaultRoot : args.vaultRoot;
+	// With a container, the vault Obsidian sees is --container-vault-root, and the write made from
+	// inside the container goes there, not to --vault-root. The host-side name/marker check above
+	// does not cover it, so it must itself be a test vault. Its folder is on the container's file
+	// system, so only the name is checked here (no marker file); name a container vault test-vault.
+	if (args.docker) {
+		const containerName = posix.basename(posix.resolve("/", args.containerVaultRoot));
+		if (containerName !== TEST_VAULT_NAME) {
+			return `--container-vault-root ${args.containerVaultRoot} is not a test vault: its folder is not named "${TEST_VAULT_NAME}". The container's Obsidian sees the note there, so this probe refuses to overwrite it.`;
+		}
+	}
+	if (openVaultPath === null || openVaultPath === undefined) {
+		if (viaDocker) return "could not read which vault the connected Obsidian has open, so cannot tell that the container's vault is the test vault";
+		const nameProblem = testVaultNameProblem(args.vaultRoot, exists);
+		return nameProblem === null ? null : nameProblem;
+	}
+	return testVaultProblem(args.vaultRoot, openVaultPath, exists, expectedOpen);
+}
+
+/** Throws (before anything is written) unless `noteWriteProblem` finds none. Asks the connected
+ * Obsidian which vault it has open; an Obsidian that is not running leaves that unknown. */
+async function assertNoteWriteAllowed(args, viaDocker) {
+	let open = null;
+	try {
+		open = await withConnection(args, (cdp) => cdp.evaluate("app.vault.adapter.basePath"));
+	} catch {
+		open = null;
+	}
+	const problem = noteWriteProblem(args, open, viaDocker);
+	if (problem !== null) throw new Error(`test-vault guard: ${problem}`);
+}
+
 export function parseArgs(argv) {
 	let vaultRoot = "/config/test-vault";
 	const args = {
 		cdpPort: 9222,
 		docker: null,
+		containerVaultRoot: "/config/test-vault",
 		host: "Salesforce Tech Test Rocketship Course.md",
 		source: "Competitive Coding Fundamentals.md",
 		before: join(ROOT, "tests", "fixtures", "embed-rematch", "competitive-coding-fundamentals-before.md"),
@@ -179,6 +267,7 @@ export function parseArgs(argv) {
 		else if (arg === "--cdp-port") args.cdpPort = Number(next());
 		else if (arg === "--docker") args.docker = next() || null;
 		else if (arg === "--vault-root") vaultRoot = next() || vaultRoot;
+		else if (arg === "--container-vault-root") args.containerVaultRoot = next() || args.containerVaultRoot;
 		else if (arg === "--host") args.host = next() || args.host;
 		else if (arg === "--source") args.source = next() || args.source;
 		else if (arg === "--before") args.before = next() || args.before;
@@ -257,7 +346,20 @@ export const readEmbedsExpression = (path) => `(() => {
 	})));
 })()`;
 
+/** How far in from the arrow's left edge a click lands (px). The arrow box is about 42 x 24, but
+ * in Obsidian the task-list checkbox covers its centre, so a click there toggles the source note's
+ * task (a write to the source, which F7 forbids) instead of folding. The glyph itself sits at the
+ * left edge (elementFromPoint at left + 6 is the list-collapse-indicator). PR-6 T1. */
+export const ARROW_GLYPH_OFFSET_PX = 6;
+
+/** Where to press on an arrow whose bounding box is `rect`: on its glyph, not its centre. Also runs
+ * in the page (its source is embedded in `arrowPointExpression`), so it uses nothing else. */
+export function arrowClickPoint(rect, offset) {
+	return { x: rect.left + Math.min(offset, rect.width / 2), y: rect.top + rect.height / 2 };
+}
+
 export const arrowPointExpression = (path, src, row) => `(() => {
+	const arrowClickPoint = ${arrowClickPoint.toString()};
 	const rowText = ${ROW_TEXT};
 	const leaf = ${leavesOf(path)}[0];
 	if (!leaf) return null;
@@ -268,7 +370,7 @@ export const arrowPointExpression = (path, src, row) => `(() => {
 	if (!arrow) return null;
 	arrow.scrollIntoView({ block: "center" });
 	const r = arrow.getBoundingClientRect();
-	return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+	return arrowClickPoint(r, ${ARROW_GLYPH_OFFSET_PX});
 })()`;
 
 /** The source note opened on its own: the lines whose fold indicator is collapsed. */
@@ -378,6 +480,7 @@ function report(phase, problems, extra = []) {
 async function phaseBeforeQuit(args, state) {
 	const problems = [];
 	const extra = [];
+	if (args.writeBefore) await assertNoteWriteAllowed(args, false);
 	if (args.writeBefore) writeFileSync(vaultFile(args, args.source), readFileSync(args.before, "utf8"), "utf8");
 	await withConnection(args, async (cdp) => {
 		// The source note on its own first: opening it may give it its own entry, which is then the
@@ -390,8 +493,11 @@ async function phaseBeforeQuit(args, state) {
 		const before = await waitForEmbed(cdp, args.host, HOST_SRC, args.waitMs);
 		if (before.arrows.some((a) => a.collapsed)) problems.push(`the embed already shows folds before the click (${before.arrows.filter((a) => a.collapsed).map((a) => a.row).join(", ")}): clear data.json's embeds and Obsidian's own fold memory first`);
 
+		const filesBefore = { [args.source]: readFileSync(vaultFile(args, args.source), "utf8"), [args.host]: readFileSync(vaultFile(args, args.host), "utf8") };
 		await realClickArrow(cdp, args.host, HOST_SRC, LESSON_8);
 		await sleep(args.waitMs);
+		// A click that toggled the source note's task checkbox is a write to the note (F7), not a fold.
+		problems.push(...clickWroteProblems("after the click", filesBefore, { [args.source]: readFileSync(vaultFile(args, args.source), "utf8"), [args.host]: readFileSync(vaultFile(args, args.host), "utf8") }));
 		const after = (await readEmbeds(cdp, args.host)).find((e) => e.src === HOST_SRC);
 		problems.push(...foldProblems("after the click", after, { folded: [LESSON_8], unfolded: [SIBLING_ROW] }));
 		extra.push(`screenshot: ${await screenshot(cdp, args, "PR-6-folded.png")}`);
@@ -417,9 +523,15 @@ async function phaseRewrite(args, state) {
 	const problems = [];
 	const extra = [];
 	const afterText = readFileSync(args.after, "utf8");
-	const written = rewriteSource(vaultFile(args, args.source), afterText);
+	// --live with --docker: write from inside the container, as an agent there would; a write through
+	// the bind mount from the host does not make the container's Obsidian re-render the embed (T2).
+	await assertNoteWriteAllowed(args, Boolean(args.live && args.docker));
+	const written = args.live && args.docker
+		? rewriteSourceViaDocker(args.docker, `${args.containerVaultRoot.replace(/\/+$/, "")}/${args.source}`, afterText)
+		: rewriteSource(vaultFile(args, args.source), afterText);
 	state.rewrite = { ...written, hostSha: sha256(readFileSync(vaultFile(args, args.host), "utf8")), live: args.live, at: new Date().toISOString() };
 	extra.push(`wrote ${written.bytes} bytes to ${written.sourcePath}`);
+	if (args.live && !args.docker) extra.push("note: with Obsidian in a container, a write from the host through the bind mount does not re-render the embed; pass --docker <container> so the rewrite is made inside it");
 	if (args.live) {
 		await withConnection(args, async (cdp) => {
 			// Past the plugin's 150 ms render window, the pass and the 400 ms re-check.
@@ -482,7 +594,7 @@ function printUsage() {
 			"  --phase rewrite [--live]               write the 'after' fixture over the source (--live: check GP4)",
 			"  --phase after-relaunch                 after quit + relaunch: check GP6, F2 and F7",
 			"",
-			"Options: [--cdp-port 9222] [--docker <container>] [--vault-root /config/test-vault] [--host <path>]",
+			"Options: [--cdp-port 9222] [--docker <container>] [--vault-root /config/test-vault] [--container-vault-root /config/test-vault] [--host <path>]",
 			"         [--source <path>] [--before <file>] [--after <file>] [--data <path>] [--state <path>]",
 			"         [--screenshots screenshots] [--wait-ms 1500] [--connect-retries 30] [--connect-retry-delay-ms 2000]",
 		].join("\n"),

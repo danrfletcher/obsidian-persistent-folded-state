@@ -325,6 +325,57 @@ describe("embed store: forgetAll", () => {
 	});
 });
 
+describe("embed store: setEmbed refuses an identity the next load would drop (PR-1 R1)", () => {
+	const good = { host: "A.md", target: "B.md", subpath: "^x", occurrence: 0 };
+	const bad: { name: string; id: EmbedIdentity }[] = [
+		{ name: "an empty host", id: { ...good, host: "" } },
+		{ name: "an empty target", id: { ...good, target: "" } },
+		{ name: "a negative occurrence", id: { ...good, occurrence: -1 } },
+		{ name: "a fractional occurrence", id: { ...good, occurrence: 1.5 } },
+		{ name: "a NaN occurrence", id: { ...good, occurrence: Number.NaN } },
+		{ name: "a chain link with a negative occurrence", id: { ...good, outer: [{ target: "C.md", subpath: "", occurrence: -2 }] } },
+		{ name: "a chain link with an empty target", id: { ...good, outer: [{ target: "", subpath: "", occurrence: 0 }] } },
+	];
+
+	for (const { name, id } of bad) {
+		it(`refuses ${name}: nothing is kept in memory and nothing is written`, async () => {
+			const { store, saveData } = await emptyStore();
+			expect(store.setEmbed(embed(id))).toBe(false);
+			expect(store.embedSize).toBe(0);
+			expect(store.embedRecords()).toEqual([]);
+			await store.flush();
+			expect(saveData).not.toHaveBeenCalled();
+		});
+	}
+
+	for (const { name, id } of bad) {
+		it(`load drops ${name} from a data.json too (one rule for both paths)`, async () => {
+			const raw = { version: 1, files: {}, embeds: [{ ...id, contentHash: "h", folds: [] }, { ...good, subpath: "^kept", contentHash: "h", folds: [] }] };
+			const store = new FoldStore({ loadData: async () => raw, saveData: async () => undefined });
+			await store.load();
+			expect(store.embedRecords().map((r) => r.subpath)).toEqual(["^kept"]);
+		});
+	}
+
+	it("accepts a valid record and reports it", async () => {
+		const { store } = await emptyStore();
+		expect(store.setEmbed(embed(good))).toBe(true);
+		expect(store.embedSize).toBe(1);
+	});
+
+	it("accepts a nested record whose chain is valid, and what it stores survives a save and a load", async () => {
+		const saved: unknown[] = [];
+		const store = new FoldStore({ loadData: async () => null, saveData: async (data) => void saved.push(data) });
+		await store.load();
+		const nested = embed({ ...good, outer: [{ target: "C.md", subpath: "", occurrence: 0 }] });
+		expect(store.setEmbed(nested)).toBe(true);
+		await store.flush();
+		const reloaded = new FoldStore({ loadData: async () => saved[0], saveData: async () => undefined });
+		await reloaded.load();
+		expect(reloaded.embedRecords()).toEqual([nested]);
+	});
+});
+
 describe("embed store: writes", () => {
 	it("a notes-only store writes no embeds key (the file is what 0.1.1 wrote)", async () => {
 		const { store, saveData } = await emptyStore();

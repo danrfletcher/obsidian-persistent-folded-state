@@ -80,6 +80,30 @@ describe("block slice", () => {
 			expected: "real ^abc",
 		},
 		{
+			name: "an id on a continuation line of a multi-line list item covers the item and its children (PR-3 R2)",
+			target: "- item\n  more text ^abc\n  - child\n    - grandchild\n- next",
+			subpath: "^abc",
+			expected: "- item\n  more text ^abc\n  - child\n    - grandchild",
+		},
+		{
+			name: "an id on a continuation line of a nested item covers that item only",
+			target: "- outer\n  - inner\n    more ^abc\n    - child\n  - sibling",
+			subpath: "^abc",
+			expected: "- inner\n  more ^abc\n  - child",
+		},
+		{
+			name: "an id on a continuation line inside a callout list item keeps the children, without the markers",
+			target: "> - item\n>   more text ^abc\n>   - child\n> - next",
+			subpath: "^abc",
+			expected: "- item\n  more text ^abc\n  - child",
+		},
+		{
+			name: "a paragraph after a blank line is not a continuation of the list above",
+			target: "- item\n  - child\n\nplain ^abc",
+			subpath: "^abc",
+			expected: "plain ^abc",
+		},
+		{
 			name: "ordered list item",
 			target: "1. one ^abc\n   - child\n2. two",
 			subpath: "^abc",
@@ -247,6 +271,21 @@ describe("heading slice", () => {
 		expect(text("H", "> ```\n> # H\n> ```\n# H\nbody")).toBe("# H\nbody");
 	});
 
+	it("a heading with a colon is found by the link text Obsidian writes without it (PR-3 R4)", () => {
+		const note = "## Lesson 8: Collections\nbody\n## Next";
+		expect(text("Lesson 8 Collections", note)).toBe("## Lesson 8: Collections\nbody");
+		expect(text("Lesson 8: Collections", note)).toBe("## Lesson 8: Collections\nbody");
+	});
+
+	it("the link text of a nested heading path drops the same characters", () => {
+		const note = "# Part 1: Basics\n## Step 2: Go\ntext\n## Step 3\n# Part 2";
+		expect(text("Part 1 Basics#Step 2 Go", note)).toBe("## Step 2: Go\ntext");
+	});
+
+	it("a plain heading is still not found by a different one", () => {
+		expect(text("Lesson 9", "## Lesson 8: Collections\nbody")).toBeNull();
+	});
+
 	it("# lines in frontmatter are not headings", () => {
 		expect(text("not a heading", "---\n# not a heading\n---\n## Real\nbody")).toBeNull();
 	});
@@ -291,8 +330,17 @@ describe("whole-note slice", () => {
 		expect(text("", "\n\n")).toBe("");
 	});
 
-	it("the first body line keeps its indent when it is the whole note", () => {
-		expect(text("", "---\nk: v\n---\n  indented first")).toBe("indented first");
+	it("the first body line keeps its indent: a whole note is not dedented (PR-3 R1)", () => {
+		expect(text("", "---\nk: v\n---\n  indented first")).toBe("  indented first");
+	});
+
+	it("an indented first line does not change the structure of the lines after it", () => {
+		expect(text("", "  - a\n- b\n  - c")).toBe("  - a\n- b\n  - c");
+	});
+
+	it("buildAnchors over the whole-note slice gives the same anchors as over the note body", () => {
+		const body = "  - a\n- b\n  - c\n";
+		expect(buildAnchors(sliceEmbed(body, "")?.text ?? "")).toEqual(buildAnchors(body.replace(/\n$/, "")));
 	});
 });
 

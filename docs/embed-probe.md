@@ -25,7 +25,7 @@ In both host modes an embedded note is a reading-style render inside `.internal-
 - Render after reopening the host: first mutation 21.5 ms, settled 28.7 ms, 1 burst(s)
 - Re-render after an external source edit: 1 burst(s) at 131.3 ms after observation started; element replaced 0 time(s)
 - Obsidian kept the fold across closing and reopening the host: yes
-- Obsidian kept the fold across an external edit of the source: no; embed showed the edited text: yes (read visible)
+- Obsidian kept the fold across an external edit of the source: no (caveat: all three kinds were folded together before this edit, and block and heading embeds of one note share Obsidian's per-note fold entry, so this no may be interference from the other kind and not how Obsidian treats this kind alone; the reopen check measures each kind on its own); embed showed the edited text: yes (read visible)
 
 ### Live Preview, heading embed: supported
 
@@ -61,7 +61,7 @@ In both host modes an embedded note is a reading-style render inside `.internal-
 - Render after reopening the host: first mutation 40.7 ms, settled 51.4 ms, 1 burst(s)
 - Re-render after an external source edit: 1 burst(s) at 133.8 ms after observation started; element replaced 0 time(s)
 - Obsidian kept the fold across closing and reopening the host: yes
-- Obsidian kept the fold across an external edit of the source: no; embed showed the edited text: yes (read visible)
+- Obsidian kept the fold across an external edit of the source: no (caveat: all three kinds were folded together before this edit, and block and heading embeds of one note share Obsidian's per-note fold entry, so this no may be interference from the other kind and not how Obsidian treats this kind alone; the reopen check measures each kind on its own); embed showed the edited text: yes (read visible)
 
 ### Reading view, heading embed: supported
 
@@ -128,6 +128,8 @@ Answer per embed kind: block embed confirmed; heading embed confirmed; whole-not
 ## Lazy rendering: 51-embed host
 
 Counts are top-level embeds present in the DOM and rendered, sampled after the view finished opening.
+
+In Live Preview the count can go down between samples (more embeds rendered at 0 s than at 1 s and 5 s). This is most likely CodeMirror 6 virtualising the viewport: embeds that scroll out of view are unmounted, and rendered again when they scroll back, so an embed's element and its fold arrows can disappear and be recreated while the host stays open. Render handling must therefore treat a Live Preview embed that appears again as a new render, not only the first one. This is inferred, not measured: no sample was taken while scrolling.
 
 - Live Preview: 0 s: 21/51 rendered (21 in DOM); 1 s: 5/51 rendered (5 in DOM); 5 s: 5/51 rendered (5 in DOM)
 - Reading view: 0 s: 0/51 rendered (0 in DOM); 1 s: 7/51 rendered (7 in DOM); 5 s: 7/51 rendered (7 in DOM)

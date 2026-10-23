@@ -48,6 +48,11 @@
  * disk legitimately change in steps 2 to 5; this script does not assert them (the plugin's own
  * no-write rule is checked by the unit and fence tests).
  *
+ * The clean start deletes notes and data.json, so it first checks (scripts/lib/test-vault-guard.mjs)
+ * that --vault-root is a test vault (named test-vault, or holding a .pfs-test-vault file) and is the
+ * vault the connected Obsidian has open, and that --data is that vault's own
+ * .obsidian/plugins/<id>/data.json (the file it deletes), and stops if not.
+ *
  * Usage: node tests/e2e/embed-rename-delete.e2e.ts [--cdp-port 9222] [--vault-root /config/test-vault]
  *   [--data <path>] [--screenshots screenshots] [--wait-ms 1500] [--link-wait-ms 15000] [--help]
  * Or `npm run test:e2e:embed-rename-delete`.
@@ -55,6 +60,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertDataFileInVault, assertTestVault } from "../../scripts/lib/test-vault-guard.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const FIXTURES = join(ROOT, "tests", "fixtures", "embed-lifecycle");
@@ -654,6 +660,10 @@ async function sequence(args: Args, linksChanged: (previous: unknown) => void): 
 		// 0. A clean start: no prompt, pane or note left from an earlier run, and the plugin restarted
 		// over no data.json (removing the file under a running plugin would leave its old records in
 		// memory). The fixture notes are copied in only after the old ones are gone.
+		// PR-8 R6: nothing is deleted or copied before the vault is known to be the test vault.
+		assertTestVault(args.vaultRoot, (await evaluate(cdp, "app.vault.adapter.basePath")) as string | null);
+		// --data can name a file anywhere: the one deleted below has to be this vault's own data.json.
+		assertDataFileInVault(args.vaultRoot, args.data);
 		const links = (await evaluate(cdp, setAlwaysUpdateLinksExpression(true))) as { previous: unknown };
 		linksChanged(links.previous);
 		await sleep(args.waitMs);

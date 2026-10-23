@@ -110,7 +110,7 @@ import { restoreOnOpen } from "./open-restore";
 import { EmbedFoldRecorder } from "./embed-fold-recorder";
 import { EmbedFoldRestorer } from "./embed-fold-restorer";
 import { EmbedDormancyTracker } from "./embed-dormancy";
-import { EmbedHeadingRenameTracker } from "./embed-heading-rename";
+import { EmbedHeadingRenameTracker, headingTargetsOf } from "./embed-heading-rename";
 import type { EmbedHost } from "./embed-host";
 
 /** Event name for the "settled non-user change" deliverable (E9/E10), triggered on
@@ -132,6 +132,8 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	private embedRecorder: EmbedFoldRecorder | null = null;
 	/** PR-5: puts the recorded folds back as each embed renders. Created in `onload()`, disposed in `onunload()`. */
 	private embedRestorer: EmbedFoldRestorer | null = null;
+	/** PR-7: the dormancy tracker, kept so `onunload()` can cancel its pending second looks. */
+	private dormancy: EmbedDormancyTracker | null = null;
 
 	async onload(): Promise<void> {
 		this.store = new FoldStore({
@@ -145,7 +147,15 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		const headingRenames = new EmbedHeadingRenameTracker({
 			store: this.store,
 			resolveLink: (linktext, sourcePath) => this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath)?.path ?? null,
+			// PR-8 R1: embeds rendered before their records moved are looked at again.
+			onMigrated: () => this.embedRestorer?.rescan(),
 		});
+		const seedHeadingBaselines = (targets: readonly string[]): void => {
+			for (const target of targets) {
+				const file = this.app.vault.getFileByPath(target);
+				if (file !== null) headingRenames.seed(target, this.app.metadataCache.getFileCache(file));
+			}
+		};
 
 		// G9 ("renamed outside Obsidian: not in v1"): drops any entry whose file no longer
 		// exists in the vault at all — the only cleanup for a rename/move/delete that happened
@@ -158,10 +168,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 			this.store.pruneOrphanEmbeds((path) => this.app.vault.getAbstractFileByPath(path) !== null);
 			// PR-8 (G17): a baseline of the headings of every note a stored embed names by heading,
 			// so a rename made before that note is next opened is still told from a hand edit.
-			for (const target of headingRenames.storedHeadingTargets()) {
-				const file = this.app.vault.getFileByPath(target);
-				if (file !== null) headingRenames.seed(target, this.app.metadataCache.getFileCache(file));
-			}
+			seedHeadingBaselines(headingRenames.storedHeadingTargets());
 		});
 
 		registerForgetNoteFoldsCommand(this);
@@ -210,7 +217,15 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		};
 		const recorder = new EmbedFoldRecorder({
 			workspace: this.app.workspace,
-			store: this.store,
+			store: {
+				getEmbed: (id) => this.store.getEmbed(id),
+				// PR-8 R2: a heading embed first folded now gets its target's headings recorded
+				// at once, so a rename of that heading before the target is next opened is still
+				// told from a hand edit.
+				setEmbed: (record) => {
+					if (this.store.setEmbed(record)) seedHeadingBaselines(headingTargetsOf(record));
+				},
+			},
 			readHostText,
 			readNote,
 			resolveLink,
@@ -227,14 +242,13 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file: TFile | null) => {
 				if (!file) return;
-				// A link changed while the host was closed starts its clock at the next open.
-				readNote(file.path)
-					.then((text) => (text === null ? undefined : dormancy.reconcileHost(file.path, text)))
-					.catch((err: unknown) => {
-						console.error("persistent-folded-state: embed dormancy on open failed", err);
-					});
+				// A link changed while the host was closed starts its clock at the next open. A
+				// heading-linked record is held back for 10 s, so the tracker looks again after
+				// that even when no embed of the host renders (R5).
+				void dormancy.reconcileOnOpen(file.path);
 			})
 		);
+		this.dormancy = dormancy;
 
 		const restorer = new EmbedFoldRestorer({
 			workspace: this.app.workspace,
@@ -325,6 +339,8 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		this.embedRecorder = null;
 		this.embedRestorer?.dispose();
 		this.embedRestorer = null;
+		this.dormancy?.dispose();
+		this.dormancy = null;
 		this.flushAtOnce();
 	}
 
