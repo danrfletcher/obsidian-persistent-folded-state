@@ -364,6 +364,42 @@ describe("data.json integration: a re-matched embed record (ticket warkworth-21,
 		expect(await readFile(dataPath, "utf8")).toBe(bytes);
 	}, 20_000);
 
+	it("PR-8: a file with no `embeds` section is byte-identical after an embed rename, delete and prune, and none is created", async () => {
+		const { dataPath, loadData, saveData } = await makeTempVault();
+		const original = JSON.stringify({ version: 1, files: { "Tasks.md": { contentHash: "n1", folds: [], dormant: [] } } });
+		await writeFile(dataPath, original, "utf8");
+		const store = new FoldStore({ loadData, saveData });
+		await store.load();
+
+		store.handleEmbedRename("Tasks.md", "Tasks Renamed.md");
+		store.handleEmbedDelete("Tasks Renamed.md");
+		store.pruneOrphanEmbeds(() => false);
+		await store.flush();
+
+		expect(await readFile(dataPath, "utf8")).toBe(original);
+	});
+
+	it("PR-8: an embed rename and a delete are written to the real file at once, and the next load reads them back", async () => {
+		const { dataPath, loadData, saveData } = await makeTempVault();
+		await writeFile(dataPath, JSON.stringify(seedData()), "utf8");
+		const store = new FoldStore({ loadData, saveData });
+		await store.load();
+
+		store.handleEmbedRename("Rocketship.md", "Rocketship Q4.md");
+		await store.flush();
+		const renamed = JSON.parse(await readFile(dataPath, "utf8")) as { embeds: EmbedFoldRecord[] };
+		expect(renamed.embeds.map((r) => r.host)).toEqual(["Rocketship Q4.md", "Rocketship Q4.md", "Rocketship Q4.md", "Other Host.md", "Other Host.md"]);
+
+		store.handleEmbedDelete("Competitive Coding Fundamentals.md");
+		await store.flush();
+		const afterDelete = JSON.parse(await readFile(dataPath, "utf8")) as { embeds: EmbedFoldRecord[] };
+		expect(afterDelete.embeds.map((r) => [r.host, r.target])).toEqual([["Other Host.md", "Rocketship Q4.md"]]); // the whole-note embed of the renamed note followed it
+
+		const reloaded = new FoldStore({ loadData, saveData });
+		await reloaded.load();
+		expect(reloaded.embedRecords()).toEqual(afterDelete.embeds);
+	});
+
 	it("a file with no `embeds` section loads unchanged, and rendering an embed adds none", async () => {
 		const { dataPath, loadData, saveData } = await makeTempVault();
 		const original = JSON.stringify({ version: 1, files: { "Tasks.md": { contentHash: "n1", folds: [], dormant: [] } } });

@@ -219,6 +219,11 @@ describe("lifecycle: embeds survive disable then re-enable (E9)", () => {
 			stored = structuredClone(data);
 		});
 		for (const path of Object.keys(SEED_FILES)) (app.vault as unknown as MockVault).setExists(path);
+		// PR-8: layout ready prunes an embed record whose host or target is not in the vault (G10).
+		for (const record of SEED_EMBEDS) {
+			(app.vault as unknown as MockVault).setExists(record.host);
+			(app.vault as unknown as MockVault).setExists(record.target);
+		}
 
 		const first = new PersistentFoldedStatePlugin(app, manifest);
 		first.loadData = loadData;

@@ -92,6 +92,12 @@
  * document for embeds rendering and puts the recorded folds back, through the embed's own fold
  * arrows. It never writes to the store or to any note, adds no command, UI or element, and is
  * disposed in `onunload()` alongside the recorder.
+ *
+ * PR-8 (embed lifecycle, G10, G11, G17): the same `vault` rename and delete listeners also call the
+ * embed twins on the store (`handleEmbedRename`, `handleEmbedDelete`), and the `onLayoutReady` prune
+ * also calls `pruneOrphanEmbeds`. A heading renamed inside Obsidian is noticed from the metadata
+ * cache (`EmbedHeadingRenameTracker`, src/embed-heading-rename.ts), which only reads it. Nothing
+ * here writes to a note, and none of it goes through the dormancy tracker.
  */
 import { Events, Plugin } from "obsidian";
 import type { TFile } from "obsidian";
@@ -104,6 +110,7 @@ import { restoreOnOpen } from "./open-restore";
 import { EmbedFoldRecorder } from "./embed-fold-recorder";
 import { EmbedFoldRestorer } from "./embed-fold-restorer";
 import { EmbedDormancyTracker } from "./embed-dormancy";
+import { EmbedHeadingRenameTracker } from "./embed-heading-rename";
 import type { EmbedHost } from "./embed-host";
 
 /** Event name for the "settled non-user change" deliverable (E9/E10), triggered on
@@ -133,12 +140,28 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		});
 		await this.store.load();
 
+		// PR-8 (G17): notices a heading renamed inside Obsidian, so the embeds that link to it
+		// follow it instead of looking retargeted. Reads the metadata cache only.
+		const headingRenames = new EmbedHeadingRenameTracker({
+			store: this.store,
+			resolveLink: (linktext, sourcePath) => this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath)?.path ?? null,
+		});
+
 		// G9 ("renamed outside Obsidian: not in v1"): drops any entry whose file no longer
 		// exists in the vault at all — the only cleanup for a rename/move/delete that happened
 		// outside Obsidian, or while it wasn't running. R1: deferred to onLayoutReady — see the
 		// file comment for why running this straight after load() is unsafe.
 		this.app.workspace.onLayoutReady(() => {
 			this.store.pruneOrphans((path) => this.app.vault.getAbstractFileByPath(path) !== null);
+			// PR-8 (G10, outside Obsidian): the same prune for embed records, whose host or
+			// target is gone. A record whose host and every target still exist is kept.
+			this.store.pruneOrphanEmbeds((path) => this.app.vault.getAbstractFileByPath(path) !== null);
+			// PR-8 (G17): a baseline of the headings of every note a stored embed names by heading,
+			// so a rename made before that note is next opened is still told from a hand edit.
+			for (const target of headingRenames.storedHeadingTargets()) {
+				const file = this.app.vault.getFileByPath(target);
+				if (file !== null) headingRenames.seed(target, this.app.metadataCache.getFileCache(file));
+			}
 		});
 
 		registerForgetNoteFoldsCommand(this);
@@ -234,12 +257,30 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				this.store.handleRename(oldPath, file.path);
+				// PR-8 (G10): embed records follow the same rename, in their own section. A
+				// rewritten link is a migration, never a retarget, so nothing here starts a dormant clock.
+				this.store.handleEmbedRename(oldPath, file.path);
+				headingRenames.handleRename(oldPath, file.path);
 			})
 		);
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
 				this.store.handleDelete(file.path);
+				// PR-8 (G11): a deleted host or target takes its embed records with it.
+				this.store.handleEmbedDelete(file.path);
+				headingRenames.handleDelete(file.path);
 			})
+		);
+
+		// PR-8 (G17): a note opened gets a heading baseline; every re-parse is checked for a
+		// heading rename and for the links Obsidian rewrote because of one.
+		this.registerEvent(
+			this.app.workspace.on("file-open", (file: TFile | null) => {
+				if (file) headingRenames.seed(file.path, this.app.metadataCache.getFileCache(file));
+			})
+		);
+		this.registerEvent(
+			this.app.metadataCache.on("changed", (file, _data, cache) => headingRenames.onChanged(file.path, cache))
 		);
 
 		// G8/E4 (open restore): thin glue — see the file comment above. The actual decision

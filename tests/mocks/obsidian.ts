@@ -265,10 +265,27 @@ export class Vault extends Events {
 	}
 }
 
-/** Just enough of real `MetadataCache.getFirstLinkpathDest`: an exact path (with or without
- * `.md`), else the first note whose name matches, else null. Ignores the source path. */
-export class MetadataCache {
-	constructor(private readonly vault: Vault) {}
+/** Just enough of real `MetadataCache`: `getFirstLinkpathDest` (an exact path, with or without
+ * `.md`, else the first note whose name matches, else null; ignores the source path), the `Events`
+ * base (so `metadataCache.on("changed", ...)` and `trigger("changed", file, data, cache)` behave as
+ * in Obsidian) and `getFileCache` over caches a test sets with `setCache`. */
+export interface MockCachedMetadata {
+	headings?: { heading: string; level: number }[];
+	embeds?: { link: string }[];
+}
+
+export class MetadataCache extends Events {
+	private caches = new Map<string, MockCachedMetadata>();
+	constructor(private readonly vault: Vault) {
+		super();
+	}
+	/** Test helper: the cache `getFileCache` answers for `path`. */
+	setCache(path: string, cache: MockCachedMetadata): void {
+		this.caches.set(path, cache);
+	}
+	getFileCache(file: TFile): MockCachedMetadata | null {
+		return this.caches.get(file.path) ?? null;
+	}
 	getFirstLinkpathDest(linkpath: string, _sourcePath: string): TFile | null {
 		const wanted = linkpath.replace(/\.md$/i, "");
 		for (const path of this.vault.allPaths()) {

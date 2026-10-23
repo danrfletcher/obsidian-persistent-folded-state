@@ -234,13 +234,18 @@ describe("vault-events: a rename never starts an embed's dormant clock (PR-7, G6
 
 		expect(reconcileHost).not.toHaveBeenCalled();
 		expect(reconcileInStore).not.toHaveBeenCalled();
-		expect(plugin.store.embedRecords().map((r) => "dormantSince" in r)).toEqual([false]);
+		// PR-8 (G10): the record now follows the renames (it is re-keyed, not left under the old
+		// host), and still carries no dormancy stamp.
+		expect(plugin.store.embedRecords().map((r) => [r.host, r.target, "dormantSince" in r])).toEqual([
+			["Folder/Course.md", "Lessons Renamed.md", false],
+		]);
 
-		// The control: the same wiring does start the clock when the host is opened.
-		(app.workspace as unknown as MockWorkspace).trigger("file-open", new MockTFile(HOST));
+		// The control: the same wiring does start the clock when the host is opened (at its new path).
+		vault.setContent("Folder/Course.md", "Nothing is embedded here now.\n");
+		(app.workspace as unknown as MockWorkspace).trigger("file-open", new MockTFile("Folder/Course.md"));
 		await vi.waitFor(() => expect(plugin.store.embedRecords()[0].dormantSince).toBeTypeOf("number"));
 		expect(reconcileHost).toHaveBeenCalledTimes(1);
-		expect(reconcileHost).toHaveBeenCalledWith(HOST, "Nothing is embedded here now.\n");
+		expect(reconcileHost).toHaveBeenCalledWith("Folder/Course.md", "Nothing is embedded here now.\n");
 		expect(reconcileInStore).toHaveBeenCalledTimes(1);
 
 		expect(writes.map((spy) => spy.mock.calls.length)).toEqual(WRITES.map(() => 0));

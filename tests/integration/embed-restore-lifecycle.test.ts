@@ -85,6 +85,9 @@ async function launch(persisted: unknown): Promise<Launch> {
 	const w = new World({}, { app, attach: false });
 	w.addNote(SOURCE, SOURCE_TEXT);
 	w.addNote(LESSONS_NOTE, LESSONS_TEXT);
+	// PR-8: layout ready prunes an embed record whose host is not in the vault (G10), so the host a
+	// test persists a record for exists from launch, as it would in a real vault.
+	app.vault.setExists(ROCKETSHIP);
 	const plugin = new PersistentFoldedStatePlugin(app as unknown as ConstructorParameters<typeof PersistentFoldedStatePlugin>[0], manifest);
 	if (persisted !== null) await plugin.saveData(structuredClone(persisted));
 	await plugin.onload();

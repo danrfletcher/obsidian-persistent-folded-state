@@ -224,6 +224,31 @@ describe("sanitizeStoreData: embeds section absent or not an array (E8)", () => 
 	});
 });
 
+describe("PR-8: the embed lifecycle on a file with no usable embeds section creates none (E8)", () => {
+	const inputs: { label: string; data: unknown }[] = [
+		{ label: "no embeds key", data: { version: STORE_VERSION, files: NOTE_FILES } },
+		{ label: "embeds as an object", data: withEmbeds({ host: "Host.md" }) },
+		{ label: "embeds as an array of bad records only", data: withEmbeds([null, 5, "x", { host: 3 }]) },
+	];
+	for (const { label, data } of inputs) {
+		it(`${label}: rename, delete, prune and heading migration are no-ops that never reach saveData`, async () => {
+			const saveData = vi.fn();
+			const store = new FoldStore({ loadData: async () => structuredClone(data), saveData, now: () => 6_000 });
+			await store.load();
+
+			expect(store.handleEmbedRename("Host.md", "Renamed.md")).toBe(false);
+			expect(store.handleEmbedDelete("Host.md")).toBe(false);
+			expect(store.pruneOrphanEmbeds(() => false)).toBe(0);
+			expect(store.migrateEmbedHeading({ source: "Host.md", target: "Note.md", from: "A", to: "B" })).toBe(0);
+			await store.flush();
+
+			expect(saveData).not.toHaveBeenCalled();
+			expect(store.embedSize).toBe(0);
+			expect(store.get("Note.md")).toEqual(NOTE_FILES["Note.md"]); // the notes' own section is untouched
+		});
+	}
+});
+
 describe("sanitizeStoreData: bad embed records are dropped, neighbours survive (E8)", () => {
 	const bad: { label: string; record: unknown }[] = [
 		{ label: "not an object (string)", record: "nope" },

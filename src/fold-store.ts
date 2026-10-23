@@ -27,9 +27,11 @@
  * Embeds (ticket warkworth-21, PR-1): a second owner of fold state next to the notes map. Embed
  * records live in an optional `embeds` array in the same data.json (version stays 1), identified
  * by the structured fields host/target/subpath/occurrence and never by a persisted composite key.
- * They share the notes' dirty flag, debounce and flush chain. This PR only stores, loads and
- * forgets them; `handleRename`, `handleDelete` and `pruneOrphans` deliberately leave them alone
- * (embed variants are PR-8). Dormant expiry for them is PR-7 (G6, E6): a record whose embed went
+ * They share the notes' dirty flag, debounce and flush chain. `handleRename`, `handleDelete` and
+ * `pruneOrphans` deliberately leave them alone: those treat keys as file paths and cover the `files`
+ * section only. PR-8 adds the embed-aware twins `handleEmbedRename`, `handleEmbedDelete`,
+ * `pruneOrphanEmbeds` and `migrateEmbedHeading` (rules in src/embed-lifecycle.ts), which work on
+ * the structured host/target fields and never touch `files`. Dormant expiry for them is PR-7 (G6, E6): a record whose embed went
  * away carries `dormantSince` (`reconcileEmbedDormancy`), and `load()` and `flush()` forget it,
  * and any per-anchor dormant entry, once it is 10 minutes old (src/embed-dormant.ts).
  *
@@ -43,6 +45,8 @@ import { expireDormant, parseDormantAnchor } from "./dormant";
 import { expireEmbedRecords, isValidDormantSince, nextEmbedDormancy } from "./embed-dormant";
 import type { EmbedPresence } from "./embed-dormant";
 import { deleteFiles, pruneOrphanFiles, renameFiles } from "./vault-lifecycle";
+import { deleteEmbeds, migrateEmbedHeading, pruneOrphanEmbeds, renameEmbeds } from "./embed-lifecycle";
+import type { HeadingMigration } from "./embed-lifecycle";
 
 /** Bumped only if a later PR needs to migrate an incompatible on-disk shape. An unrecognised
  * version is treated the same as a corrupt file (E8): start empty rather than guess. */
@@ -229,7 +233,8 @@ export function hashText(text: string): string {
 export class FoldStore {
 	private files = new Map<string, FileFoldRecord>();
 	/** Embed records by `embedMapKey(identity)`. Untouched by `handleRename`, `handleDelete` and
-	 * `pruneOrphans`: those treat keys as file paths, and embed variants belong to PR-8. */
+	 * `pruneOrphans`: those treat keys as file paths. The embed twins (`handleEmbedRename`,
+	 * `handleEmbedDelete`, `pruneOrphanEmbeds`, `migrateEmbedHeading`) are what move or remove them. */
 	private embeds = new Map<string, EmbedFoldRecord>();
 	private dirty = false;
 	private flushTimer: number | null = null;
@@ -506,6 +511,60 @@ export class FoldStore {
 		this.dirty = true;
 		this.flushAndLog();
 		return removed;
+	}
+
+	/**
+	 * PR-8 (G10): the embed twin of `handleRename`. Re-keys every embed record whose host or target
+	 * (or a containing embed's target, for a nested one) is `oldPath` or lies beneath it, to
+	 * `newPath` (src/embed-lifecycle.ts). Only the `embeds` section is read or changed: the notes'
+	 * own `files` entries are `handleRename`'s, so a note-level rename and this one can both run
+	 * for one vault event without either touching the other's section (F2). Flushes at once, so a
+	 * rename arriving while a debounced flush is pending never lets a later write land under the
+	 * old key. Returns whether any record was found; a miss is a no-op that never reaches `saveData`.
+	 */
+	handleEmbedRename(oldPath: string, newPath: string): boolean {
+		return this.replaceEmbeds(renameEmbeds(this.embedRecords(), oldPath, newPath));
+	}
+
+	/** PR-8 (G11): the embed twin of `handleDelete`. Removes every embed record whose host or target
+	 * (or a containing embed's target) is `path` or lies beneath it. This is removal, not dormancy:
+	 * the file is gone. Flushes at once. A miss is a no-op that never reaches `saveData`. */
+	handleEmbedDelete(path: string): boolean {
+		return this.replaceEmbeds(deleteEmbeds(this.embedRecords(), path));
+	}
+
+	/** PR-8 (G10, outside Obsidian): the embed twin of `pruneOrphans`, called from the same
+	 * `onLayoutReady` callback in `main.ts`. Drops every embed record whose host or any note in its
+	 * chain does not exist. Flushes at once if anything was pruned. Returns the number removed. */
+	pruneOrphanEmbeds(exists: (path: string) => boolean): number {
+		const before = this.embedRecords();
+		const after = pruneOrphanEmbeds(before, exists);
+		this.replaceEmbeds(after);
+		return before.length - after.length;
+	}
+
+	/** PR-8 (G17): moves the embed records of the links `migration` describes to the new heading
+	 * (src/embed-lifecycle.ts `migrateEmbedHeading`). Deliberately not routed through
+	 * `reconcileEmbedDormancy`: a rename is a migration, so no record is stamped dormant and no
+	 * 10-minute timer starts for it. Flushes at once. Returns how many records now sit under a
+	 * different key; none means nothing was written. */
+	migrateEmbedHeading(migration: HeadingMigration): number {
+		const before = this.embedRecords();
+		const after = migrateEmbedHeading(before, migration);
+		const moved = after.filter((record) => !before.includes(record)).length;
+		this.replaceEmbeds(after);
+		return moved;
+	}
+
+	/** Swaps the embeds map for `after` and flushes at once, but only when it differs from what the
+	 * map holds (a record changed, or one was dropped by replacement or removal). Returns whether it did. */
+	private replaceEmbeds(after: readonly EmbedFoldRecord[]): boolean {
+		const before = this.embedRecords();
+		if (after.length === before.length && after.every((record, i) => record === before[i])) return false;
+		this.embeds = new Map(after.map((record) => [embedMapKey(record), record]));
+		this.dirty = true;
+		this.flushAndLog();
+		return true;
 	}
 
 	/** Immediate flush, bypassing the debounce window. Safe to call even with nothing pending
