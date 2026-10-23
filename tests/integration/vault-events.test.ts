@@ -14,6 +14,7 @@ import { EditorView } from "@codemirror/view";
 import { codeFolding } from "@codemirror/language";
 import { TFile as MockTFile, Vault as MockVault, Workspace as MockWorkspace, editorInfoField } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
+import { EmbedDormancyTracker } from "../../src/embed-dormancy";
 
 function setExists(app: App, path: string): void {
 	(app.vault as unknown as MockVault).setExists(path);
@@ -205,6 +206,51 @@ describe("vault-events: rename (G9)", () => {
 			vi.useRealTimers();
 		},
 	);
+});
+
+describe("vault-events: a rename never starts an embed's dormant clock (PR-7, G6 rename guard)", () => {
+	const HOST = "Course.md";
+	const SOURCE = "Lessons.md";
+	const WRITES = ["modify", "process", "create", "createFolder", "rename", "delete", "trash", "append", "copy"];
+
+	it("renaming the host or the embedded note fires no dormancy step and stamps nothing; opening the host does (F7: no vault write either way)", async () => {
+		const app = new App();
+		const vault = app.vault as unknown as MockVault & Record<string, unknown>;
+		// The host no longer embeds the stored key: opening it must stamp the record dormant.
+		vault.setContent(HOST, "Nothing is embedded here now.\n");
+		vault.setContent(SOURCE, "- [ ] Lesson 8 ^abc123\n  - [ ] Child\n");
+		const writes = WRITES.map((name) => (vault[name] = vi.fn()) as ReturnType<typeof vi.fn>);
+		const record = { host: HOST, target: SOURCE, subpath: "^abc123", occurrence: 0, contentHash: "h", folds: [], dormant: [] };
+		const stored = { value: { version: 1, files: {}, embeds: [record] } as unknown };
+		const reconcileHost = vi.spyOn(EmbedDormancyTracker.prototype, "reconcileHost");
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+		const reconcileInStore = vi.spyOn(plugin.store, "reconcileEmbedDormancy");
+
+		triggerRename(app, "Course Renamed.md", HOST);
+		triggerRename(app, "Lessons Renamed.md", SOURCE);
+		triggerRename(app, "Folder/Course.md", "Course Renamed.md");
+		await plugin.store.flush();
+
+		expect(reconcileHost).not.toHaveBeenCalled();
+		expect(reconcileInStore).not.toHaveBeenCalled();
+		// PR-8 (G10): the record now follows the renames (it is re-keyed, not left under the old
+		// host), and still carries no dormancy stamp.
+		expect(plugin.store.embedRecords().map((r) => [r.host, r.target, "dormantSince" in r])).toEqual([
+			["Folder/Course.md", "Lessons Renamed.md", false],
+		]);
+
+		// The control: the same wiring does start the clock when the host is opened (at its new path).
+		vault.setContent("Folder/Course.md", "Nothing is embedded here now.\n");
+		(app.workspace as unknown as MockWorkspace).trigger("file-open", new MockTFile("Folder/Course.md"));
+		await vi.waitFor(() => expect(plugin.store.embedRecords()[0].dormantSince).toBeTypeOf("number"));
+		expect(reconcileHost).toHaveBeenCalledTimes(1);
+		expect(reconcileHost).toHaveBeenCalledWith("Folder/Course.md", "Nothing is embedded here now.\n");
+		expect(reconcileInStore).toHaveBeenCalledTimes(1);
+
+		expect(writes.map((spy) => spy.mock.calls.length)).toEqual(WRITES.map(() => 0));
+		await plugin.store.flush();
+	});
 });
 
 describe("vault-events: delete (G10)", () => {

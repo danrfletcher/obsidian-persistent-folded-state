@@ -81,6 +81,23 @@
  * compare, re-match, replace native restore) is `src/open-restore.ts`'s `restoreOnOpen`, fully
  * testable on its own against a directly constructed `EditorView` — this handler is deliberately
  * thin glue around it.
+ *
+ * PR-4 (embed recording, G1): `EmbedFoldRecorder` (src/embed-fold-recorder.ts) listens, with
+ * capture-phase document listeners, for the user's own click on the fold arrow Obsidian already
+ * shows inside an embed, and records it under the embed's key. It adds no command, no UI and no
+ * element to the page. `onunload()` removes every listener it added (E9). The readers handed to it
+ * only read: the host's text from its view, a target's text with `cachedRead`.
+ *
+ * PR-5 (embed restore, G2): `EmbedFoldRestorer` (src/embed-fold-restorer.ts) watches each
+ * document for embeds rendering and puts the recorded folds back, through the embed's own fold
+ * arrows. It never writes to the store or to any note, adds no command, UI or element, and is
+ * disposed in `onunload()` alongside the recorder.
+ *
+ * PR-8 (embed lifecycle, G10, G11, G17): the same `vault` rename and delete listeners also call the
+ * embed twins on the store (`handleEmbedRename`, `handleEmbedDelete`), and the `onLayoutReady` prune
+ * also calls `pruneOrphanEmbeds`. A heading renamed inside Obsidian is noticed from the metadata
+ * cache (`EmbedHeadingRenameTracker`, src/embed-heading-rename.ts), which only reads it. Nothing
+ * here writes to a note, and none of it goes through the dormancy tracker.
  */
 import { Events, Plugin } from "obsidian";
 import type { TFile } from "obsidian";
@@ -90,6 +107,11 @@ import { registerForgetNoteFoldsCommand } from "./commands";
 import { PersistentFoldedStateSettingTab } from "./settings-tab";
 import { createEditorWatcher } from "./editor-watcher";
 import { restoreOnOpen } from "./open-restore";
+import { EmbedFoldRecorder } from "./embed-fold-recorder";
+import { EmbedFoldRestorer } from "./embed-fold-restorer";
+import { EmbedDormancyTracker } from "./embed-dormancy";
+import { EmbedHeadingRenameTracker } from "./embed-heading-rename";
+import type { EmbedHost } from "./embed-host";
 
 /** Event name for the "settled non-user change" deliverable (E9/E10), triggered on
  * `PersistentFoldedStatePlugin.events` with `(path: string, text: string)`. */
@@ -106,6 +128,10 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	 * seconds long in production to give a slow, real relaunch's native restore time to arrive.
 	 * Set before calling `onload()`; left `undefined` (the default) in production. */
 	guardDelaysMs?: readonly number[];
+	/** PR-4: records the user's folds inside embeds. Created in `onload()`, disposed in `onunload()`. */
+	private embedRecorder: EmbedFoldRecorder | null = null;
+	/** PR-5: puts the recorded folds back as each embed renders. Created in `onload()`, disposed in `onunload()`. */
+	private embedRestorer: EmbedFoldRestorer | null = null;
 
 	async onload(): Promise<void> {
 		this.store = new FoldStore({
@@ -114,12 +140,28 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		});
 		await this.store.load();
 
+		// PR-8 (G17): notices a heading renamed inside Obsidian, so the embeds that link to it
+		// follow it instead of looking retargeted. Reads the metadata cache only.
+		const headingRenames = new EmbedHeadingRenameTracker({
+			store: this.store,
+			resolveLink: (linktext, sourcePath) => this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath)?.path ?? null,
+		});
+
 		// G9 ("renamed outside Obsidian: not in v1"): drops any entry whose file no longer
 		// exists in the vault at all — the only cleanup for a rename/move/delete that happened
 		// outside Obsidian, or while it wasn't running. R1: deferred to onLayoutReady — see the
 		// file comment for why running this straight after load() is unsafe.
 		this.app.workspace.onLayoutReady(() => {
 			this.store.pruneOrphans((path) => this.app.vault.getAbstractFileByPath(path) !== null);
+			// PR-8 (G10, outside Obsidian): the same prune for embed records, whose host or
+			// target is gone. A record whose host and every target still exist is kept.
+			this.store.pruneOrphanEmbeds((path) => this.app.vault.getAbstractFileByPath(path) !== null);
+			// PR-8 (G17): a baseline of the headings of every note a stored embed names by heading,
+			// so a rename made before that note is next opened is still told from a hand edit.
+			for (const target of headingRenames.storedHeadingTargets()) {
+				const file = this.app.vault.getFileByPath(target);
+				if (file !== null) headingRenames.seed(target, this.app.metadataCache.getFileCache(file));
+			}
 		});
 
 		registerForgetNoteFoldsCommand(this);
@@ -148,18 +190,97 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		});
 		this.registerDomEvent(window, "pagehide", () => this.flushAtOnce());
 
+		// G1 (PR-4): record the user's own folds inside embeds, in the main window and in every
+		// pop-out window. The recorder only reads the vault; it writes to the store alone.
+		// PR-5 (G2): the restorer below reads them back as each embed renders, through the same
+		// readers, and never writes.
+		const readHostText = (host: { view: { getViewData(): string } }): string => host.view.getViewData();
+		const readNote = async (path: string): Promise<string | null> => {
+			const file = this.app.vault.getFileByPath(path);
+			return file === null ? null : await this.app.vault.cachedRead(file);
+		};
+		const resolveLink = (linktext: string, sourcePath: string): string | null =>
+			this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath)?.path ?? null;
+		// Live Preview only: where in the host's text a rendered embed sits. Used just to tell
+		// identical embeds apart; undocumented route, same as the file-open handler below.
+		const positionOf = (host: EmbedHost, el: Element): number | null => {
+			if (host.mode !== "live-preview") return null;
+			const cm = (host.view.editor as unknown as { cm?: EditorView } | undefined)?.cm;
+			return cm ? cm.posAtDOM(el) : null;
+		};
+		const recorder = new EmbedFoldRecorder({
+			workspace: this.app.workspace,
+			store: this.store,
+			readHostText,
+			readNote,
+			resolveLink,
+			positionOf,
+		});
+		this.embedRecorder = recorder;
+		recorder.attach(document);
+		this.registerEvent(this.app.workspace.on("window-open", (_win, popout) => recorder.attach(popout.document)));
+		this.registerEvent(this.app.workspace.on("window-close", (_win, popout) => recorder.detach(popout.document)));
+
+		// PR-7 (G6, E6): a retargeted or broken embed's stored state goes dormant for 10 minutes,
+		// then is forgotten. Read-only toward the vault; never called from a rename handler.
+		const dormancy = new EmbedDormancyTracker({ store: this.store, readNote, resolveLink });
+		this.registerEvent(
+			this.app.workspace.on("file-open", (file: TFile | null) => {
+				if (!file) return;
+				// A link changed while the host was closed starts its clock at the next open.
+				readNote(file.path)
+					.then((text) => (text === null ? undefined : dormancy.reconcileHost(file.path, text)))
+					.catch((err: unknown) => {
+						console.error("persistent-folded-state: embed dormancy on open failed", err);
+					});
+			})
+		);
+
+		const restorer = new EmbedFoldRestorer({
+			workspace: this.app.workspace,
+			store: this.store,
+			readHostText,
+			readNote,
+			resolveLink,
+			positionOf,
+			whenRecorded: () => recorder.whenIdle(),
+			dormancy,
+		});
+		this.embedRestorer = restorer;
+		restorer.attach(document);
+		this.registerEvent(this.app.workspace.on("window-open", (_win, popout) => restorer.attach(popout.document)));
+		this.registerEvent(this.app.workspace.on("window-close", (_win, popout) => restorer.detach(popout.document)));
+
 		// G9/G10: re-key or remove the stored entry (and every entry nested beneath it, for a
 		// folder) on a rename/move or delete inside Obsidian. `registerEvent` tears both down
 		// automatically on unload.
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				this.store.handleRename(oldPath, file.path);
+				// PR-8 (G10): embed records follow the same rename, in their own section. A
+				// rewritten link is a migration, never a retarget, so nothing here starts a dormant clock.
+				this.store.handleEmbedRename(oldPath, file.path);
+				headingRenames.handleRename(oldPath, file.path);
 			})
 		);
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
 				this.store.handleDelete(file.path);
+				// PR-8 (G11): a deleted host or target takes its embed records with it.
+				this.store.handleEmbedDelete(file.path);
+				headingRenames.handleDelete(file.path);
 			})
+		);
+
+		// PR-8 (G17): a note opened gets a heading baseline; every re-parse is checked for a
+		// heading rename and for the links Obsidian rewrote because of one.
+		this.registerEvent(
+			this.app.workspace.on("file-open", (file: TFile | null) => {
+				if (file) headingRenames.seed(file.path, this.app.metadataCache.getFileCache(file));
+			})
+		);
+		this.registerEvent(
+			this.app.metadataCache.on("changed", (file, _data, cache) => headingRenames.onChanged(file.path, cache))
 		);
 
 		// G8/E4 (open restore): thin glue — see the file comment above. The actual decision
@@ -199,6 +320,11 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	onunload(): void {
 		// R14: must run before `flushAtOnce()` can do anything async — see the file comment.
 		this.editorWatcherDisposed.current = true;
+		// E9: no embed listener or observer outlives the plugin, and nothing queued is recorded.
+		this.embedRecorder?.dispose();
+		this.embedRecorder = null;
+		this.embedRestorer?.dispose();
+		this.embedRestorer = null;
 		this.flushAtOnce();
 	}
 

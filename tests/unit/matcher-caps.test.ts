@@ -78,6 +78,29 @@ describe("E6 C22: at most maxComparisons similarity() calls per run", () => {
 		const { MAX_COMPARISONS } = await import("../../src/matcher");
 		expect(MAX_COMPARISONS).toBe(5000);
 	});
+
+	it("PR-6 (E7): the smaller budget an embed is handed because other embeds of its host spent some stops its comparing early and returns capped", async () => {
+		const storedLabels = Array.from({ length: 10 }, (_, i) => `shared host task ${i} changed`);
+		const candidateLabels = Array.from({ length: 10 }, (_, i) => `shared host task ${i}`);
+		const stored = anchorsFrom(tasksMarkdown(storedLabels));
+		const candidates = anchorsFrom(tasksMarkdown(candidateLabels));
+		const spy = vi.spyOn(similarityModule, "similarity");
+
+		// A host budget of 14: the first embed spends 10 of it, so the next is handed the 4 left.
+		const hostBudget = 14;
+		const first = await matchAnchors(stored, candidates, { maxComparisons: hostBudget });
+		const spent = spy.mock.calls.length;
+		expect(spent).toBe(10);
+		expect(first.every((r) => r.tier === "positional")).toBe(true);
+
+		spy.mockClear();
+		const second = await matchAnchors(stored, candidates, { maxComparisons: hostBudget - spent });
+		expect(spy.mock.calls.length).toBe(4); // stopped early, at the remaining budget
+		for (let i = 0; i < 4; i++) expect(second[i]).toEqual({ tier: "positional", target: i });
+		for (let i = 4; i < 10; i++) expect(second[i]).toEqual({ tier: "none", reason: "capped" });
+
+		vi.restoreAllMocks();
+	});
 });
 
 describe("E6 C23: matchAnchors is async and yields through an injected yieldToHost", () => {

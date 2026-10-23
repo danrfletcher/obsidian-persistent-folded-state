@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FoldStore, hashText } from "../../src/fold-store";
-import type { FileFoldRecord } from "../../src/types";
+import type { EmbedFoldRecord, FileFoldRecord } from "../../src/types";
 
 function record(contentHash: string, folds: Record<string, unknown>[] = []): FileFoldRecord {
 	return { contentHash, folds, dormant: [] };
@@ -314,5 +314,215 @@ describe("hashText", () => {
 	it("hashes empty text without error", () => {
 		expect(() => hashText("")).not.toThrow();
 		expect(hashText("")).toBe(hashText(""));
+	});
+});
+
+// --- Embed records: debounce, pending-flush forgets, failed writes (warkworth-21 PR-1) ----------
+
+function embedRecord(contentHash: string, overrides: Partial<EmbedFoldRecord> = {}): EmbedFoldRecord {
+	return { host: "Host.md", target: "Source.md", subpath: "^abc", occurrence: 0, contentHash, folds: [], dormant: [], ...overrides };
+}
+
+type Written = { files: Record<string, FileFoldRecord>; embeds?: EmbedFoldRecord[] };
+
+describe("FoldStore: embed records and the debounce window (E9)", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("an embed change at t=0 is unwritten at 149ms and written at 150ms", async () => {
+		const { store, saveData } = makeStore();
+		await store.load();
+		store.setEmbed(embedRecord("e1"));
+
+		await vi.advanceTimersByTimeAsync(149);
+		expect(saveData).not.toHaveBeenCalled();
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect(saveData).toHaveBeenCalledTimes(1);
+		expect((saveData.mock.calls[0][0] as Written).embeds).toEqual([embedRecord("e1")]);
+	});
+
+	it("a further embed change restarts the window, and the last value is what lands", async () => {
+		const { store, saveData } = makeStore();
+		await store.load();
+		store.setEmbed(embedRecord("e1"));
+		await vi.advanceTimersByTimeAsync(100);
+		store.setEmbed(embedRecord("e2"));
+
+		await vi.advanceTimersByTimeAsync(149);
+		expect(saveData).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(saveData).toHaveBeenCalledTimes(1);
+		expect((saveData.mock.calls[0][0] as Written).embeds?.[0].contentHash).toBe("e2");
+	});
+
+	it("a note change and an embed change inside one window share one write", async () => {
+		const { store, saveData } = makeStore();
+		await store.load();
+		store.set("Tasks.md", record("n1"));
+		await vi.advanceTimersByTimeAsync(80);
+		store.setEmbed(embedRecord("e1"));
+
+		await vi.advanceTimersByTimeAsync(149);
+		expect(saveData).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(saveData).toHaveBeenCalledTimes(1);
+		const written = saveData.mock.calls[0][0] as Written;
+		expect(Object.keys(written.files)).toEqual(["Tasks.md"]);
+		expect(written.embeds).toHaveLength(1);
+	});
+
+	it("flush() inside the window writes the embed at once and the cancelled timer never writes again", async () => {
+		const { store, saveData } = makeStore();
+		await store.load();
+		store.setEmbed(embedRecord("e1"));
+		await vi.advanceTimersByTimeAsync(10);
+		await store.flush();
+		expect(saveData).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(saveData).toHaveBeenCalledTimes(1);
+	});
+
+	it("forgetEmbedsForHost during a pending debounced flush writes the post-forget state, never the stale one", async () => {
+		const { store, saveData } = makeStore();
+		await store.load();
+		store.setEmbed(embedRecord("e1")); // schedules a flush in 150ms
+		store.setEmbed(embedRecord("e2", { host: "Keep.md" }));
+
+		await vi.advanceTimersByTimeAsync(50);
+		expect(store.forgetEmbedsForHost("Host.md")).toBe(1);
+
+		await vi.advanceTimersByTimeAsync(0);
+		expect(saveData).toHaveBeenCalledTimes(1);
+		expect((saveData.mock.calls[0][0] as Written).embeds?.map((r) => r.host)).toEqual(["Keep.md"]);
+
+		await vi.advanceTimersByTimeAsync(200); // the cancelled timer must not write the stale state
+		expect(saveData).toHaveBeenCalledTimes(1);
+	});
+
+	it("forgetNote during a pending debounced flush writes the post-forget state, never the stale one", async () => {
+		const { store, saveData } = makeStore();
+		await store.load();
+		store.set("Host.md", record("n1"));
+		store.setEmbed(embedRecord("e1"));
+
+		await vi.advanceTimersByTimeAsync(50);
+		store.forgetNote("Host.md");
+
+		await vi.advanceTimersByTimeAsync(0);
+		expect(saveData).toHaveBeenCalledTimes(1);
+		expect(saveData.mock.calls[0][0]).toEqual({ version: 1, files: {} });
+		await vi.advanceTimersByTimeAsync(200);
+		expect(saveData).toHaveBeenCalledTimes(1);
+	});
+
+	it("forgetAll during a pending debounced flush clears embeds too and writes the post-forget state", async () => {
+		const { store, saveData } = makeStore();
+		await store.load();
+		store.setEmbed(embedRecord("e1")); // the store holds only an embed
+
+		await vi.advanceTimersByTimeAsync(50);
+		expect(store.forgetAll()).toBe(0);
+
+		await vi.advanceTimersByTimeAsync(0);
+		expect(saveData).toHaveBeenCalledTimes(1);
+		expect(saveData.mock.calls[0][0]).toEqual({ version: 1, files: {} });
+		await vi.advanceTimersByTimeAsync(200);
+		expect(saveData).toHaveBeenCalledTimes(1);
+	});
+
+	it("forgetEmbed during a pending debounced flush writes the post-forget state", async () => {
+		const { store, saveData } = makeStore();
+		await store.load();
+		store.setEmbed(embedRecord("e1"));
+		await vi.advanceTimersByTimeAsync(50);
+		store.forgetEmbed({ host: "Host.md", target: "Source.md", subpath: "^abc", occurrence: 0 });
+		await vi.advanceTimersByTimeAsync(0);
+		expect(saveData).toHaveBeenCalledTimes(1);
+		expect(saveData.mock.calls[0][0]).toEqual({ version: 1, files: {} });
+		await vi.advanceTimersByTimeAsync(200);
+		expect(saveData).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("FoldStore: embed records and failed writes", () => {
+	it("a rejecting saveData leaves the store dirty, and the next flush retries with the embed", async () => {
+		const writes: unknown[] = [];
+		let calls = 0;
+		const saveData = vi.fn(async (data: unknown) => {
+			calls++;
+			if (calls === 1) throw new Error("disk full");
+			writes.push(data);
+		});
+		const store = new FoldStore({ loadData: async () => null, saveData });
+		await store.load();
+
+		store.setEmbed(embedRecord("e1"));
+		await expect(store.flush()).rejects.toThrow("disk full");
+		await store.flush();
+
+		expect(saveData).toHaveBeenCalledTimes(2);
+		expect((writes[0] as Written).embeds).toEqual([embedRecord("e1")]);
+	});
+
+	it("a forgetNote whose write is rejected does not throw, and a later flush retries the post-forget state", async () => {
+		let calls = 0;
+		const saveData = vi.fn(async (_data: unknown) => {
+			calls++;
+			if (calls === 2) throw new Error("disk full");
+		});
+		const store = new FoldStore({ loadData: async () => null, saveData });
+		await store.load();
+		store.set("Host.md", record("n1"));
+		store.setEmbed(embedRecord("e1"));
+		await store.flush();
+
+		const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+		try {
+			expect(() => store.forgetNote("Host.md")).not.toThrow();
+			await vi.waitFor(() => expect(saveData).toHaveBeenCalledTimes(2));
+			await vi.waitFor(() => expect(errors).toHaveBeenCalled());
+		} finally {
+			errors.mockRestore();
+		}
+
+		await store.flush();
+		expect(saveData).toHaveBeenCalledTimes(3);
+		expect(saveData.mock.calls.at(-1)?.[0]).toEqual({ version: 1, files: {} });
+	});
+
+	it("a change that lands while a failed embed flush is in flight is not lost", async () => {
+		const writes: unknown[] = [];
+		let calls = 0;
+		let rejectFirst: ((err: Error) => void) | undefined;
+		const saveData = vi.fn((data: unknown) => {
+			calls++;
+			if (calls === 1) {
+				return new Promise<void>((_resolve, reject) => {
+					rejectFirst = reject;
+				});
+			}
+			writes.push(data);
+			return Promise.resolve();
+		});
+		const store = new FoldStore({ loadData: async () => null, saveData });
+		await store.load();
+
+		store.setEmbed(embedRecord("e1"));
+		const flush1 = store.flush();
+		store.setEmbed(embedRecord("e2"));
+		const flush2 = store.flush();
+
+		await vi.waitFor(() => expect(saveData).toHaveBeenCalledTimes(1));
+		rejectFirst?.(new Error("disk full"));
+		await expect(flush1).rejects.toThrow("disk full");
+		await flush2;
+
+		expect(writes).toHaveLength(1);
+		expect((writes[0] as Written).embeds?.[0].contentHash).toBe("e2");
 	});
 });
