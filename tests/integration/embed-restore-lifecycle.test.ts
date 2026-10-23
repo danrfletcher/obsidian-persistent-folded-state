@@ -19,6 +19,7 @@ import { EMBED_VERIFY_DELAY_MS } from "../../src/embed-fold-restorer";
 import { LESSONS_NOTE, LESSONS_TEXT, SOURCE, SOURCE_TEXT, World, arrowFor } from "../fixtures/embed-recording-world";
 import type { Mode } from "../fixtures/embed-recording-world";
 import { foldedRows, isFolded } from "../fixtures/embed-restore-world";
+import { sliceEmbed } from "../../src/embed-slice";
 
 const manifest: PluginManifest = {
 	id: "persistent-folded-state",
@@ -45,7 +46,9 @@ const ROCKETSHIP_RECORD: EmbedFoldRecord = {
 	target: SOURCE,
 	subpath: "^0169a6",
 	occurrence: 0,
-	contentHash: "h-rocketship",
+	// The hash of the slice as the source note holds it, so a restore finds the record up to date
+	// (PR-6: a record whose hash differs from the slice's is refreshed after a re-match).
+	contentHash: sliceEmbed(SOURCE_TEXT, "^0169a6")?.hash ?? "",
 	folds: [LESSON_8_BLOCK],
 	dormant: [],
 };

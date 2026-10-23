@@ -2,9 +2,9 @@
  * F1/F8/F9 — purity fence for the anchor-building module (PR-3): `src/normalize.ts` and
  * `src/anchors.ts` must have no Obsidian, CodeMirror, DOM, file or network dependency, and no
  * use of browser/runtime globals a pure text-in/data-out module has no business touching. This
- * is a static source scan, deliberately scoped to just these two files (not all of `src/`,
- * which `tests/unit/fence.test.ts` and `tests/lint/fence.test.ts` already cover for the rest of
- * the plugin).
+ * is a static source scan, deliberately scoped to just these two files and, further down, the
+ * PR-6 planner `src/embed-rematch.ts` (not all of `src/`, which `tests/unit/fence.test.ts` and
+ * `tests/lint/fence.test.ts` already cover for the rest of the plugin).
  *
  * Also checks the module's exports don't creep into PR-4's territory (similarity/threshold/
  * matcher functions).
@@ -58,6 +58,40 @@ describe("purity (F1/F8/F9): src/normalize.ts and src/anchors.ts have no I/O", (
 			});
 		});
 	}
+});
+
+/**
+ * PR-6: the embed re-match planner (src/embed-rematch.ts) is the same kind of module: text and
+ * anchors in, a plan out. It may import the matcher, the anchors and their types, and nothing from
+ * Obsidian, CodeMirror, Node or the DOM. The only scheduling it does is awaiting the `yieldToHost`
+ * it is handed, so it names no timer.
+ */
+describe("purity (PR-6): src/embed-rematch.ts imports no Obsidian, CodeMirror, Node or DOM API", () => {
+	const file = join(ROOT, "src", "embed-rematch.ts");
+	const text = readFileSync(file, "utf8");
+	const code = stripComments(text);
+
+	it.each(FORBIDDEN_IMPORTS)("does not import or require $label", ({ pattern }) => {
+		expect(text).not.toMatch(pattern);
+	});
+
+	it.each(FORBIDDEN_GLOBALS)("does not use $label", ({ pattern }) => {
+		expect(code).not.toMatch(pattern);
+	});
+
+	it.each([
+		{ label: "window", pattern: /\bwindow\b/ },
+		{ label: "a timer (setTimeout, setInterval, requestAnimationFrame)", pattern: /\b(?:setTimeout|setInterval|requestAnimationFrame|queueMicrotask)\b/ },
+		{ label: "a DOM type (Element, HTMLElement, Document, MutationObserver)", pattern: /\b(?:Element|HTMLElement|Document|MutationObserver|Node)\b/ },
+	])("does not use $label", ({ pattern }) => {
+		expect(code).not.toMatch(pattern);
+	});
+
+	it("imports only the local pure modules (./anchors, ./matcher)", () => {
+		const sources = Array.from(text.matchAll(/from\s+["']([^"']+)["']/g)).map((m) => m[1]);
+		expect(sources.length).toBeGreaterThan(0);
+		for (const source of sources) expect(["./anchors", "./matcher"]).toContain(source);
+	});
 });
 
 describe("exports: no similarity, threshold or matcher function (PR-4's territory)", () => {

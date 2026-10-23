@@ -4,13 +4,19 @@
  * `loadData`/`saveData` implemented the same way Obsidian's own `Plugin.loadData`/`saveData` do
  * (read/parse, or stringify/write, that file) — not a fake in-memory stand-in.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FoldStore } from "../../src/fold-store";
 import { legacyLoadThenSave } from "../fixtures/legacy-sanitise-0.1.1";
 import { seedData, SEED_EMBEDS, SEED_FILES } from "../fixtures/embed-seed";
+import { buildAnchors } from "../../src/anchors";
+import { sliceEmbed } from "../../src/embed-slice";
+import * as similarityModule from "../../src/similarity";
+import type { EmbedFoldRecord, StoredAnchor } from "../../src/types";
+import { SOURCE, SOURCE_TEXT, World } from "../fixtures/embed-recording-world";
+import { attachRestorer, foldedRows } from "../fixtures/embed-restore-world";
 
 const tempDirs: string[] = [];
 
@@ -267,4 +273,102 @@ describe("data.json integration: embed records (ticket warkworth-21, PR-1)", () 
 			expect(back.embedSize).toBe(0);
 		});
 	});
+});
+
+describe("data.json integration: a re-matched embed record (ticket warkworth-21, PR-6)", () => {
+	const HOST = "Salesforce Tech Test Rocketship Course.md";
+	const HOST_TEXT = "![[Competitive Coding Fundamentals#^0169a6]]\n";
+	const LESSON_8 = "- [ ] Lesson 8: Collections and frequency counting ^0169a6";
+	const RENAMED_TEXT = SOURCE_TEXT.replace(LESSON_8, "- [ ] Lesson 8 (revised): Collections and frequency counting ^0169a6");
+	const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+	const worlds: World[] = [];
+
+	afterEach(() => {
+		for (const w of worlds.splice(0)) w.recorder.dispose();
+		document.body.replaceChildren();
+		vi.restoreAllMocks();
+	});
+
+	/** What Dan's fold of Lesson 8 left in data.json, against the source as it was. */
+	function storedLesson8(): EmbedFoldRecord {
+		const slice = sliceEmbed(SOURCE_TEXT, "^0169a6");
+		const anchor = buildAnchors(slice?.text ?? "").find((block) => block.anchor.text.startsWith("lesson 8"))?.anchor;
+		return {
+			host: HOST,
+			target: SOURCE,
+			subpath: "^0169a6",
+			occurrence: 0,
+			contentHash: slice?.hash ?? "",
+			folds: [anchor as unknown as StoredAnchor],
+			dormant: [],
+		};
+	}
+
+	/** A restorer over a real file-backed store, a host with the embed, and the source text given.
+	 * Real time: the render window, the pass and the re-check all run. */
+	async function openHost(store: FoldStore, sourceText: string): Promise<{ w: World; embed: HTMLElement }> {
+		const w = new World();
+		worlds.push(w);
+		w.addNote(SOURCE, sourceText);
+		const restorer = attachRestorer(w, { store });
+		const host = w.addHost(HOST, "live-preview", HOST_TEXT);
+		await sleep(900);
+		await restorer.whenIdle();
+		restorer.dispose();
+		return { w, embed: host.embeds[0] };
+	}
+
+	it("the refreshed anchors and content hash survive save and load, and a later render needs no matcher", async () => {
+		const { dataPath, loadData, saveData } = await makeTempVault();
+		const note = { contentHash: "n1", folds: [], dormant: [] };
+		await writeFile(dataPath, JSON.stringify({ version: 1, files: { "Tasks.md": note }, embeds: [storedLesson8()] }), "utf8");
+		const store = new FoldStore({ loadData, saveData });
+		await store.load();
+
+		// The source was rewritten while Obsidian was closed; the host is opened.
+		const first = await openHost(store, RENAMED_TEXT);
+		expect(foldedRows(first.embed)).toEqual(["Lesson 8 (revised): Collections and frequency counting"]);
+		await store.flush();
+
+		const onDisk = JSON.parse(await readFile(dataPath, "utf8"));
+		const newHash = sliceEmbed(RENAMED_TEXT, "^0169a6")?.hash;
+		expect(newHash).not.toBe(storedLesson8().contentHash);
+		expect(onDisk.embeds).toHaveLength(1);
+		expect(onDisk.embeds[0].contentHash).toBe(newHash);
+		expect(onDisk.embeds[0].folds.map((f: { text: string }) => f.text)).toEqual(["lesson 8 (revised): collections and frequency counting ^0169a6"]);
+		expect(onDisk.embeds[0]).toMatchObject({ host: HOST, target: SOURCE, subpath: "^0169a6", occurrence: 0, dormant: [] });
+		expect(onDisk.files).toEqual({ "Tasks.md": note }); // the note-level section is untouched
+
+		// A fresh load reads back exactly the refreshed record...
+		const reloaded = new FoldStore({ loadData, saveData });
+		await reloaded.load();
+		expect(reloaded.embedRecords()).toEqual(onDisk.embeds);
+
+		// ...and rendering the embed again, source unchanged, re-applies it without the matcher or a write.
+		const similarity = vi.spyOn(similarityModule, "similarity");
+		const bytes = await readFile(dataPath, "utf8");
+		const second = await openHost(reloaded, RENAMED_TEXT);
+		expect(foldedRows(second.embed)).toEqual(["Lesson 8 (revised): Collections and frequency counting"]);
+		expect(similarity).not.toHaveBeenCalled();
+		await reloaded.flush();
+		expect(await readFile(dataPath, "utf8")).toBe(bytes);
+	}, 20_000);
+
+	it("a file with no `embeds` section loads unchanged, and rendering an embed adds none", async () => {
+		const { dataPath, loadData, saveData } = await makeTempVault();
+		const original = JSON.stringify({ version: 1, files: { "Tasks.md": { contentHash: "n1", folds: [], dormant: [] } } });
+		await writeFile(dataPath, original, "utf8");
+		const store = new FoldStore({ loadData, saveData });
+		await store.load();
+		expect(store.embedSize).toBe(0);
+		expect(store.size).toBe(1);
+
+		const { embed } = await openHost(store, RENAMED_TEXT); // an embed renders with nothing stored for it
+		expect(foldedRows(embed)).toEqual([]);
+		await store.flush();
+
+		expect(store.embedSize).toBe(0);
+		expect(JSON.parse(await readFile(dataPath, "utf8"))).toEqual(JSON.parse(original));
+		expect(await readFile(dataPath, "utf8")).not.toContain("embeds");
+	}, 20_000);
 });

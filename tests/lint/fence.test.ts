@@ -156,17 +156,18 @@ describe("fence: PR-5 embed restore files", () => {
 		expect(restorer).not.toMatch(/\baddCommand\b|\baddSettingTab\b|\baddRibbonIcon\b|\baddStatusBarItem\b|\bregisterView\b/);
 	});
 
-	it("the restorer never writes the store, and never reads a note's own state (F2)", () => {
+	it("the restorer's only store calls are the read of the one embed's record and its refresh after a re-match, and it never reads a note's own state (F2)", () => {
 		expect(restorer).not.toMatch(/\.files\b|\bstore\.get\s*\(|\.embedRecords\s*\(/);
-		// The only store call is the read of the one embed's record.
+		// PR-6: the one write is `setEmbed`, bringing a changed slice's anchors and hash up to date.
 		const calls = [...restorer.matchAll(/\bstore\.(\w+)/g)].map((m) => m[1]);
-		expect(new Set(calls)).toEqual(new Set(["getEmbed"]));
+		expect(new Set(calls)).toEqual(new Set(["getEmbed", "setEmbed"]));
 		expect(readFileSync(join(SRC, "embed-fold-restorer.ts"), "utf8")).toMatch(/store:\s*\{\s*getEmbed\(id: EmbedIdentity\)/);
 	});
 
 	it("restore reuses buildAnchors and matchAnchors from the existing modules, with no second matcher and no copied constants", () => {
 		expect(restorer).toMatch(/import\s*\{[^}]*\bbuildAnchors\b[^}]*\}\s*from\s*"\.\/anchors"/);
-		expect(restorer).toMatch(/import\s*\{\s*matchAnchors\s*\}\s*from\s*"\.\/matcher"/);
+		// PR-6: the matcher call moved into the re-match planner (src/embed-rematch.ts), which the restorer calls.
+		expect(restorer).toMatch(/import\s*\{[^}]*\bplanEmbedRematch\b[^}]*\}\s*from\s*"\.\/embed-rematch"/);
 		const matcherText = readFileSync(join(SRC, "matcher.ts"), "utf8");
 		const constants = [...matcherText.matchAll(/^export const (\w+)\s*=\s*([\d.]+);/gm)];
 		expect(constants.length).toBeGreaterThan(0);

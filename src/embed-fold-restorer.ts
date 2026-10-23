@@ -24,15 +24,22 @@
  *  3. The record under that key is read with `store.getEmbed`. Nothing else in the store is read:
  *     never `files[source]` (F2). No record, or an empty one, means the embed starts fully
  *     expanded and nothing Obsidian shows is adopted (G13).
- *  4. The record's folds are re-matched against the slice text only, with `buildAnchors` and
- *     `matchAnchors` unchanged (G3), and `planEmbedRestore` compares the result with what the
- *     embed's arrows show: stored folds Obsidian did not restore are applied, strays are
- *     unfolded (E4).
- *  5. The changes are made by clicking the embed's own arrows, the hook the probe proved.
+ *  4. The record's folds are placed on the slice text only (src/embed-rematch.ts, PR-6): the
+ *     same slice as the record's hash re-applies the stored set without the matcher (G4); a
+ *     changed slice (an agent, sync or `git pull` rewrote the source, or Dan edited it, G3) is
+ *     re-matched with `buildAnchors` and `matchAnchors` unchanged, within 500 folds per embed
+ *     and 5,000 comparisons per host per render pass, in yielded chunks (E7).
+ *     `planEmbedRestore` then compares the result with what the embed's arrows show: stored
+ *     folds Obsidian did not restore are applied, strays are unfolded (E4).
+ *  5. After a successful re-match of a changed slice the record's anchors and content hash are
+ *     brought up to date, so a second edit matches against the latest state. An embed whose
+ *     slice is empty, whose target block is gone, or that ran out of budget keeps its record as
+ *     it was (dormancy is PR-7's).
+ *  6. The changes are made by clicking the embed's own arrows, the hook the probe proved.
  *
- * Restore never records and never writes: the toggles it makes are scripted clicks (untrusted,
- * with no pointer sequence), which the recorder's click-only classifier calls non-user, so the
- * store is byte-identical before and after a restore (rule 2). A user click always wins (E3):
+ * Restore never records: the toggles it makes are scripted clicks (untrusted, with no pointer
+ * sequence), which the recorder's click-only classifier calls non-user (rule 2). Its one store
+ * write is the record refresh in step 5, and only when the slice changed. A user click always wins (E3):
  * before reading the DOM the pass waits for the recorder to finish what it has queued, and if the
  * embed's record changed while the pass was matching it starts over from the new record.
  *
@@ -49,11 +56,11 @@ import { detectEmbedHost } from "./embed-host";
 import type { EmbedHost } from "./embed-host";
 import { parseEmbedLinktext } from "./embed-key";
 import { EMBED_RENDER_SETTLE_MS, EmbedRenderCoalescer } from "./embed-render-coalescer";
+import { HostComparisonBudget, planEmbedRematch } from "./embed-rematch";
 import { planEmbedRestore } from "./embed-restore-plan";
 import type { LiveArrow } from "./embed-restore-plan";
-import { matchAnchors } from "./matcher";
 import type { MatcherOptions } from "./matcher";
-import type { EmbedFoldRecord, EmbedIdentity } from "./types";
+import type { EmbedFoldRecord, EmbedIdentity, StoredAnchor } from "./types";
 
 /** Once a pass has run, the embed is looked at once more after this long (ms), in case Obsidian
  * restored its own folds after the pass and without another render (E4, "late native restore"). */
@@ -63,7 +70,9 @@ const MAX_RESTARTS = 3;
 
 export interface EmbedFoldRestorerDeps {
 	workspace: Workspace;
-	store: { getEmbed(id: EmbedIdentity): EmbedFoldRecord | undefined };
+	/** Read for every pass; written (`setEmbed`) only to bring an embed's anchors and content hash
+	 * up to date after a successful re-match of a changed slice (PR-6, G3). */
+	store: { getEmbed(id: EmbedIdentity): EmbedFoldRecord | undefined; setEmbed(record: EmbedFoldRecord): void };
 	/** The host's current source text. */
 	readHostText: (host: EmbedHost) => string;
 	/** The current text of a vault note, or null when it does not exist. Read-only. */
@@ -84,6 +93,9 @@ export interface EmbedFoldRestorerDeps {
 	verifyDelayMs?: number;
 	/** Test seam for the matcher's caps; production uses the matcher's defaults unchanged. */
 	matcherOptions?: MatcherOptions;
+	/** Comparisons one host may spend per render pass, shared by all its embeds (E7). Defaults to
+	 * 5,000 (the matcher's own cap); a test lowers it. */
+	hostComparisonBudget?: number;
 }
 
 /** The window an element lives in (a pop-out window has its own `MutationObserver`). */
@@ -115,6 +127,10 @@ export class EmbedFoldRestorer {
 	private readonly verifier: EmbedRenderCoalescer<Element, number>;
 	private readonly generations = new WeakMap<Element, number>();
 	private readonly inFlight = new Set<Promise<void>>();
+	/** One comparison budget per host path, for the render pass in progress (E7). Dropped once the
+	 * restorer is quiet (no pass running and no render window open), so the next render starts a
+	 * new pass with a full budget. */
+	private readonly budgets = new Map<string, HostComparisonBudget>();
 	private renderSeq = 0;
 	private disposed = false;
 
@@ -153,6 +169,7 @@ export class EmbedFoldRestorer {
 		this.observers.clear();
 		this.renders.cancelAll();
 		this.verifier.cancelAll();
+		this.budgets.clear();
 	}
 
 	/** How many embeds have a render window open. */
@@ -219,8 +236,18 @@ export class EmbedFoldRestorer {
 			})
 			.finally(() => {
 				this.inFlight.delete(task);
+				if (this.inFlight.size === 0 && this.renders.pendingCount === 0) this.budgets.clear();
 			});
 		this.inFlight.add(task);
+	}
+
+	private budgetFor(hostPath: string): HostComparisonBudget {
+		let budget = this.budgets.get(hostPath);
+		if (budget === undefined) {
+			budget = new HostComparisonBudget(this.deps.hostComparisonBudget);
+			this.budgets.set(hostPath, budget);
+		}
+		return budget;
 	}
 
 	private stale(el: Element, generation: number): boolean {
@@ -270,15 +297,22 @@ export class EmbedFoldRestorer {
 				if (anchor !== null) storedAnchors.push(anchor);
 			}
 
-			// The same builder and matcher a note's folds use, over the slice text alone.
+			// The source note changed so that the slice is empty: nothing to place, nothing to change.
+			// The record is left as it was (dormancy is PR-7's).
+			if (resolved.sliceText.trim() === "") return;
+
+			// The same builder and matcher a note's folds use, over the slice text alone (G3).
 			const candidates: AnchoredBlock[] = storedAnchors.length > 0 ? buildAnchors(resolved.sliceText) : [];
-			const matches =
-				storedAnchors.length > 0
-					? await matchAnchors(storedAnchors, candidates.map((c) => c.anchor), {
-							yieldToHost: () => new Promise<void>((resolve) => window.setTimeout(resolve, 0)),
-							...this.deps.matcherOptions,
-						})
-					: [];
+			const rematch = await planEmbedRematch({
+				stored: storedAnchors,
+				storedHash: snapshot?.contentHash,
+				sliceHash: resolved.sliceHash,
+				candidates,
+				budget: this.budgetFor(host.file.path),
+				yieldToHost: () => new Promise<void>((resolve) => window.setTimeout(resolve, 0)),
+				matcherOptions: this.deps.matcherOptions,
+			});
+			const matches = rematch.matches;
 
 			await this.deps.whenRecorded();
 			if (this.stale(el, generation)) return;
@@ -293,6 +327,24 @@ export class EmbedFoldRestorer {
 				collapsed: arrow.indicator.classList.contains(COLLAPSED_CLASS),
 			}));
 			const plan = planEmbedRestore({ matches, candidates, arrows: live });
+			// Out of comparison budget: some stored folds could not be placed this pass, so what the
+			// embed shows is not second-guessed either. Folds that were placed are applied; nothing is
+			// unfolded, and the record is not touched (E7).
+			if (rematch.budgetExhausted) plan.unfold = [];
+
+			// G3/G4: the slice changed and the folds were placed on it: the record now describes the
+			// new slice, so a second edit matches against the latest state. No await since the check
+			// above, so this cannot overwrite a fold or unfold Dan has just made (E3).
+			if (rematch.update !== null) {
+				const current = this.deps.store.getEmbed(resolved.identity);
+				if (current !== undefined) {
+					this.deps.store.setEmbed({
+						...current,
+						contentHash: rematch.update.contentHash,
+						folds: rematch.update.folds as unknown as StoredAnchor[],
+					});
+				}
+			}
 			for (const i of [...plan.fold, ...plan.unfold]) {
 				const indicator = arrows[i].indicator as HTMLElement;
 				if (typeof indicator.click === "function") indicator.click();

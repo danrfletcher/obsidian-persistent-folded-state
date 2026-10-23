@@ -598,7 +598,9 @@ describe.each(MODES)("%s host: E3 at the boundaries of a pass", (mode) => {
 		expect(clicked).toBe(true);
 		expect(clicks).toHaveBeenCalledTimes(1); // the restore did not fold it again from the old match
 		expect(foldedRows(host.embeds[0]).map((t) => t.slice(0, 8))).toEqual(["Lesson 3"]);
-		expect(r.w.store.embedRecords()[0].folds.map((f) => f.text)).toEqual(["lesson 3: graphs"]);
+		// Lesson 2 stays out of the record (his click won); Lesson 3's anchor now reads as the
+		// slice does (PR-6: a successful re-match refreshes the record).
+		expect(r.w.store.embedRecords()[0].folds.map((f) => f.text)).toEqual(["lesson 3: graphs and trees"]);
 	});
 });
 

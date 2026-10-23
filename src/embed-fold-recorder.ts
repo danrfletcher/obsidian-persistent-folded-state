@@ -51,6 +51,7 @@ import type { EmbedCapability, EmbedHostModeId, EmbedKind } from "./embed-capabi
 import { detectEmbedHost } from "./embed-host";
 import type { EmbedHost } from "./embed-host";
 import { findEmbeds, parseEmbedLinktext } from "./embed-key";
+import { HostComparisonBudget, planEmbedRematch } from "./embed-rematch";
 import { sliceEmbed } from "./embed-slice";
 import { normalizeText } from "./normalize";
 import type { EmbedFoldRecord, EmbedIdentity, EmbedLinkId, StoredAnchor } from "./types";
@@ -570,8 +571,40 @@ export class EmbedFoldRecorder {
 		const anchor = anchorForToggle(resolved.sliceText, ctx.toggle);
 		if (anchor === null) return;
 
-		const next = applyEmbedFold(this.deps.store.getEmbed(resolved.identity), resolved.identity, resolved.sliceHash, anchor, job.folded);
+		const existing = await this.currentRecord(resolved);
+		const next = applyEmbedFold(existing, resolved.identity, resolved.sliceHash, anchor, job.folded);
 		if (next !== null) this.deps.store.setEmbed(next);
+	}
+
+	/**
+	 * The embed's record as the slice reads now (PR-6, E3). A record whose hash is not the slice's
+	 * was written for an earlier text of the source; its anchors may no longer read like the
+	 * block the user just clicked (a line was reworded and the re-match has not run yet), so an
+	 * unfold would not find the anchor to remove and the pending re-match would fold the block
+	 * again over his click. The stored anchors are first placed on the current slice with the same
+	 * planner the re-match uses, so his click lands on the right anchor and wins.
+	 */
+	private async currentRecord(resolved: ResolvedEmbed): Promise<EmbedFoldRecord | undefined> {
+		const existing = this.deps.store.getEmbed(resolved.identity);
+		if (existing === undefined || existing.contentHash === resolved.sliceHash) return existing;
+		const stored: Anchor[] = [];
+		for (const raw of existing.folds) {
+			const parsed = parseAnchor(raw);
+			if (parsed !== null) stored.push(parsed);
+		}
+		if (stored.length === 0) return existing;
+		const outcome = await planEmbedRematch({
+			stored,
+			storedHash: existing.contentHash,
+			sliceHash: resolved.sliceHash,
+			candidates: buildAnchors(resolved.sliceText),
+			budget: new HostComparisonBudget(),
+			yieldToHost: () => new Promise<void>((resolve) => window.setTimeout(resolve, 0)),
+		});
+		// Read again: the restore may have refreshed the record while the planner was yielding.
+		const latest = this.deps.store.getEmbed(resolved.identity);
+		if (latest === undefined || latest.contentHash === resolved.sliceHash || outcome.update === null) return latest;
+		return { ...latest, contentHash: outcome.update.contentHash, folds: outcome.update.folds as unknown as StoredAnchor[] };
 	}
 }
 
