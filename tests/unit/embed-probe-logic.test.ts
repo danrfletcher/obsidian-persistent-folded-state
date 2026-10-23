@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { comboFor, foldMemoryAnswer as foldMemoryAnswerTyped, guardFixtureFolder, installFixtures, removeFixtureFolder, retention } from "../../scripts/e2e-embed-probe.mjs";
+import { LAZY_NOTE, buildReport, comboFor, editRetentionCaveat, foldMemoryAnswer as foldMemoryAnswerTyped, guardFixtureFolder, installFixtures, removeFixtureFolder, reportMarkdown, retention, writeReports } from "../../scripts/e2e-embed-probe.mjs";
 
 const UNOBSERVABLE = "unobservable";
 const KINDS = ["block", "heading", "whole-note"] as const;
@@ -324,5 +324,84 @@ describe("the second-host fixture carries an embed of every kind the fold-memory
 		expect(text).toContain("![[Probe Fundamentals#^0169a6]]");
 		expect(text).toContain("![[Probe Fundamentals#Lesson 8]]");
 		expect(text).toContain("![[Probe Whole Note]]");
+	});
+});
+
+// ---- a partly failed probe still writes a complete report (G18 edge case, PR-2 R7) ------------------------
+describe("buildReport and writeReports: a probe that mostly failed still writes valid, schema-complete output", () => {
+	const dirs: string[] = [];
+	afterEach(() => {
+		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+	});
+
+	/** What the probe's state file holds when only the setup step got as far as recording an error. */
+	const partialState = (): Any => ({
+		startedAt: "2026-10-23T00:00:00.000Z",
+		vault: null,
+		obsidian: null,
+		preSnapshot: null,
+		modes: {},
+		hover: null,
+		fixtureRestored: null,
+		stepErrors: [{ step: "open-host", mode: "lp", error: "CDP connection refused" }],
+	});
+
+	it("gives all six combinations as unsupported, each with a reason", () => {
+		const report = buildReport(partialState()) as Any;
+		expect(report.combinations).toHaveLength(6);
+		for (const mode of ["live-preview", "reading-view"]) {
+			for (const kind of KINDS) {
+				expect(report.verdicts[mode][kind].verdict).toBe("unsupported");
+				expect(String(report.verdicts[mode][kind].reason).length).toBeGreaterThan(0);
+			}
+		}
+	});
+
+	it("keeps every top-level field of the schema, with the unobservable marker where nothing was read", () => {
+		const report = buildReport(partialState()) as Any;
+		expect(Object.keys(report).sort()).toEqual(
+			["combinations", "fixtureCoverage", "fixtureRestored", "foldMemory", "generatedAt", "generatedBy", "hostDetection", "hoverPreview", "lazyRendering", "obsidianVersion", "schemaVersion", "stepErrors", "verdicts"].sort(),
+		);
+		expect(report.schemaVersion).toBe(1);
+		expect(report.obsidianVersion).toBe(UNOBSERVABLE);
+		expect(report.hoverPreview).toBe(UNOBSERVABLE);
+		expect(report.lazyRendering).toEqual({ "live-preview": UNOBSERVABLE, "reading-view": UNOBSERVABLE });
+		expect(report.stepErrors).toEqual(partialState().stepErrors);
+	});
+
+	it("writes embed-probe.json that parses back to the same report, plus both markdown files", () => {
+		const dir = mkdtempSync(join(tmpdir(), "embed-probe-docs-"));
+		dirs.push(dir);
+		const report = buildReport(partialState()) as Any;
+		writeReports({ writeDocs: true }, report, dir);
+		expect(readdirSync(dir).sort()).toEqual(["embed-probe.json", "embed-probe.md", "embed-release-gaps.md"]);
+		const written = JSON.parse(readFileSync(join(dir, "embed-probe.json"), "utf8"));
+		expect(written).toEqual(JSON.parse(JSON.stringify(report)));
+		expect(readFileSync(join(dir, "embed-release-gaps.md"), "utf8")).toContain("Live Preview, block embed (unsupported)");
+		expect(readFileSync(join(dir, "embed-probe.md"), "utf8")).toContain("CDP connection refused");
+	});
+
+	it("writes nothing with --no-write-docs", () => {
+		const dir = join(mkdtempSync(join(tmpdir(), "embed-probe-docs-")), "docs");
+		dirs.push(join(dir, ".."));
+		writeReports({ writeDocs: false }, buildReport(partialState()), dir);
+		expect(existsSync(dir)).toBe(false);
+	});
+});
+
+describe("report wording that keeps two readings honest (PR-2 R5, R8)", () => {
+	it("the edit-retention caveat is added only to a no for a block or heading embed", () => {
+		expect(editRetentionCaveat({ kind: "block", retainedAcrossSourceEdit: false })).toContain("interference");
+		expect(editRetentionCaveat({ kind: "heading", retainedAcrossSourceEdit: false })).toContain("interference");
+		expect(editRetentionCaveat({ kind: "whole-note", retainedAcrossSourceEdit: false })).toBe("");
+		expect(editRetentionCaveat({ kind: "block", retainedAcrossSourceEdit: true })).toBe("");
+		expect(editRetentionCaveat({ kind: "block", retainedAcrossSourceEdit: UNOBSERVABLE })).toBe("");
+	});
+
+	it("the lazy-rendering section says Live Preview embeds unmount and remount on scroll", () => {
+		const md = reportMarkdown(buildReport({ ...{ startedAt: "", modes: {}, hover: null, fixtureRestored: null, stepErrors: [] } }) as Any);
+		expect(md).toContain(LAZY_NOTE);
+		expect(LAZY_NOTE).toContain("unmounted");
+		expect(LAZY_NOTE).toContain("not measured");
 	});
 });

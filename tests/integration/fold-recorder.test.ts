@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EditorState } from "@codemirror/state";
+import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { editorInfoField } from "../../tests/mocks/obsidian";
@@ -304,5 +304,43 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 			expect(record?.folds).toHaveLength(1);
 			expect((record?.folds[0] as { text: string }).text).toBe("new line");
 		});
+	});
+});
+
+describe("fold recorder: stored entries and effects it does not own", () => {
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	it("a stored entry that is not a well-formed anchor is dropped when the next fold is recorded, and the other stored anchors stay", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		const first = lineStart(view, LINES.heading);
+		view.dispatch({ effects: [foldEffect.of({ from: first, to: first + 1 })] });
+		const kept = store.get(NOTE_PATH)?.folds[0];
+		expect(kept).toBeDefined();
+		// A raw-text record of the kind the PR-2 store wrote, sitting beside the good anchor.
+		store.set(NOTE_PATH, { ...(store.get(NOTE_PATH) as FileFoldRecord), folds: [kept as never, "- Plain list item" as never] });
+
+		const second = lineStart(view, LINES.task);
+		view.dispatch({ effects: [foldEffect.of({ from: second, to: second + 1 })] });
+
+		const folds = store.get(NOTE_PATH)?.folds as unknown as Array<{ kind: string } | string>;
+		expect(folds).toHaveLength(2);
+		expect(folds.every((f) => typeof f !== "string")).toBe(true);
+		expect(folds.map((f) => (f as { kind: string }).kind)).toEqual(["heading", "task"]);
+	});
+
+	it("an effect that is neither a fold nor an unfold, sent beside a fold, changes nothing in the stored set", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		const other = StateEffect.define<number>();
+		const from = lineStart(view, LINES.heading);
+
+		view.dispatch({ effects: [other.of(1), foldEffect.of({ from, to: from + 1 }), other.of(2)] });
+
+		const folds = store.get(NOTE_PATH)?.folds as unknown as Array<{ kind: string }>;
+		expect(folds).toHaveLength(1);
+		expect(folds[0].kind).toBe("heading");
 	});
 });

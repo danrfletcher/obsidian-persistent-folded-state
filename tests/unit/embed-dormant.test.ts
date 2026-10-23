@@ -14,7 +14,7 @@ import { buildAnchors, parseAnchor } from "../../src/anchors";
 import type { Anchor } from "../../src/anchors";
 import { MAX_DORMANT_AGE_MS } from "../../src/dormant";
 import { planEmbedPass } from "../../src/embed-anchor-dormancy";
-import { EmbedDormancyTracker, classifyEmbedRecord } from "../../src/embed-dormancy";
+import { EmbedDormancyTracker, HEADING_RENAME_GRACE_MS, classifyEmbedRecord } from "../../src/embed-dormancy";
 import { expireEmbedRecords, isEmbedDormancyExpired, isValidDormantSince, nextEmbedDormancy } from "../../src/embed-dormant";
 import type { EmbedDormancyAction, EmbedPresence } from "../../src/embed-dormant";
 import { HostComparisonBudget } from "../../src/embed-rematch";
@@ -308,6 +308,84 @@ describe("EmbedDormancyTracker.reconcileHost: reads only, and only for records t
 	});
 });
 
+describe("EmbedDormancyTracker.reconcileHost: a heading link waits before its record is stamped (PR-8 R1)", () => {
+	function fakeStore(records: EmbedFoldRecord[]) {
+		const verdicts: (EmbedPresence | undefined)[][] = [];
+		return {
+			verdicts,
+			store: {
+				embedRecordsForHost: (host: string) => records.filter((r) => r.host === host),
+				reconcileEmbedDormancy: (host: string, presenceOf: (r: EmbedFoldRecord) => EmbedPresence | undefined) => {
+					verdicts.push(records.filter((r) => r.host === host).map(presenceOf));
+					return { stamped: 0, revived: 0, forgotten: 0 };
+				},
+			},
+		};
+	}
+	const headingRecord = (over: Partial<EmbedFoldRecord> = {}): EmbedFoldRecord => record({ subpath: "Chapter Two", ...over });
+	const renamedText = "![[Source#Chapter Two (revised)]]\n";
+
+	it("a heading-linked record seen absent is not assessed until the wait is over, then it is stamped", async () => {
+		let now = T0;
+		const { store, verdicts } = fakeStore([headingRecord()]);
+		const tracker = new EmbedDormancyTracker({ store, ...deps(vaultWith()), now: () => now });
+
+		expect(await tracker.reconcileHost("Host.md", renamedText)).toEqual({ deferred: 1 });
+		now = T0 + HEADING_RENAME_GRACE_MS - 1;
+		expect(await tracker.reconcileHost("Host.md", renamedText)).toEqual({ deferred: 1 });
+		now = T0 + HEADING_RENAME_GRACE_MS;
+		expect(await tracker.reconcileHost("Host.md", renamedText)).toEqual({ deferred: 0 });
+		expect(verdicts).toEqual([[undefined], [undefined], ["absent"]]);
+	});
+
+	it("a heading-linked record seen broken waits the same way", async () => {
+		const vault = vaultWith();
+		vault.unreadable.add("Source.md");
+		const { store, verdicts } = fakeStore([headingRecord()]);
+		const tracker = new EmbedDormancyTracker({ store, ...deps(vault), now: () => T0 });
+		expect(await tracker.reconcileHost("Host.md", "![[Source#Chapter Two]]\n")).toEqual({ deferred: 1 });
+		expect(verdicts).toEqual([[undefined]]);
+	});
+
+	it("a block embed and a whole-note embed are stamped at once, and so is a heading record when the wait is off", async () => {
+		for (const [records, options] of [
+			[[record({ subpath: "^0169a6" })], {}],
+			[[record({ subpath: "" })], {}],
+			[[headingRecord()], { headingGraceMs: 0 }],
+		] as const) {
+			const { store, verdicts } = fakeStore([...records]);
+			const tracker = new EmbedDormancyTracker({ store, ...deps(vaultWith()), now: () => T0, ...options });
+			expect(await tracker.reconcileHost("Host.md", "![[Other]]\n")).toEqual({ deferred: 0 });
+			expect(verdicts).toEqual([["absent"]]);
+		}
+	});
+
+	it("a nested record with a heading link in its chain waits too", async () => {
+		const nested = record({ subpath: "^0169a6", outer: [{ target: "Source.md", subpath: "Chapter Two", occurrence: 0 }] });
+		const { store, verdicts } = fakeStore([nested]);
+		const tracker = new EmbedDormancyTracker({ store, ...deps(vaultWith()), now: () => T0 });
+		expect(await tracker.reconcileHost("Host.md", renamedText)).toEqual({ deferred: 1 });
+		expect(verdicts).toEqual([[undefined]]);
+	});
+
+	it("the wait starts again when the embed was live in between, and an already stamped record is not held", async () => {
+		let now = T0;
+		const { store, verdicts } = fakeStore([headingRecord()]);
+		const tracker = new EmbedDormancyTracker({ store, ...deps(vaultWith()), now: () => now });
+		await tracker.reconcileHost("Host.md", renamedText);
+		now = T0 + 6000;
+		await tracker.reconcileHost("Host.md", "![[Source#Chapter Two]]\n"); // back
+		now = T0 + HEADING_RENAME_GRACE_MS + 1;
+		expect(await tracker.reconcileHost("Host.md", renamedText)).toEqual({ deferred: 1 }); // not 10 s since the first sighting
+		expect(verdicts).toEqual([[undefined], ["live"], [undefined]]);
+
+		const stamped = fakeStore([headingRecord({ dormantSince: T0 })]);
+		const later = new EmbedDormancyTracker({ store: stamped.store, ...deps(vaultWith()), now: () => T0 });
+		expect(await later.reconcileHost("Host.md", renamedText)).toEqual({ deferred: 0 });
+		expect(stamped.verdicts).toEqual([["absent"]]);
+	});
+});
+
 // --- Dormant folds inside a live embed (G14, G16, E7, E8) ------------------------------------------
 
 const SLICE_TEXT = sliceEmbed(SOURCE_TEXT, "")?.text ?? "";
@@ -471,9 +549,9 @@ describe("rename guard: the dormancy step is one function that no rename handler
 		}
 	});
 
-	it("the only callers of the host reconcile are the restore pass and the file-open handler", () => {
+	it("the only callers of the host reconcile are the restore pass and the file-open handler (via reconcileOnOpen)", () => {
 		const callers = ["main.ts", "embed-fold-restorer.ts", "embed-fold-recorder.ts", "vault-lifecycle.ts", "fold-restorer.ts", "open-restore.ts"].filter((name) =>
-			/\.reconcileHost\s*\(/.test(code(name))
+			/\.reconcile(Host|OnOpen)\s*\(/.test(code(name))
 		);
 		expect(callers.sort()).toEqual(["embed-fold-restorer.ts", "main.ts"]);
 	});

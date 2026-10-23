@@ -277,6 +277,11 @@ describe("sanitizeStoreData: bad embed records are dropped, neighbours survive (
 		{ label: "folds missing", record: embedWithout("folds") },
 		{ label: "folds not an array (object)", record: goodEmbed({ folds: {} }) },
 		{ label: "folds not an array (string)", record: goodEmbed({ folds: "x" }) },
+		{ label: "dormantSince a string (PR-7 R5)", record: goodEmbed({ dormantSince: "soon" }) },
+		{ label: "dormantSince negative", record: goodEmbed({ dormantSince: -1 }) },
+		{ label: "dormantSince NaN", record: goodEmbed({ dormantSince: Number.NaN }) },
+		{ label: "dormantSince Infinity", record: goodEmbed({ dormantSince: Number.POSITIVE_INFINITY }) },
+		{ label: "dormantSince null", record: goodEmbed({ dormantSince: null }) },
 	];
 
 	it.each(bad)("$label: that record is dropped, the neighbours on both sides survive", ({ record }) => {
@@ -291,6 +296,13 @@ describe("sanitizeStoreData: bad embed records are dropped, neighbours survive (
 	it("an embeds array of only bad records yields no embeds key", () => {
 		const result = sanitizeStoreData(withEmbeds(["x", 1, null, embedWithout("host")]));
 		expect("embeds" in result).toBe(false);
+	});
+
+	it("a finite, non-negative dormantSince (0 included) is kept as written (PR-7 R5)", () => {
+		for (const dormantSince of [0, 1_700_000_000_000]) {
+			const record = goodEmbed({ dormantSince });
+			expect(sanitizeStoreData(withEmbeds([record])).embeds).toEqual([record]);
+		}
 	});
 
 	it("occurrence 0 is valid, and so is a subpath of '' (whole-note embed)", () => {

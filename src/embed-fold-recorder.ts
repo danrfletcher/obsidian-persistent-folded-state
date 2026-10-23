@@ -63,7 +63,13 @@ export const COLLAPSED_CLASS = "is-collapsed";
 
 /** A pointerdown counts toward a click only if it came this long (ms) or less before it. */
 const POINTER_WINDOW_MS = 3000;
-/** How long (ms) after a user input an arrow's class change is still attributed to it. */
+/** How long (ms) after a user input an arrow's class change is still attributed to it. This is
+ * also how long an input's credit can wait for a class change: a trusted click that Obsidian
+ * ignores leaves its credit for this long, and a render-time toggle of the same arrow inside the
+ * window would be recorded as a fold (PR-4 R2). The window is not shortened to close that
+ * coincidence: a missed class change of a real fold costs the user's fold (the restore would
+ * undo it), which is worse than the narrow false positive, and how soon Obsidian's own handler
+ * toggles the arrow has not been measured. */
 const ARM_WINDOW_MS = 300;
 
 // --- Pure rules (no DOM) ----------------------------------------------------------------------
@@ -91,16 +97,25 @@ function familyOf(anchor: Anchor): "heading" | "list" | null {
 /**
  * An anchor's text as Obsidian shows it in a rendered row, so it can be compared with the row's
  * text read from the DOM (docs/embed-probe.md: the row of "- Lesson 8 ... ^0169a6" reads
- * "Lesson 8 ..."). Drops a trailing block id, shows `[[target|alias]]` as `alias` and
- * `[[target]]` as `target`, and `[text](url)` as `text`. Anchor text is already normalized, so
- * the result stays normalized (whitespace collapsed and trimmed).
+ * "Lesson 8 ..."). Drops a trailing block id and any embed in the row (`rowText` removes
+ * `.internal-embed`, so `- ![[X]]` reads as an empty row), shows `[[target|alias]]` as `alias`,
+ * `[[target]]` as `target`, `[[note#heading]]` as `note > heading` (a link to a heading of the
+ * same note, `[[#heading]]`, as `heading`), `[text](url)` as `text` and `code` without its
+ * backticks. Anchor text is already normalized, so the result stays normalized (whitespace
+ * collapsed and trimmed). A row this still gets wrong falls back to the arrow's position
+ * (`blockIndexForToggle`), never to a guess.
  */
 export function displayText(anchorText: string): string {
 	return anchorText
 		.replace(/\s+\^[A-Za-z0-9-]+$/, "")
+		.replace(/!\[\[[^\]]*\]\]/g, "")
+		.replace(/!\[[^\]]*\]\([^)]*\)/g, "")
 		.replace(/\[\[([^\]|]*)\|([^\]]*)\]\]/g, "$2")
+		.replace(/\[\[#([^\]]*)\]\]/g, "$1")
+		.replace(/\[\[([^\]#]*)#([^\]]*)\]\]/g, "$1 > $2")
 		.replace(/\[\[([^\]]*)\]\]/g, "$1")
 		.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+		.replace(/(`+)(.+?)\1/g, "$2")
 		.replace(/\s+/g, " ")
 		.trim();
 }
@@ -147,6 +162,13 @@ export function blockIndexForToggle(blocks: readonly AnchoredBlock[], toggle: To
  * untouched, as do the dormant anchors. Unfolding in an embed with no record creates none
  * (state exists only once Dan has folded something, E12), and nothing is ever added for a block
  * nobody clicked (G16). `contentHash` is the hash of the slice the anchors were described over.
+ *
+ * A record this returns never carries `dormantSince`: a click on an embed proves the embed is
+ * live, so rebuilding the record from the click ends any dormancy it was in (the stamp is not
+ * copied from `existing`). That makes the recorder the second writer of the stamp, after
+ * `FoldStore.reconcileEmbedDormancy`, and anything that relies on "only reconcile clears it"
+ * must allow for this (PR-7 R7). A click that changes nothing returns null and leaves the
+ * stamp as it was.
  */
 export function applyEmbedFold(
 	existing: EmbedFoldRecord | undefined,
@@ -234,9 +256,25 @@ export interface EmbedLevelFacts {
 	index: number;
 }
 
-/** Start of the `![` that the host position `pos` belongs to (the widget may report its end). */
+/** Everything that can stand before an embed on its line without being text: indent, quote
+ * markers, one list marker and a task checkbox. */
+const LINE_PREFIX = /^[ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?(?:\[.\][ \t]+)?$/;
+
+/**
+ * Start of the `![` that the host position `pos` belongs to. The widget may report its end, so a
+ * position after the `![` means the nearest one before it. It may also report the start of its
+ * line (not verified for an embed inside a list item, `- ![[X]]`, in Live Preview): when only a
+ * line prefix (indent, quote markers, a list marker, a checkbox) lies between the line start and
+ * `pos`, and the next `![` on that line follows only prefix too, it is that `![` and not the
+ * previous identical embed.
+ */
 function embedStartAt(text: string, pos: number): number {
 	if (text.startsWith("![", pos)) return pos;
+	const lineStart = pos === 0 ? 0 : text.lastIndexOf("\n", pos - 1) + 1;
+	const lineEnd = text.indexOf("\n", pos);
+	const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
+	const ahead = line.indexOf("![", pos - lineStart);
+	if (ahead !== -1 && LINE_PREFIX.test(line.slice(0, ahead))) return lineStart + ahead;
 	const back = text.lastIndexOf("![", pos);
 	return back === -1 ? pos : back;
 }
@@ -244,8 +282,9 @@ function embedStartAt(text: string, pos: number): number {
 /**
  * Which embed of `text` (the host's source, or a containing embed's slice) this element is, as a
  * link with its occurrence index. One identical embed: index 0, no DOM needed. Several: the
- * document position when one is known, else the element's order among the identical embeds in the
- * DOM, but only if the DOM shows as many as the text has. Null when it cannot be told.
+ * element's order among the identical embeds in the DOM when the DOM shows as many as the text
+ * has (it is then the document order, and no editor position is trusted over it); otherwise the
+ * document position when one is known. Null when it cannot be told.
  */
 export function locateEmbed(
 	text: string,
@@ -261,19 +300,27 @@ export function locateEmbed(
 	if (found.length === 0) return null;
 	if (found.length === 1) return { target: me.target, subpath: me.subpath, occurrence: found[0].occurrence };
 
-	if (position !== null) {
+	const fromDom = (): number | null => {
+		const domSame: number[] = [];
+		level.siblingSrcs.forEach((src, i) => {
+			const other = resolveSrc(src, sourcePath, resolve);
+			if (other !== null && same(other)) domSame.push(i);
+		});
+		if (domSame.length !== found.length) return null;
+		const at = domSame.indexOf(level.index);
+		return at === -1 ? null : at;
+	};
+	// The DOM shows every identical embed of the text: its order is the document order, whatever
+	// the editor reports as a position. How a Live Preview widget in a list item reports its
+	// position is not verified against real Obsidian (PR-4 R3), so the position only decides
+	// when the DOM cannot (an embed scrolled out of Live Preview's rendered range, say).
+	const domOccurrence = fromDom();
+	let occurrence = domOccurrence;
+	if (occurrence === null && position !== null) {
 		const before = findEmbeds(sourcePath, text.slice(0, embedStartAt(text, position)), resolve).filter(same).length;
-		return before < found.length ? { target: me.target, subpath: me.subpath, occurrence: before } : null;
+		occurrence = before < found.length ? before : null;
 	}
-
-	const domSame: number[] = [];
-	level.siblingSrcs.forEach((src, i) => {
-		const other = resolveSrc(src, sourcePath, resolve);
-		if (other !== null && same(other)) domSame.push(i);
-	});
-	if (domSame.length !== found.length) return null;
-	const occurrence = domSame.indexOf(level.index);
-	return occurrence === -1 ? null : { target: me.target, subpath: me.subpath, occurrence };
+	return occurrence === null ? null : { target: me.target, subpath: me.subpath, occurrence };
 }
 
 // --- The recorder -----------------------------------------------------------------------------

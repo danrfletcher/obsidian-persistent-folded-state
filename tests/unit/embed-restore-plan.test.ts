@@ -64,8 +64,12 @@ describe("empty store and empty stored set (G13): the embed ends fully expanded"
 		expect(await plan([], [arrow(LESSON_8, true), arrow(COUNT_WORDS, false)])).toEqual({ fold: [], unfold: [0] });
 	});
 
-	it("nothing stored: an arrow whose block could not be told is unfolded when collapsed", async () => {
-		expect(await plan([], [arrow(null, true), arrow(null, false)])).toEqual({ fold: [], unfold: [0] });
+	it("nothing stored: an arrow whose block could not be told is left alone, collapsed or not (PR-5 R2)", async () => {
+		expect(await plan([], [arrow(null, true), arrow(null, false)])).toEqual({ fold: [], unfold: [] });
+	});
+
+	it("nothing stored: the arrows that can be told are still unfolded around one that cannot", async () => {
+		expect(await plan([], [arrow(null, true), arrow(LESSON_8, true)])).toEqual({ fold: [], unfold: [1] });
 	});
 
 	it("no arrows at all plans nothing", async () => {
@@ -112,9 +116,9 @@ describe("stray folds are unfolded (E4: the stored set wins)", () => {
 	});
 
 	it("indices are ascending", async () => {
-		const live = [arrow(COUNT_WORDS, true), arrow(LESSON_8, true), arrow(null, true)];
+		const live = [arrow(COUNT_WORDS, true), arrow(null, true), arrow(LESSON_8, true)];
 		const result = await plan([], live);
-		expect(result.unfold).toEqual([0, 1, 2]);
+		expect(result.unfold).toEqual([0, 2]);
 	});
 });
 

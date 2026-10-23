@@ -61,6 +61,9 @@ export interface EmbedPassOutcome {
 	matches: MatchResult[];
 	/** True when the host's budget ran out before everything was placed: no update is made. */
 	budgetExhausted: boolean;
+	/** Comparisons this pass charged to the host budget (both matcher calls), so a caller that
+	 * throws the outcome away can refund them. */
+	comparisons: number;
 	/** The record changes to write, or null when there is nothing to write. */
 	update: EmbedPassUpdate | null;
 	/** Dormant anchors that matched and moved back to the active set. */
@@ -106,13 +109,14 @@ export async function planEmbedPass(input: EmbedPassInput): Promise<EmbedPassOut
 		storedHash: survivors.length === 0 ? record?.contentHash : undefined,
 		...common,
 	});
-	if (rematch.budgetExhausted) return { matches: rematch.matches, budgetExhausted: true, update: null, promoted: 0, droppedClaimed: 0 };
+	if (rematch.budgetExhausted) return { matches: rematch.matches, budgetExhausted: true, comparisons: rematch.comparisons, update: null, promoted: 0, droppedClaimed: 0 };
 
 	const activeMatches = rematch.matches.slice(0, stored.length);
 	const dormantResults = rematch.matches.slice(stored.length);
 	const split = splitDormantResults(survivors, dormantResults);
 	let stillDormant = split.stillDormant;
 	let droppedClaimed = 0;
+	let comparisons = rematch.comparisons;
 
 	// G14: of the dormant anchors with no match, drop those that would have matched a block an
 	// active fold took. Asked on their own, with no active fold competing.
@@ -121,6 +125,7 @@ export async function planEmbedPass(input: EmbedPassInput): Promise<EmbedPassOut
 	for (const match of activeMatches) if (match.tier !== "none") activeTargets.add(match.target);
 	if (losers.length > 0 && activeTargets.size > 0) {
 		const solo = await planEmbedRematch({ stored: losers.map((l) => l.anchor), storedHash: undefined, ...common });
+		comparisons += solo.comparisons;
 		if (!solo.budgetExhausted) {
 			const verdict = dropDormantClaimedByActive(losers, solo.matches, activeTargets);
 			stillDormant = verdict.kept;
@@ -156,6 +161,7 @@ export async function planEmbedPass(input: EmbedPassInput): Promise<EmbedPassOut
 	return {
 		matches: rematch.matches,
 		budgetExhausted: false,
+		comparisons,
 		// Nothing stored and nothing dormant means nothing to write (E12: no state is created here).
 		update: record === undefined || unchanged ? null : next,
 		promoted: split.matched.length,

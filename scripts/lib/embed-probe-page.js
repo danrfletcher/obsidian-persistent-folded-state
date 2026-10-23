@@ -103,14 +103,18 @@
 		return embed.classList.contains("is-loaded");
 	}
 
-	/** Mirrors src/embed-host.ts's container rule for the probe's report (the plugin's own module
-	 * is covered by the vitest suites; this is the in-page equivalent). */
+	/** Mirrors src/embed-host.ts's detectEmbedHost for the probe's report (the plugin's own module
+	 * is covered by the vitest suites; this is the in-page equivalent, and
+	 * tests/unit/embed-probe-page-rule.test.ts runs both over the same views so they cannot drift).
+	 * Source mode is not a host mode: a Source-mode view is skipped, so the answer is null for an
+	 * embed that only a Source-mode view contains. */
 	function containerRule(el) {
 		if (!el.closest(".internal-embed.markdown-embed")) return null; // media embeds are never hosts
 		for (const leaf of allMarkdownLeaves()) {
 			const view = leaf.view;
+			if (view.getMode() !== "preview" && view.getState().source) continue;
+			const mode = view.getMode() === "preview" ? "reading-view" : "live-preview";
 			if (!surfaceOf(view).contains(el)) continue;
-			const mode = view.getMode() === "preview" ? "reading-view" : view.getState().source ? "source" : "live-preview";
 			return { file: view.file.path, mode };
 		}
 		return null;
@@ -515,6 +519,7 @@
 		closeLeavesFor,
 		closeProbeLeaves,
 		snapshot,
+		containerRule,
 		openHost,
 		openPlain,
 		startRecorder,

@@ -246,6 +246,30 @@ describe.each(MODES)("%s host: a fold the matcher cannot place is dormant inside
 		expect(foldedRows(host.embeds[0])).toEqual([]);
 	});
 
+	it("Dan folds the block himself while its anchor is dormant: his click is the only fold, the dormant duplicate is dropped (PR-7 R3)", async () => {
+		const r = rig();
+		const host = await openWholeNoteAndFold(r);
+		await edit(r, host, ZEBRA_TEXT);
+		expect(records(r)[0].dormant).toHaveLength(1);
+		expect(records(r)[0].folds).toEqual([]);
+
+		// The line is back and the embed has rendered again, but no restore pass has run: Dan folds it.
+		r.w.addNote(SOURCE, SOURCE_TEXT);
+		r.w.rerender(host.embeds[0], host.path);
+		r.w.realClick(arrowFor(host.embeds[0], "Lesson 8"));
+		await r.w.settle();
+		expect(foldTexts(records(r)[0])).toEqual([expect.stringMatching(/^lesson 8/)]);
+
+		// The restore pass that follows sees the dormant anchor claimed by the active fold and drops it.
+		await settleRestore(r.w, r.restorer);
+		expect(foldTexts(records(r)[0])).toEqual([expect.stringMatching(/^lesson 8/)]);
+		expect(records(r)[0].dormant).toEqual([]);
+		await edit(r, host, SOURCE_TEXT);
+		expect(foldTexts(records(r)[0])).toHaveLength(1);
+		expect(records(r)[0].dormant).toEqual([]);
+		expect(foldedRows(host.embeds[0]).map((t) => t.slice(0, 8))).toEqual(["Lesson 8"]);
+	});
+
 	it("while Dan folds the same block himself, the dormant duplicate is dropped: one fold only", async () => {
 		const r = rig();
 		const host = await openWholeNoteAndFold(r);
@@ -257,6 +281,50 @@ describe.each(MODES)("%s host: a fold the matcher cannot place is dormant inside
 		expect(records(r)[0].folds).toEqual(folds);
 		expect(records(r)[0].dormant).toEqual([]);
 		expect(foldedRows(host.embeds[0])).toHaveLength(1);
+	});
+});
+
+// --- One reconcile per burst, made again when the host text changed (PR-7 R6) --------------------
+
+describe.each(MODES)("%s host: the host's dormancy is reconciled again when its text changed during the burst (PR-7 R6)", (mode) => {
+	it("a second embed of the same burst sees the host text as it is now, not the verdict for the old text", async () => {
+		const r = rig();
+		const reconcile = vi.spyOn(EmbedDormancyTracker.prototype, "reconcileHost");
+		const host = r.w.addHost(HOST, mode, `${LESSON_8}\n\n${LESSON_9}\n`);
+		await settleRestore(r.w, r.restorer);
+		reconcile.mockClear();
+
+		// The first embed renders; the second renders 100 ms later, so the burst is still open when
+		// the first one's pass has run.
+		r.w.rerender(host.embeds[0], host.path);
+		await vi.advanceTimersByTimeAsync(100);
+		r.w.rerender(host.embeds[1], host.path);
+		await vi.advanceTimersByTimeAsync(60); // the first window closes: pass 1 reconciles the old text
+		expect(reconcile).toHaveBeenCalledTimes(1);
+		const oldText = `${LESSON_8}\n\n${LESSON_9}\n`;
+		expect(reconcile).toHaveBeenLastCalledWith(HOST, oldText);
+
+		// The host is edited while the second embed still waits for its window.
+		const newText = `${LESSON_8}\n\n${LESSON_9}\n\nnew paragraph\n`;
+		host.view.data = newText;
+		await vi.advanceTimersByTimeAsync(100); // the second window closes: pass 2, before any 400 ms re-check
+
+		expect(reconcile).toHaveBeenCalledTimes(2);
+		expect(reconcile).toHaveBeenLastCalledWith(HOST, newText);
+	});
+
+	it("two embeds of one burst with an unchanged host text still reconcile it once", async () => {
+		const r = rig();
+		const reconcile = vi.spyOn(EmbedDormancyTracker.prototype, "reconcileHost");
+		const host = r.w.addHost(HOST, mode, `${LESSON_8}\n\n${LESSON_9}\n`);
+		await settleRestore(r.w, r.restorer);
+		reconcile.mockClear();
+
+		r.w.rerender(host.embeds[0], host.path);
+		await vi.advanceTimersByTimeAsync(100);
+		r.w.rerender(host.embeds[1], host.path);
+		await vi.advanceTimersByTimeAsync(160); // both windows have closed and both passes have run
+		expect(reconcile).toHaveBeenCalledTimes(1);
 	});
 });
 

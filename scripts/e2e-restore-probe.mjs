@@ -35,7 +35,7 @@
  *                      (Tuesday's section holds Draft proposal and Send invoices, so a check
  *                      made while Tuesday is folded can only see Tuesday: reading "Send invoices"
  *                      or "Outline" as hidden then proves nothing about their own folds.)
- *   --phase report      (re)writes docs/restore-golden-path.md from the gathered state.
+ *   --phase report      (re)writes the report (default: the OS temp dir, not the repo) from the gathered state.
  *   --phase all          setup + rewrite + verify + report in one Obsidian session (the default).
  *
  * This is a container-run harness, not a unit test — see the file comment in
@@ -63,15 +63,23 @@
  *   node scripts/e2e-restore-probe.mjs --phase verify  --note <path>
  *   node scripts/e2e-restore-probe.mjs --phase report
  *
- * Every phase accepts [--cdp-port 9222] [--wait-ms 1000] [--state <path>].
+ * Every phase accepts [--cdp-port 9222] [--wait-ms 1000] [--state <path>] [--report <path>].
+ * The report goes to `pfs-e2e-restore-probe-report.md` in the OS temp dir unless --report says
+ * otherwise, so a run never leaves an untracked file in the worktree. Pass --report
+ * docs/restore-golden-path.md to refresh a copy meant to be committed.
+ *
+ * The rewrite phase overwrites the --note file, so it first checks (scripts/lib/test-vault-guard.mjs)
+ * that the note sits inside a test vault (an enclosing folder named test-vault, or one holding a
+ * .pfs-test-vault file) and stops if not.
  */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
+import { assertNoteInTestVault } from "./lib/test-vault-guard.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const REPORT_PATH = join(ROOT, "docs", "restore-golden-path.md");
+export const DEFAULT_REPORT_PATH = join(tmpdir(), "pfs-e2e-restore-probe-report.md");
 const DEFAULT_STATE_PATH = join(tmpdir(), "pfs-e2e-restore-probe-state.json");
 const DEFAULT_NOTE_PATH = "/config/test-vault/Tasks.md";
 const DEFAULT_AFTER_PATH = join(ROOT, "tests", "fixtures", "tasks-after.md");
@@ -79,8 +87,8 @@ const DEFAULT_AFTER_PATH = join(ROOT, "tests", "fixtures", "tasks-after.md");
 const EXPLICIT_PHASES = ["setup", "rewrite", "verify", "report"];
 const PHASES = ["all", ...EXPLICIT_PHASES];
 
-function parseArgs(argv) {
-	const args = { cdpPort: 9222, waitMs: 1000, state: DEFAULT_STATE_PATH };
+export function parseArgs(argv) {
+	const args = { cdpPort: 9222, waitMs: 1000, state: DEFAULT_STATE_PATH, report: DEFAULT_REPORT_PATH };
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "--phase") args.phase = argv[++i];
@@ -89,6 +97,7 @@ function parseArgs(argv) {
 		else if (arg === "--cdp-port") args.cdpPort = Number(argv[++i]);
 		else if (arg === "--wait-ms") args.waitMs = Number(argv[++i]);
 		else if (arg === "--state") args.state = argv[++i];
+		else if (arg === "--report") args.report = argv[++i];
 		else if (arg === "--help" || arg === "-h") args.help = true;
 	}
 	return args;
@@ -104,9 +113,10 @@ function printUsage() {
 			"  --phase setup   [--note <path>]    GP1: fold Tuesday + Draft proposal; leave Send invoices open",
 			"  --phase rewrite [--note <path>] [--after <path>]  GP2: external rewrite (default --after: tests/fixtures/tasks-after.md)",
 			"  --phase verify  [--note <path>]    GP3: check folded/visible lines + byte-identical file",
-			"  --phase report                     (re)write docs/restore-golden-path.md from --state",
+			"  --phase report                     (re)write the report from --state",
 			"",
-			"Options: [--cdp-port 9222] [--wait-ms 1000] [--state <path>]",
+			"Options: [--cdp-port 9222] [--wait-ms 1000] [--state <path>] [--report <path>]",
+			`--report defaults to ${DEFAULT_REPORT_PATH} (outside the repo).`,
 			"",
 			`--note defaults to ${DEFAULT_NOTE_PATH} (the container test vault's copy of tests/fixtures/tasks-before.md).`,
 			"Requires a real Obsidian launched with --remote-debugging-port, this plugin built and",
@@ -272,7 +282,7 @@ async function setFold(cdp, needle, exact, wantCollapsed) {
 /** Whether a `setFold` result means the fold is now in the wanted state: either the click
  * happened, or the line was already in that state (a re-run on a note that kept the fold from an
  * earlier run, so no click was needed). A line that was not found is neither. */
-function foldIsSet(click) {
+export function foldIsSet(click) {
 	return Boolean(click && (click.clicked || click.alreadyInState));
 }
 
@@ -300,6 +310,13 @@ async function readLines(cdp) {
 async function runSetup(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	await withConnection(args.cdpPort, async (cdp) => {
+		// A re-run on a note a previous run left healthy has Tuesday folded, which hides the
+		// Draft proposal line inside it: there is nothing to click and the gate would fail although
+		// nothing is wrong. Open Tuesday first (a no-op when it is already open) so every run starts
+		// from the same place; Draft proposal keeps its own fold, which the next step then finds set.
+		const resetTuesday = await setFold(cdp, "Tuesday", true, false);
+		await sleep(args.waitMs);
+
 		// Draft proposal first: Tuesday's section contains it, so once Tuesday is folded there is
 		// no Draft proposal line left to click.
 		const draftClick = await setFold(cdp, "Draft proposal", false, true);
@@ -312,6 +329,7 @@ async function runSetup(args, state) {
 
 		state.setup = {
 			note,
+			resetTuesday,
 			draftClick,
 			tuesdayClick,
 			// After the Draft click: its children are hidden, the sibling Send invoices still shows.
@@ -328,11 +346,13 @@ async function runSetup(args, state) {
 	});
 }
 
-async function runRewrite(args, state) {
+export async function runRewrite(args, state) {
 	const note = args.note ?? DEFAULT_NOTE_PATH;
 	const afterPath = args.after ?? DEFAULT_AFTER_PATH;
 	const afterText = readFileSync(afterPath, "utf8");
 
+	// PR-8 R6: --note names the file that is overwritten; it has to be in a test vault.
+	assertNoteInTestVault(note);
 	const writeStartedAt = Date.now();
 	writeFileSync(note, afterText, "utf8");
 	// 150ms settle + however long the (chunked, yielded) match takes for this small fixture —
@@ -384,7 +404,7 @@ async function runVerify(args, state) {
 	});
 }
 
-function renderReport(state) {
+export function renderReport(state) {
 	function section(title, data, describe) {
 		if (!data) return `### ${title}\n\nNot yet captured.\n`;
 		return `### ${title}\n\n${describe(data)}\n`;
@@ -392,6 +412,7 @@ function renderReport(state) {
 
 	const setupSection = section("GP1 (--phase setup)", state.setup, (d) => [
 		`- Note: \`${d.note}\``,
+		`- Opened Tuesday first, so a re-run starts from the same place (a no-op when it was already open): ${JSON.stringify(d.resetTuesday)}`,
 		`- Clicked Draft proposal's fold indicator: ${JSON.stringify(d.draftClick)}`,
 		`- Draft proposal's children hidden (its line still shown): ${d.draftChildrenHidden}`,
 		`- Send invoices visible after that (never folded): ${d.sendInvoicesVisibleAfterDraft}`,
@@ -481,11 +502,14 @@ async function main() {
 
 	saveState(args.state, state);
 	const report = renderReport(state);
-	writeFileSync(REPORT_PATH, report, "utf8");
-	console.log(`Wrote ${REPORT_PATH} (state: ${args.state})`);
+	writeFileSync(args.report, report, "utf8");
+	console.log(`Wrote ${args.report} (state: ${args.state})`);
 }
 
-main().catch((err) => {
-	console.error("e2e-restore-probe failed:", err);
-	process.exitCode = 1;
-});
+// Imported by tests/unit/restore-probe-logic.test.ts for its pure functions: only run as a script.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+	main().catch((err) => {
+		console.error("e2e-restore-probe failed:", err);
+		process.exitCode = 1;
+	});
+}

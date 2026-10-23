@@ -251,3 +251,66 @@ describe("E7: 51 embeds in one host share 5,000 comparisons", () => {
 		expect(host.embeds.length).toBe(EMBEDS);
 	}, 60_000);
 });
+
+describe("E7: the host budget is scoped to a burst of one host's renders, and a restart gives its comparisons back", () => {
+	const FOLDS_EACH = 100;
+	const BEFORE = headingNote(FOLDS_EACH, "original");
+	const AFTER = headingNote(FOLDS_EACH, "renamed");
+	const newHash = sliceEmbed(AFTER, "")?.hash;
+
+	function twoBigEmbeds(r: Rig): ReturnType<World["addHost"]> {
+		for (const i of [0, 1]) {
+			r.w.addNote(`Big ${i}.md`, AFTER);
+			r.w.store.setEmbed(storedRecord(`Big ${i}.md`, BEFORE));
+		}
+		return r.w.addHost(HOST, "live-preview", "![[Big 0]]\n\n![[Big 1]]\n");
+	}
+	const refreshed = (r: Rig): number => r.w.store.embedRecords().filter((record) => record.contentHash === newHash).length;
+
+	it("a host that went quiet gets a full budget on its next render although another host keeps rendering (PR-6 R7)", async () => {
+		const r = rig({ hostComparisonBudget: FOLDS_EACH });
+		// Another host whose embed renders again and again: its render window never settles, so the
+		// restorer as a whole is never quiet while the first host below is worked on.
+		r.w.addNote("Small.md", "- a\n  - b\n");
+		const busy = r.w.addHost("Busy Host.md", "live-preview", "![[Small]]\n");
+		const timer = setInterval(() => r.w.rerender(busy.embeds[0], busy.path), 40);
+		try {
+			const host = twoBigEmbeds(r);
+			await sleep(500);
+			expect(r.restorer.pendingRenders).toBeGreaterThan(0);
+			expect(refreshed(r)).toBe(1); // one embed paid for its 100 comparisons, the other found the budget spent
+
+			// This host's own next burst: its budget is new, whatever the other host is doing.
+			const spent = host.embeds.findIndex((_embed, i) => r.w.store.embedRecords().some((rec) => rec.target === `Big ${i}.md` && rec.contentHash !== newHash));
+			r.w.rerender(host.embeds[spent], host.path);
+			await sleep(500);
+			expect(refreshed(r)).toBe(2);
+		} finally {
+			clearInterval(timer);
+		}
+	}, 60_000);
+
+	it("an embed whose record changes mid-match starts over without taking its siblings' comparisons (PR-6 R8)", async () => {
+		let changed = false;
+		const r = rig({
+			hostComparisonBudget: 250,
+			matcherOptions: {
+				chunkSize: 10,
+				yieldToHost: async () => {
+					if (changed) return;
+					changed = true;
+					// Dan unfolds one row of Big 0 while the matcher is working.
+					const record = r.w.store.embedRecords().find((rec) => rec.target === "Big 0.md");
+					if (record !== undefined) r.w.store.setEmbed({ ...record, folds: record.folds.slice(1) });
+				},
+			},
+		});
+		twoBigEmbeds(r);
+		await untilQuiet(r);
+
+		expect(changed).toBe(true);
+		expect(refreshed(r)).toBe(2); // both fit: the discarded attempt was refunded
+		expect(r.w.store.embedRecords().find((rec) => rec.target === "Big 0.md")?.folds).toHaveLength(FOLDS_EACH - 1);
+		expect(r.w.store.embedRecords().find((rec) => rec.target === "Big 1.md")?.folds).toHaveLength(FOLDS_EACH);
+	}, 60_000);
+});

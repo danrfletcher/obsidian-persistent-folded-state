@@ -60,7 +60,9 @@ export function isEmbedDormancyExpired(dormantSince: number, now: number): boole
 /**
  * The one rule for a record seen as `presence` at `now`, given its current `dormantSince`
  * (undefined when healthy). This is the single dormancy step: the store applies it to a host's
- * records (`FoldStore.reconcileEmbedDormancy`), and nothing else ever sets or clears the stamp.
+ * records (`FoldStore.reconcileEmbedDormancy`), the only code that sets the stamp. It is also
+ * cleared, never set, when the recorder rebuilds a record from a user's fold or unfold click
+ * (`applyEmbedFold`): a click proves the embed is live.
  *  - already dormant and the window is over: forget, whatever `presence` is;
  *  - not dormant and seen absent or broken: stamp `now`;
  *  - dormant and seen absent or broken again: keep (the clock does not restart);

@@ -132,6 +132,18 @@ function sanitizeOuter(value: unknown): EmbedLinkId[] | null {
 	return chain;
 }
 
+/** Whether `id` names an embed the way a loaded record must: a non-empty string `host` and
+ * `target`, a string `subpath`, an `occurrence` that is a non-negative integer, and an `outer`
+ * chain (if any) whose links satisfy the same rules. The one rule behind both `setEmbed` and
+ * the load path, so nothing is kept in memory that the next load would drop. */
+function hasValidEmbedIdentity(id: { host: unknown; target: unknown; subpath: unknown; occurrence: unknown; outer?: unknown }): id is EmbedIdentity {
+	if (typeof id.host !== "string" || id.host === "") return false;
+	if (typeof id.target !== "string" || id.target === "") return false;
+	if (typeof id.subpath !== "string") return false;
+	if (typeof id.occurrence !== "number" || !Number.isInteger(id.occurrence) || id.occurrence < 0) return false;
+	return sanitizeOuter(id.outer) !== null;
+}
+
 /** Validates one raw `embeds` entry. Returns null for anything malformed: not an object; a
  * missing or empty `host`/`target`; a non-string `subpath`; an `occurrence` that is not a
  * non-negative integer; a missing `contentHash`; `folds` not an array; a `dormantSince` that is
@@ -140,13 +152,13 @@ function sanitizeOuter(value: unknown): EmbedLinkId[] | null {
 function sanitizeEmbedRecord(value: unknown): EmbedFoldRecord | null {
 	if (!isPlainObject(value)) return null;
 	const { host, target, subpath, occurrence, contentHash, folds, dormant } = value;
-	if (typeof host !== "string" || host === "") return null;
-	if (typeof target !== "string" || target === "") return null;
-	if (typeof subpath !== "string") return null;
-	if (typeof occurrence !== "number" || !Number.isInteger(occurrence) || occurrence < 0) return null;
+	// The identity rule is hasValidEmbedIdentity's alone: setEmbed applies the same function, so
+	// what it keeps is exactly what this keeps.
+	const identity = { host, target, subpath, occurrence, outer: value.outer };
+	if (!hasValidEmbedIdentity(identity)) return null;
 	if (typeof contentHash !== "string") return null;
 	if (!Array.isArray(folds)) return null;
-	const outer = sanitizeOuter(value.outer);
+	const outer = sanitizeOuter(identity.outer);
 	if (outer === null) return null;
 	// PR-7 (E8): the whole-embed dormancy stamp is optional (a healthy embed has none), but when
 	// the field is there it has to be a finite, non-negative number; otherwise the record is
@@ -154,10 +166,10 @@ function sanitizeEmbedRecord(value: unknown): EmbedFoldRecord | null {
 	const { dormantSince } = value;
 	if (dormantSince !== undefined && !isValidDormantSince(dormantSince)) return null;
 	return {
-		host,
-		target,
-		subpath,
-		occurrence,
+		host: identity.host,
+		target: identity.target,
+		subpath: identity.subpath,
+		occurrence: identity.occurrence,
 		...(outer.length > 0 ? { outer } : {}),
 		contentHash,
 		folds: sanitizeAnchorArray(folds),
@@ -236,6 +248,7 @@ export class FoldStore {
 	 * `pruneOrphans`: those treat keys as file paths. The embed twins (`handleEmbedRename`,
 	 * `handleEmbedDelete`, `pruneOrphanEmbeds`, `migrateEmbedHeading`) are what move or remove them. */
 	private embeds = new Map<string, EmbedFoldRecord>();
+	private embedsRevision = 0;
 	private dirty = false;
 	private flushTimer: number | null = null;
 	/** Serialises every flush (scheduled or immediate) so overlapping calls never race: each
@@ -287,6 +300,7 @@ export class FoldStore {
 		const loadedEmbeds = sanitized.embeds ?? [];
 		const keptEmbeds = expireEmbedRecords(loadedEmbeds, now);
 		this.embeds = new Map(keptEmbeds.map((record) => [embedMapKey(record), record]));
+		this.embedsRevision++;
 		this.dirty = false;
 		this.cancelScheduledFlush();
 		// T16: what was just forgotten here is still in `data.json` until the store writes again,
@@ -316,6 +330,13 @@ export class FoldStore {
 		return this.embeds.get(embedMapKey(id));
 	}
 
+	/** A number that changes whenever the set of embed records, or any record in it, does. A
+	 * reader that derives an index from the records can keep it for as long as this stays the same
+	 * (PR-8 R5). */
+	embedRevision(): number {
+		return this.embedsRevision;
+	}
+
 	/** Every stored embed record, in insertion order. */
 	embedRecords(): EmbedFoldRecord[] {
 		return [...this.embeds.values()];
@@ -339,6 +360,10 @@ export class FoldStore {
 	 * embed's record, and nothing in `files`, is read or changed (F2, G8). Nothing is written to
 	 * any note (F7). A change is flushed by the ordinary debounce, not at once: it is not a user
 	 * action.
+	 *
+	 * This is the only place the stamp is set. It is not the only place it is cleared: a user's
+	 * fold or unfold click rebuilds the record without it (`applyEmbedFold` in
+	 * src/embed-fold-recorder.ts), since a click proves the embed is live.
 	 *
 	 * Deliberately a single function that only the render path calls and that a vault `rename`
 	 * handler never does: a link Obsidian rewrites itself after a rename or heading rename must
@@ -365,26 +390,39 @@ export class FoldStore {
 				tally.forgotten++;
 			}
 		}
-		if (tally.stamped + tally.revived + tally.forgotten > 0) this.scheduleDebouncedFlush();
+		if (tally.stamped + tally.revived + tally.forgotten > 0) {
+			this.embedsRevision++;
+			this.scheduleDebouncedFlush();
+		}
 		return tally;
 	}
 
 	/** Replaces the whole record for the embed `record` identifies (host, target, subpath and
 	 * occurrence, and the chain of containing embeds for a nested one). Debounced like `set()`.
-	 * An empty `outer` is dropped, so a flat embed is always stored and written without the field. */
-	setEmbed(record: EmbedFoldRecord): void {
+	 * An empty `outer` is dropped, so a flat embed is always stored and written without the field.
+	 *
+	 * The identity is checked by the same rule `load()` applies (`hasValidEmbedIdentity`): a record
+	 * with an empty host or target, a non-string subpath, or an occurrence that is not a
+	 * non-negative integer (in the record or in any link of its chain) is refused, because it
+	 * would be written to disk and then silently dropped on the next load. Returns whether the
+	 * record was stored; a refused record changes nothing and schedules no write. */
+	setEmbed(record: EmbedFoldRecord): boolean {
+		if (!hasValidEmbedIdentity(record)) return false;
 		if (record.outer !== undefined && record.outer.length === 0) {
 			const { outer: _empty, ...flat } = record;
 			record = flat;
 		}
 		this.embeds.set(embedMapKey(record), record);
+		this.embedsRevision++;
 		this.scheduleDebouncedFlush();
+		return true;
 	}
 
 	/** Removes one embed's record. A miss is a no-op that never reaches `saveData`; a hit
 	 * flushes at once, like `forget`. */
 	forgetEmbed(id: EmbedIdentity): boolean {
 		if (!this.embeds.delete(embedMapKey(id))) return false;
+		this.embedsRevision++;
 		this.dirty = true;
 		this.flushAndLog();
 		return true;
@@ -420,6 +458,7 @@ export class FoldStore {
 			this.embeds.delete(key);
 			removed++;
 		}
+		if (removed > 0) this.embedsRevision++;
 		return removed;
 	}
 
@@ -455,6 +494,7 @@ export class FoldStore {
 		if (count === 0 && this.embeds.size === 0) return 0;
 		this.files.clear();
 		this.embeds.clear();
+		this.embedsRevision++;
 		this.dirty = true;
 		this.flushAndLog();
 		return count;
@@ -562,6 +602,7 @@ export class FoldStore {
 		const before = this.embedRecords();
 		if (after.length === before.length && after.every((record, i) => record === before[i])) return false;
 		this.embeds = new Map(after.map((record) => [embedMapKey(record), record]));
+		this.embedsRevision++;
 		this.dirty = true;
 		this.flushAndLog();
 		return true;
@@ -589,6 +630,7 @@ export class FoldStore {
 				const after = expireEmbedRecords(before, now);
 				if (after.length !== before.length || after.some((record, i) => record !== before[i])) {
 					this.embeds = new Map(after.map((record) => [embedMapKey(record), record]));
+					this.embedsRevision++;
 				}
 			}
 			const snapshot: StoreData = {

@@ -26,6 +26,12 @@
  * that embeds its own heading is both at once and is handled in a single event. In either order
  * it is the one rule that decides whether a link move is a rename.
  *
+ * Memory and cost (PR-8 R3, R5): a baseline is kept only for a note that was opened or seeded, or
+ * that is the target of a stored heading embed; the other notes a vault re-index reports are not
+ * remembered. Which notes those are is an index over the stored records, rebuilt only when the
+ * store says its embed records changed (`embedRevision`), so a re-index of many files costs a
+ * set lookup each, not a pass over every record.
+ *
  * Never throws out of an event handler. No timers of its own: the window is measured with the
  * injected clock when an event arrives.
  */
@@ -47,11 +53,17 @@ export interface HeadingRenameDeps {
 	store: {
 		embedRecords(): EmbedFoldRecord[];
 		migrateEmbedHeading(migration: HeadingMigration): number;
+		/** Changes whenever the embed records do. Without it the index is rebuilt on every use. */
+		embedRevision?(): number;
 	};
 	/** Obsidian's link resolver: link text as written in `sourcePath` to a vault path, or null. */
 	resolveLink: (linktext: string, sourcePath: string) => string | null;
 	/** Wall clock in ms; defaults to `Date.now`. */
 	now?: () => number;
+	/** Called after records were migrated to a new heading. The embeds they belong to may be on
+	 * screen already, rendered before the records moved, so the caller looks at them again
+	 * (PR-8 R1). A throw is logged by `onChanged` and does not undo the migration. */
+	onMigrated?: () => void;
 }
 
 interface RecentLinks {
@@ -85,6 +97,22 @@ function chainLinks(record: EmbedFoldRecord): { source: string; target: string; 
 	return links;
 }
 
+/** Every note a record's links name by heading: the targets whose headings are worth a baseline. */
+export function headingTargetsOf(record: EmbedFoldRecord): string[] {
+	return chainLinks(record)
+		.filter((link) => isHeadingSubpath(link.subpath))
+		.map((link) => link.target);
+}
+
+/** The notes of stored heading links, by role. */
+interface HeadingIndex {
+	revision: number | null;
+	/** Notes named by a stored heading link. */
+	targets: Set<string>;
+	/** Notes that hold a stored heading link. */
+	sources: Set<string>;
+}
+
 export class EmbedHeadingRenameTracker {
 	private readonly deps: HeadingRenameDeps;
 	private readonly now: () => number;
@@ -93,6 +121,7 @@ export class EmbedHeadingRenameTracker {
 	/** The embed links of notes that hold a stored heading embed, as of their last re-parse. Only
 	 * read when a target's headings change later; see the file comment on order. */
 	private readonly recentLinks = new Map<string, RecentLinks>();
+	private index: HeadingIndex | null = null;
 
 	constructor(deps: HeadingRenameDeps) {
 		this.deps = deps;
@@ -106,13 +135,29 @@ export class EmbedHeadingRenameTracker {
 		this.snapshots.set(path, toEntries(meta));
 	}
 
+	/** How many notes have a heading baseline. For tests and diagnostics. */
+	baselineCount(): number {
+		return this.snapshots.size;
+	}
+
 	/** Every target of a stored embed link that names a heading: the notes worth a baseline. */
 	storedHeadingTargets(): string[] {
-		const targets = new Set<string>();
+		return [...this.headingIndex().targets];
+	}
+
+	private headingIndex(): HeadingIndex {
+		const revision = this.deps.store.embedRevision?.() ?? null;
+		if (this.index !== null && revision !== null && this.index.revision === revision) return this.index;
+		const index: HeadingIndex = { revision, targets: new Set(), sources: new Set() };
 		for (const record of this.deps.store.embedRecords()) {
-			for (const link of chainLinks(record)) if (isHeadingSubpath(link.subpath)) targets.add(link.target);
+			for (const link of chainLinks(record)) {
+				if (!isHeadingSubpath(link.subpath)) continue;
+				index.targets.add(link.target);
+				index.sources.add(link.source);
+			}
 		}
-		return [...targets];
+		this.index = index;
+		return index;
 	}
 
 	/** Called for every metadata `changed` event: `path` was re-parsed and `meta` is its new cache. */
@@ -146,7 +191,9 @@ export class EmbedHeadingRenameTracker {
 		const now = this.now();
 		const headings = toEntries(meta);
 		const previous = this.snapshots.get(path);
-		this.snapshots.set(path, headings);
+		// A note nobody opened and no stored heading embed names gets no baseline: a vault
+		// re-index reports every note, and remembering them all would grow with the vault.
+		if (previous !== undefined || this.headingIndex().targets.has(path)) this.snapshots.set(path, headings);
 		this.rememberLinks(path, meta, now);
 		// A change with the same headings (typing in the body) must not replace a pending rename.
 		const renamed = previous !== undefined && !sameEntries(previous, headings);
@@ -173,13 +220,12 @@ export class EmbedHeadingRenameTracker {
 	 * of a heading rename can be parsed before the renamed note is. */
 	private rememberLinks(source: string, meta: FileMeta | null | undefined, now: number): void {
 		const embeds = meta?.embeds ?? [];
-		if (embeds.length === 0) {
+		// A heading link is written with a '#', so a note with no such embed link holds none.
+		if (!embeds.some((embed) => embed.link.includes("#"))) {
 			this.recentLinks.delete(source);
 			return;
 		}
-		const holdsHeadingEmbed = this.deps.store
-			.embedRecords()
-			.some((record) => chainLinks(record).some((link) => link.source === source && isHeadingSubpath(link.subpath)));
+		const holdsHeadingEmbed = this.headingIndex().sources.has(source);
 		if (holdsHeadingEmbed) this.recentLinks.set(source, { embeds, at: now });
 		else this.recentLinks.delete(source);
 	}
@@ -216,7 +262,8 @@ export class EmbedHeadingRenameTracker {
 					storedSubpath: from,
 					linkSubpaths: linkSubpaths.get(target) ?? [],
 				});
-				if (to !== null) this.deps.store.migrateEmbedHeading({ source, target, from, to });
+				if (to === null) continue;
+				if (this.deps.store.migrateEmbedHeading({ source, target, from, to }) > 0) this.deps.onMigrated?.();
 			}
 		}
 	}

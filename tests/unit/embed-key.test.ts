@@ -101,6 +101,9 @@ describe("findEmbeds: text that is not an embed", () => {
 		{ name: "a callout fence that is never closed ends with the callout", text: `> \`\`\`\n> ${A}\n\n${A}`, expected: 1 },
 		{ name: "a fence line in a callout does not open a fence for the lines after the callout", text: `> \`\`\`\n> x\n> \`\`\`\n${A}\n${A}`, expected: 2 },
 		{ name: "a quoted fence line does not close a top-level fence", text: `\`\`\`\n> \`\`\`\n${A}\n\`\`\`\n${A}`, expected: 1 },
+		{ name: "a backslash-escaped ! (a link after a literal !, PR-3 R3)", text: `\\${A}\n${A}`, expected: 1 },
+		{ name: "an escaped ! in the middle of a line", text: `see \\${A} and ${A}`, expected: 1 },
+		{ name: "an escaped backslash does not escape the !", text: `\\\\${A}\n${A}`, expected: 2 },
 		{ name: "inline code", text: `\`${A}\` and ${A}`, expected: 1 },
 		{ name: "double-backtick inline code holding a backtick", text: `\`\` ${A} \` \`\` ${A}`, expected: 1 },
 		{ name: "an unmatched backtick is plain text", text: `\` ${A}`, expected: 1 },
@@ -122,6 +125,38 @@ describe("findEmbeds: text that is not an embed", () => {
 	it("counts only embeds outside code and comments toward the index", () => {
 		const text = "![[A]]\n```\n![[A]]\n```\n`![[A]]`\n%%![[A]]%%\n<!-- ![[A]] -->\n![[A]]";
 		expect(summary(text)).toEqual([["A", "", 0], ["A", "", 1]]);
+	});
+});
+
+describe("same-note and case variants count as identical embeds (PR-3 R6)", () => {
+	it("![[#H]] and ![[Host#H]] in Host.md are the same note: one target, occurrences 0 and 1", () => {
+		const host = HOST.replace(/\.md$/, "");
+		expect(summary(`![[#H]] ![[${host}#H]]`)).toEqual([
+			[HOST, "H", 0],
+			[HOST, "H", 1],
+		]);
+	});
+
+	it("a link to the host with its extension counts the same", () => {
+		expect(summary(`![[#H]] ![[${HOST}#H]]`).map((r) => r[2])).toEqual([0, 1]);
+	});
+
+	it("A#Intro and A#intro count together, each keeping the subpath as written", () => {
+		expect(summary("![[A#Intro]] ![[A#intro]] ![[A#Intro]]")).toEqual([
+			["A", "Intro", 0],
+			["A", "intro", 1],
+			["A", "Intro", 2],
+		]);
+	});
+
+	it("block ids stay case-sensitive", () => {
+		expect(summary("![[A#^Ab]] ![[A#^ab]]").map((r) => r[2])).toEqual([0, 0]);
+	});
+
+	it("findEmbedKey finds the second of two case variants", () => {
+		const text = "![[A#Intro]] ![[A#intro]]";
+		expect(findEmbedKey(HOST, text, "A#intro", 1)).toEqual({ host: HOST, target: "A", subpath: "intro", occurrence: 1 });
+		expect(findEmbedKey(HOST, text, "A#INTRO", 0)).toEqual({ host: HOST, target: "A", subpath: "Intro", occurrence: 0 });
 	});
 });
 

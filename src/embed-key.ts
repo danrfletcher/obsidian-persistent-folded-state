@@ -13,12 +13,14 @@
  * Rules this module keeps:
  * - The key carries host path, target path, subpath and occurrence index only: no line number,
  *   offset or host text hash, so editing the host around an embed never changes its key (G5).
- * - "Identical" means same target and subpath; alias and size (`|alias`, `|300`) are ignored.
+ * - "Identical" means same target and subpath; alias and size (`|alias`, `|300`) are ignored. A
+ *   heading subpath is compared case-insensitively (the slice finds a heading that way), a block
+ *   id as written. A link to the host by name (`![[Host#H]]`) is the same note as `![[#H]]`.
  *   The index counts in the host's source text in document order, never render order (G7, E1).
  *   Inserting or deleting an identical embed earlier shifts later indices (E15, a known limit).
  * - Not embeds, and not counted: anything inside the host's frontmatter, fenced code, inline
  *   code (a fence inside a blockquote or callout, `> ```, included), `%%comments%%` and HTML
- *   comments; images, PDFs, audio, video and other non-note files.
+ *   comments; a backslash-escaped `\![[A]]` (a link after a literal "!"); images, PDFs, audio, video and other non-note files.
  * - Never throws, and every scan is a single left-to-right pass: no regex runs over the text, so
  *   a 100,000-character line of unterminated `![[` cannot backtrack.
  *
@@ -144,7 +146,10 @@ function quotePrefixEnd(src: string, lineStart: number, lineEnd: number): number
 /** Index just past the line that closes `fence` (same character, at least as long, nothing else
  * on the line), scanning from `from`; the end of the text when it never closes. A fence opened
  * inside a blockquote or callout (`quoted`) is closed by a quoted line, and ends without a
- * closing line at the first line that is no longer quoted (returning that line's start). */
+ * closing line at the first line that is no longer quoted (returning that line's start). That
+ * ends the fence at a lazy continuation line too (an unquoted line straight after a quoted one),
+ * which CommonMark would still keep in the blockquote though not in the fence; this is the safe
+ * reading, and has not been checked against Obsidian's rendering (PR-3 R8, low risk). */
 function skipFence(src: string, from: number, fence: FenceOpen, quoted: boolean): number {
 	let lineStart = from;
 	while (lineStart < src.length) {
@@ -298,6 +303,10 @@ function scanRawEmbeds(text: string): RawEmbed[] {
 				j += closing;
 			}
 			i = closedAt === -1 ? i + run : closedAt;
+		} else if (ch === "\\" && (src[i + 1] === "!" || src[i + 1] === "\\")) {
+			// `\![[A]]` is a plain link after a literal "!", not an embed (PR-3 R3); the same pair
+			// `\\` is an escaped backslash, so `\\![[A]]` is an embed again.
+			i += 2;
 		} else if (ch === "%" && src[i + 1] === "%") {
 			const close = src.indexOf("%%", i + 2);
 			i = close === -1 ? n : close + 2;
@@ -331,8 +340,26 @@ function targetFor(linktext: string, resolve: LinkResolver | undefined): string 
 	return callResolver(resolve, linktext) ?? stripMarkdownExtension(linktext);
 }
 
+/** The occurrence-counting identity of a subpath. A heading subpath is compared the way
+ * `sliceEmbed` finds the heading (case-insensitively), so `A#Intro` and `A#intro`, which show the
+ * same section, count as identical embeds; a block id (`^x`) is kept as written. The key still
+ * carries the subpath as written (PR-3 R6). */
+function subpathIdentity(subpath: string): string {
+	return subpath.startsWith("^") ? subpath : subpath.toLowerCase();
+}
+
 function identityKey(target: string, subpath: string): string {
-	return JSON.stringify([target, subpath]);
+	return JSON.stringify([target, subpathIdentity(subpath)]);
+}
+
+/** The target of a link whose written note name is `linktext`, given the host's own path. With no
+ * resolver (or one that does not resolve it) a link to the host by name (`![[Host#H]]` in
+ * `Host.md`) reads `Host`, while `![[#H]]` reads the host's path `Host.md`: the same note, so the
+ * written name is mapped to the host's path (PR-3 R6). With Obsidian's resolver both are the
+ * full path already. */
+function targetOfLink(hostPath: string, linktext: string, resolve: LinkResolver | undefined): string {
+	const target = targetFor(linktext, resolve);
+	return target === stripMarkdownExtension(hostPath) ? hostPath : target;
 }
 
 /**
@@ -351,7 +378,7 @@ export function findEmbeds(hostPath: string, hostText: string, resolve?: LinkRes
 			if (raw.subpath === "") continue;
 			target = hostPath;
 		} else {
-			target = targetFor(raw.target, resolve);
+			target = targetOfLink(hostPath, raw.target, resolve);
 		}
 		if (!isNoteTarget(target)) continue;
 		const id = identityKey(target, raw.subpath);
@@ -395,9 +422,9 @@ export function findEmbedKey(
 ): EmbedIdentity | null {
 	const parsed = parseEmbedLinktext(linktext);
 	if (parsed === null) return null;
-	const target = parsed.target === "" ? hostPath : targetFor(parsed.target, resolve);
+	const target = parsed.target === "" ? hostPath : targetOfLink(hostPath, parsed.target, resolve);
 	for (const embed of findEmbeds(hostPath, hostText, resolve)) {
-		if (embed.target === target && embed.subpath === parsed.subpath && embed.occurrence === occurrence) {
+		if (embed.target === target && subpathIdentity(embed.subpath) === subpathIdentity(parsed.subpath) && embed.occurrence === occurrence) {
 			return buildEmbedKey(hostPath, embed);
 		}
 	}

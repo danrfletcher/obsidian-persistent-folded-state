@@ -80,4 +80,10 @@ export class EmbedRenderCoalescer<K, P> {
 	has(key: K): boolean {
 		return this.pending.has(key);
 	}
+
+	/** Whether any key with a pass waiting satisfies `test`. */
+	hasWhere(test: (key: K) => boolean): boolean {
+		for (const key of this.pending.keys()) if (test(key)) return true;
+		return false;
+	}
 }
