@@ -239,16 +239,20 @@ describe.each(MODES)("%s host: the slice is gone or empty", (mode) => {
 		expect(ownArrows(host.embeds[0])).toHaveLength(0);
 	});
 
-	it("the edit leaves nothing the stored fold can be placed on: it stays unfolded, the record is kept and nothing is added (F6)", async () => {
+	it("the edit leaves nothing the stored fold can be placed on: it stays unfolded, the fold goes dormant and nothing is added (F6, G14)", async () => {
 		const r = rig();
 		const host = await openAndFold(r, mode);
-		const record = JSON.stringify(recordOf(r));
+		const before = recordOf(r);
 
 		editSource(r, host, mode, SOURCE_TEXT.replace(LESSON_8_LINE, "- [ ] Zebra migration patterns ^0169a6"));
 		await settleRestore(r.w, r.restorer);
 
 		expect(foldedRows(host.embeds[0])).toEqual([]);
-		expect(JSON.stringify(recordOf(r))).toBe(record);
+		// PR-7: the unplaced fold is kept, dormant, with the time it went dormant; no block is added.
+		const after = recordOf(r);
+		expect(after.folds).toEqual([]);
+		expect(after.dormant).toHaveLength(1);
+		expect(after.dormant[0]).toMatchObject({ ...before.folds[0], dormantSince: expect.any(Number) });
 	});
 });
 

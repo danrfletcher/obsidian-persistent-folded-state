@@ -4,7 +4,7 @@
  * `loadData`/`saveData` implemented the same way Obsidian's own `Plugin.loadData`/`saveData` do
  * (read/parse, or stringify/write, that file) — not a fake in-memory stand-in.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -137,6 +137,16 @@ describe("data.json integration: round trip through real files", () => {
 });
 
 describe("data.json integration: embed records (ticket warkworth-21, PR-1)", () => {
+	// The seed's dormant entry is stamped at 1,000 ms; PR-7 forgets it after 10 minutes of wall
+	// clock, so the clock (Date only) is pinned inside that window.
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(2_000);
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
 	it("round trip: notes and embeds written by flush() load back identically", async () => {
 		const { dataPath, loadData, saveData } = await makeTempVault();
 		await writeFile(dataPath, JSON.stringify(seedData()), "utf8");

@@ -201,6 +201,16 @@ function embedRecord(contentHash: string): EmbedFoldRecord {
 }
 
 describe("lifecycle: embeds survive disable then re-enable (E9)", () => {
+	// The seed's dormant entry is stamped at 1,000 ms; PR-7 forgets it after 10 minutes of wall
+	// clock, so the clock (Date only) is pinned inside that window.
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(2_000);
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
 	it("bytes in data.json are identical across disable and re-enable, and the reloaded store returns the same records", async () => {
 		let stored: unknown = structuredClone(SEED_DISK);
 		const app = new App();

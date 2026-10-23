@@ -335,8 +335,10 @@ describe.each(MODES)("%s host: a stored anchor with no confident match stays unf
 		await settleRestore(r.w, r.restorer);
 
 		// Whatever the matcher decides, only its decision is folded, and never more than one block per stored anchor.
+		// PR-7 (G14): an anchor with no confident match is not lost: it is in the record's folds or, if unplaced, dormant.
 		expect(foldedRows(host.embeds[0]).length).toBeLessThanOrEqual(1);
-		expect(r.w.store.embedRecords()[0].folds).toHaveLength(1);
+		const record = r.w.store.embedRecords()[0];
+		expect(record.folds.length + record.dormant.length).toBe(1);
 	});
 
 	it("two identical lines, one stored: only its own ordinal folds", async () => {

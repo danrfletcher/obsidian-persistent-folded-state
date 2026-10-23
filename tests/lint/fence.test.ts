@@ -166,8 +166,12 @@ describe("fence: PR-5 embed restore files", () => {
 
 	it("restore reuses buildAnchors and matchAnchors from the existing modules, with no second matcher and no copied constants", () => {
 		expect(restorer).toMatch(/import\s*\{[^}]*\bbuildAnchors\b[^}]*\}\s*from\s*"\.\/anchors"/);
-		// PR-6: the matcher call moved into the re-match planner (src/embed-rematch.ts), which the restorer calls.
-		expect(restorer).toMatch(/import\s*\{[^}]*\bplanEmbedRematch\b[^}]*\}\s*from\s*"\.\/embed-rematch"/);
+		// PR-6: the matcher call moved into the re-match planner (src/embed-rematch.ts). PR-7: the restorer
+		// calls it through the embed pass (src/embed-anchor-dormancy.ts), which also retries dormant anchors.
+		expect(restorer).toMatch(/import\s*\{[^}]*\bplanEmbedPass\b[^}]*\}\s*from\s*"\.\/embed-anchor-dormancy"/);
+		const passText = readFileSync(join(SRC, "embed-anchor-dormancy.ts"), "utf8");
+		expect(passText).toMatch(/import\s*\{[^}]*\bplanEmbedRematch\b[^}]*\}\s*from\s*"\.\/embed-rematch"/);
+		expect(passText).toMatch(/import\s*\{[^}]*\bdropDormantClaimedByActive\b[^}]*\}\s*from\s*"\.\/dormant"/);
 		const matcherText = readFileSync(join(SRC, "matcher.ts"), "utf8");
 		const constants = [...matcherText.matchAll(/^export const (\w+)\s*=\s*([\d.]+);/gm)];
 		expect(constants.length).toBeGreaterThan(0);

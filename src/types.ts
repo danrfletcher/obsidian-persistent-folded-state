@@ -67,6 +67,13 @@ export interface EmbedFoldRecord extends EmbedIdentity {
 	contentHash: string;
 	folds: StoredAnchor[];
 	dormant: StoredAnchor[];
+	/** Wall-clock time (ms) at which the plugin first saw this embed's key lacking from its host's
+	 * embed set (the link was retargeted, G6) or its target note or block id missing (E6). Present
+	 * only while the whole embed's state is dormant: kept, never applied, forgotten once
+	 * `MAX_DORMANT_AGE_MS` old. Absent on a healthy embed. `folds`, `dormant` and `contentHash`
+	 * are left exactly as they were while it is set. Not to be confused with the per-anchor
+	 * `dormantSince` inside `dormant` (G14). */
+	dormantSince?: number;
 }
 
 /** The whole on-disk/in-memory shape saved to and loaded from data.json.

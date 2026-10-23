@@ -51,16 +51,17 @@ import { buildAnchors, parseAnchor } from "./anchors";
 import type { Anchor, AnchoredBlock } from "./anchors";
 import { EMBED_CAPABILITIES } from "./embed-capabilities";
 import type { EmbedCapability, EmbedHostModeId, EmbedKind } from "./embed-capabilities";
+import { planEmbedPass } from "./embed-anchor-dormancy";
 import { COLLAPSED_CLASS, EMBED_SELECTOR, blockIndexForToggle, describeArrows, embedKindOf, embedLevels, resolveEmbedChain } from "./embed-fold-recorder";
 import { detectEmbedHost } from "./embed-host";
 import type { EmbedHost } from "./embed-host";
 import { parseEmbedLinktext } from "./embed-key";
 import { EMBED_RENDER_SETTLE_MS, EmbedRenderCoalescer } from "./embed-render-coalescer";
-import { HostComparisonBudget, planEmbedRematch } from "./embed-rematch";
+import { HostComparisonBudget } from "./embed-rematch";
 import { planEmbedRestore } from "./embed-restore-plan";
 import type { LiveArrow } from "./embed-restore-plan";
 import type { MatcherOptions } from "./matcher";
-import type { EmbedFoldRecord, EmbedIdentity, StoredAnchor } from "./types";
+import type { EmbedFoldRecord, EmbedIdentity } from "./types";
 
 /** Once a pass has run, the embed is looked at once more after this long (ms), in case Obsidian
  * restored its own folds after the pass and without another render (E4, "late native restore"). */
@@ -96,6 +97,11 @@ export interface EmbedFoldRestorerDeps {
 	/** Comparisons one host may spend per render pass, shared by all its embeds (E7). Defaults to
 	 * 5,000 (the matcher's own cap); a test lowers it. */
 	hostComparisonBudget?: number;
+	/** PR-7 (G6, E6): brings the dormancy of the host's embed records up to date with its source
+	 * text; called once per host per render pass, before the embeds are read. Optional. */
+	dormancy?: { reconcileHost(hostPath: string, hostText: string): Promise<void> };
+	/** Wall clock in ms for the dormant retry (PR-7). Defaults to `Date.now`. */
+	now?: () => number;
 }
 
 /** The window an element lives in (a pop-out window has its own `MutationObserver`). */
@@ -131,6 +137,8 @@ export class EmbedFoldRestorer {
 	 * restorer is quiet (no pass running and no render window open), so the next render starts a
 	 * new pass with a full budget. */
 	private readonly budgets = new Map<string, HostComparisonBudget>();
+	/** The dormancy reconcile of each host in the pass in progress (PR-7); dropped with `budgets`. */
+	private readonly reconciled = new Map<string, Promise<void>>();
 	private renderSeq = 0;
 	private disposed = false;
 
@@ -170,6 +178,7 @@ export class EmbedFoldRestorer {
 		this.renders.cancelAll();
 		this.verifier.cancelAll();
 		this.budgets.clear();
+		this.reconciled.clear();
 	}
 
 	/** How many embeds have a render window open. */
@@ -236,9 +245,27 @@ export class EmbedFoldRestorer {
 			})
 			.finally(() => {
 				this.inFlight.delete(task);
-				if (this.inFlight.size === 0 && this.renders.pendingCount === 0) this.budgets.clear();
+				if (this.inFlight.size === 0 && this.renders.pendingCount === 0) {
+					this.budgets.clear();
+					this.reconciled.clear();
+				}
 			});
 		this.inFlight.add(task);
+	}
+
+	/** Reconciles the host's embed records once per render pass (dropped with the budgets). A
+	 * failure is logged and leaves every record as it was. */
+	private reconcileHost(hostPath: string, hostText: string): Promise<void> {
+		const dormancy = this.deps.dormancy;
+		if (dormancy === undefined) return Promise.resolve();
+		let done = this.reconciled.get(hostPath);
+		if (done === undefined) {
+			done = dormancy.reconcileHost(hostPath, hostText).catch((err: unknown) => {
+				console.error("persistent-folded-state: embed dormancy failed", err);
+			});
+			this.reconciled.set(hostPath, done);
+		}
+		return done;
 	}
 
 	private budgetFor(hostPath: string): HostComparisonBudget {
@@ -279,6 +306,10 @@ export class EmbedFoldRestorer {
 			} catch {
 				return;
 			}
+			// PR-7: a retargeted or broken embed's record goes dormant, and one that is back is
+			// revived, before any embed of this host is read. Once per host per pass.
+			await this.reconcileHost(host.file.path, hostText);
+			if (this.stale(el, generation)) return;
 			const resolved = await resolveEmbedChain({
 				hostPath: host.file.path,
 				hostText,
@@ -291,6 +322,9 @@ export class EmbedFoldRestorer {
 			if (resolved === null || this.stale(el, generation)) return;
 
 			const snapshot = this.deps.store.getEmbed(resolved.identity);
+			// A record still stamped dormant after the host was reconciled could not be assessed
+			// (a read failed): its folds are neither applied nor changed on a guess (E6, G6).
+			if (snapshot?.dormantSince !== undefined) return;
 			const storedAnchors: Anchor[] = [];
 			for (const raw of snapshot?.folds ?? []) {
 				const anchor = parseAnchor(raw);
@@ -298,19 +332,22 @@ export class EmbedFoldRestorer {
 			}
 
 			// The source note changed so that the slice is empty: nothing to place, nothing to change.
-			// The record is left as it was (dormancy is PR-7's).
+			// The record is left as it was.
 			if (resolved.sliceText.trim() === "") return;
 
-			// The same builder and matcher a note's folds use, over the slice text alone (G3).
-			const candidates: AnchoredBlock[] = storedAnchors.length > 0 ? buildAnchors(resolved.sliceText) : [];
-			const rematch = await planEmbedRematch({
-				stored: storedAnchors,
-				storedHash: snapshot?.contentHash,
+			// The same builder and matcher a note's folds use, over the slice text alone (G3). The
+			// dormant anchors (PR-7, G14) are retried in the same matcher call, on every settled
+			// render of this embed (E5), sharing the host's comparison budget (E7).
+			const hasDormant = (snapshot?.dormant.length ?? 0) > 0;
+			const candidates: AnchoredBlock[] = storedAnchors.length > 0 || hasDormant ? buildAnchors(resolved.sliceText) : [];
+			const rematch = await planEmbedPass({
+				record: snapshot,
 				sliceHash: resolved.sliceHash,
 				candidates,
 				budget: this.budgetFor(host.file.path),
 				yieldToHost: () => new Promise<void>((resolve) => window.setTimeout(resolve, 0)),
 				matcherOptions: this.deps.matcherOptions,
+				now: (this.deps.now ?? Date.now)(),
 			});
 			const matches = rematch.matches;
 
@@ -341,7 +378,8 @@ export class EmbedFoldRestorer {
 					this.deps.store.setEmbed({
 						...current,
 						contentHash: rematch.update.contentHash,
-						folds: rematch.update.folds as unknown as StoredAnchor[],
+						folds: rematch.update.folds,
+						dormant: rematch.update.dormant,
 					});
 				}
 			}

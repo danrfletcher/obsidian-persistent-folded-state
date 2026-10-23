@@ -1,7 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FoldStore, STORE_VERSION } from "../../src/fold-store";
 import type { EmbedFoldRecord, EmbedIdentity } from "../../src/types";
 import { ANCHOR_LESSON_8, ANCHOR_TASK, SEED_EMBEDS, SEED_FILES } from "../fixtures/embed-seed";
+
+// The seed holds a dormant entry stamped at 1,000 ms. Since PR-7 the store forgets what has been
+// dormant for 10 minutes by the wall clock, so these tests pin the clock (Date only) inside that window.
+beforeEach(() => {
+	vi.useFakeTimers({ toFake: ["Date"] });
+	vi.setSystemTime(2_000);
+});
+afterEach(() => {
+	vi.useRealTimers();
+});
 
 function embed(id: EmbedIdentity, contentHash = "h", folds: Record<string, unknown>[] = []): EmbedFoldRecord {
 	return { ...id, contentHash, folds, dormant: [] };

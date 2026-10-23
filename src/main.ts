@@ -103,6 +103,7 @@ import { createEditorWatcher } from "./editor-watcher";
 import { restoreOnOpen } from "./open-restore";
 import { EmbedFoldRecorder } from "./embed-fold-recorder";
 import { EmbedFoldRestorer } from "./embed-fold-restorer";
+import { EmbedDormancyTracker } from "./embed-dormancy";
 import type { EmbedHost } from "./embed-host";
 
 /** Event name for the "settled non-user change" deliverable (E9/E10), triggered on
@@ -197,6 +198,21 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		this.registerEvent(this.app.workspace.on("window-open", (_win, popout) => recorder.attach(popout.document)));
 		this.registerEvent(this.app.workspace.on("window-close", (_win, popout) => recorder.detach(popout.document)));
 
+		// PR-7 (G6, E6): a retargeted or broken embed's stored state goes dormant for 10 minutes,
+		// then is forgotten. Read-only toward the vault; never called from a rename handler.
+		const dormancy = new EmbedDormancyTracker({ store: this.store, readNote, resolveLink });
+		this.registerEvent(
+			this.app.workspace.on("file-open", (file: TFile | null) => {
+				if (!file) return;
+				// A link changed while the host was closed starts its clock at the next open.
+				readNote(file.path)
+					.then((text) => (text === null ? undefined : dormancy.reconcileHost(file.path, text)))
+					.catch((err: unknown) => {
+						console.error("persistent-folded-state: embed dormancy on open failed", err);
+					});
+			})
+		);
+
 		const restorer = new EmbedFoldRestorer({
 			workspace: this.app.workspace,
 			store: this.store,
@@ -205,6 +221,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 			resolveLink,
 			positionOf,
 			whenRecorded: () => recorder.whenIdle(),
+			dormancy,
 		});
 		this.embedRestorer = restorer;
 		restorer.attach(document);

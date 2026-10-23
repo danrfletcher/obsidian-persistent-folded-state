@@ -29,7 +29,9 @@
  * by the structured fields host/target/subpath/occurrence and never by a persisted composite key.
  * They share the notes' dirty flag, debounce and flush chain. This PR only stores, loads and
  * forgets them; `handleRename`, `handleDelete` and `pruneOrphans` deliberately leave them alone
- * (embed variants are PR-8), and dormant expiry for them is PR-7.
+ * (embed variants are PR-8). Dormant expiry for them is PR-7 (G6, E6): a record whose embed went
+ * away carries `dormantSince` (`reconcileEmbedDormancy`), and `load()` and `flush()` forget it,
+ * and any per-anchor dormant entry, once it is 10 minutes old (src/embed-dormant.ts).
  *
  * PR-4 (recording): a nested embed's identity also carries the chain of embeds that contain it
  * (`EmbedIdentity.outer`, see src/types.ts), validated on load and folded into the in-memory key.
@@ -38,6 +40,8 @@
 import type { EmbedFoldRecord, EmbedIdentity, EmbedLinkId, FileFoldRecord, StoreData } from "./types";
 import { parseAnchor } from "./anchors";
 import { expireDormant, parseDormantAnchor } from "./dormant";
+import { expireEmbedRecords, isValidDormantSince, nextEmbedDormancy } from "./embed-dormant";
+import type { EmbedPresence } from "./embed-dormant";
 import { deleteFiles, pruneOrphanFiles, renameFiles } from "./vault-lifecycle";
 
 /** Bumped only if a later PR needs to migrate an incompatible on-disk shape. An unrecognised
@@ -126,8 +130,9 @@ function sanitizeOuter(value: unknown): EmbedLinkId[] | null {
 
 /** Validates one raw `embeds` entry. Returns null for anything malformed: not an object; a
  * missing or empty `host`/`target`; a non-string `subpath`; an `occurrence` that is not a
- * non-negative integer; a missing `contentHash`; `folds` not an array. Inside a valid record,
- * `folds` and `dormant` keep only entries that pass `parseAnchor`/`parseDormantAnchor`. */
+ * non-negative integer; a missing `contentHash`; `folds` not an array; a `dormantSince` that is
+ * present but not a finite, non-negative number (PR-7, E8). Inside a valid record, `folds` and
+ * `dormant` keep only entries that pass `parseAnchor`/`parseDormantAnchor`. */
 function sanitizeEmbedRecord(value: unknown): EmbedFoldRecord | null {
 	if (!isPlainObject(value)) return null;
 	const { host, target, subpath, occurrence, contentHash, folds, dormant } = value;
@@ -139,6 +144,11 @@ function sanitizeEmbedRecord(value: unknown): EmbedFoldRecord | null {
 	if (!Array.isArray(folds)) return null;
 	const outer = sanitizeOuter(value.outer);
 	if (outer === null) return null;
+	// PR-7 (E8): the whole-embed dormancy stamp is optional (a healthy embed has none), but when
+	// the field is there it has to be a finite, non-negative number; otherwise the record is
+	// dropped on load rather than guessed at.
+	const { dormantSince } = value;
+	if (dormantSince !== undefined && !isValidDormantSince(dormantSince)) return null;
 	return {
 		host,
 		target,
@@ -148,6 +158,7 @@ function sanitizeEmbedRecord(value: unknown): EmbedFoldRecord | null {
 		contentHash,
 		folds: sanitizeAnchorArray(folds),
 		dormant: sanitizeDormantArray(dormant),
+		...(dormantSince !== undefined ? { dormantSince } : {}),
 	};
 }
 
@@ -265,9 +276,20 @@ export class FoldStore {
 			files.set(path, { ...record, dormant: expireDormant(record.dormant, now) });
 		}
 		this.files = files;
-		this.embeds = new Map((sanitized.embeds ?? []).map((record) => [embedMapKey(record), record]));
+		// PR-7 (G6, E9): an embed state that stayed dormant for the whole window while the plugin
+		// was disabled (or Obsidian was shut) is forgotten here, by the wall clock; one still
+		// inside the window keeps its `dormantSince`, so the 10 minutes carry on across a relaunch.
+		const loadedEmbeds = sanitized.embeds ?? [];
+		const keptEmbeds = expireEmbedRecords(loadedEmbeds, now);
+		this.embeds = new Map(keptEmbeds.map((record) => [embedMapKey(record), record]));
 		this.dirty = false;
 		this.cancelScheduledFlush();
+		// T16: what was just forgotten here is still in `data.json` until the store writes again,
+		// and an unrelated write may never come: a record dropped (or a per-anchor dormant entry
+		// pruned) at load is written out by the ordinary debounce, so the file matches memory.
+		if (keptEmbeds.length !== loadedEmbeds.length || keptEmbeds.some((record, i) => record !== loadedEmbeds[i])) {
+			this.scheduleDebouncedFlush();
+		}
 	}
 
 	get(path: string): FileFoldRecord | undefined {
@@ -292,6 +314,54 @@ export class FoldStore {
 	/** Every stored embed record, in insertion order. */
 	embedRecords(): EmbedFoldRecord[] {
 		return [...this.embeds.values()];
+	}
+
+	/** Every stored embed record hosted by `host` (an exact path match), in insertion order. */
+	embedRecordsForHost(host: string): EmbedFoldRecord[] {
+		return [...this.embeds.values()].filter((record) => record.host === host);
+	}
+
+	/**
+	 * PR-7 (G6, E6): the one dormancy step. Applies `nextEmbedDormancy` (src/embed-dormant.ts) to
+	 * every record `host` owns, given how each stands (`presenceOf`, decided by the caller from
+	 * the host's source text and the targets, src/embed-dormancy.ts):
+	 *  - first seen absent or broken: stamped dormant at the store's `now`, its folds kept;
+	 *  - already dormant and seen absent or broken again: left alone, the clock does not restart;
+	 *  - dormant and live again inside the window: the stamp is removed, the folds apply as the
+	 *    embed renders;
+	 *  - dormant for the whole window: forgotten.
+	 * Only records that already exist can change (E12), and only the record concerned: no other
+	 * embed's record, and nothing in `files`, is read or changed (F2, G8). Nothing is written to
+	 * any note (F7). A change is flushed by the ordinary debounce, not at once: it is not a user
+	 * action.
+	 *
+	 * Deliberately a single function that only the render path calls and that a vault `rename`
+	 * handler never does: a link Obsidian rewrites itself after a rename or heading rename must
+	 * not start the clock, and the later rename and heading-rename migration (PR-8) re-keys the
+	 * records instead of going through here.
+	 */
+	reconcileEmbedDormancy(host: string, presenceOf: (record: EmbedFoldRecord) => EmbedPresence | undefined): { stamped: number; revived: number; forgotten: number } {
+		const now = this.nowFn();
+		const tally = { stamped: 0, revived: 0, forgotten: 0 };
+		for (const [key, record] of [...this.embeds]) {
+			if (record.host !== host) continue;
+			const presence = presenceOf(record);
+			if (presence === undefined) continue; // not assessed: left exactly as it is
+			const action = nextEmbedDormancy(record.dormantSince, presence, now);
+			if (action.kind === "stamp") {
+				this.embeds.set(key, { ...record, dormantSince: action.dormantSince });
+				tally.stamped++;
+			} else if (action.kind === "revive") {
+				const { dormantSince: _stamp, ...live } = record;
+				this.embeds.set(key, live);
+				tally.revived++;
+			} else if (action.kind === "forget") {
+				this.embeds.delete(key);
+				tally.forgotten++;
+			}
+		}
+		if (tally.stamped + tally.revived + tally.forgotten > 0) this.scheduleDebouncedFlush();
+		return tally;
 	}
 
 	/** Replaces the whole record for the embed `record` identifies (host, target, subpath and
@@ -452,6 +522,15 @@ export class FoldStore {
 				if (record.dormant.length === 0) continue;
 				const pruned = expireDormant(record.dormant, now);
 				if (pruned.length !== record.dormant.length) this.files.set(path, { ...record, dormant: pruned });
+			}
+			// PR-7: the same pruning for the embeds section: an embed state dormant for the
+			// whole window is forgotten, and a per-anchor dormant entry (G14) that aged out goes.
+			if (this.embeds.size > 0) {
+				const before = [...this.embeds.values()];
+				const after = expireEmbedRecords(before, now);
+				if (after.length !== before.length || after.some((record, i) => record !== before[i])) {
+					this.embeds = new Map(after.map((record) => [embedMapKey(record), record]));
+				}
 			}
 			const snapshot: StoreData = {
 				version: STORE_VERSION,
