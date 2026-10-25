@@ -1,0 +1,803 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "scripts/e2e-embed-probe.mjs",
+  "generatedAt": "2026-10-22T20:23:48.168Z",
+  "obsidianVersion": "1.14.4",
+  "verdicts": {
+    "live-preview": {
+      "block": {
+        "verdict": "supported"
+      },
+      "heading": {
+        "verdict": "supported"
+      },
+      "whole-note": {
+        "verdict": "supported"
+      }
+    },
+    "reading-view": {
+      "block": {
+        "verdict": "supported"
+      },
+      "heading": {
+        "verdict": "supported"
+      },
+      "whole-note": {
+        "verdict": "supported"
+      }
+    }
+  },
+  "combinations": [
+    {
+      "hostMode": "live-preview",
+      "kind": "block",
+      "verdict": "supported",
+      "reason": null,
+      "toggle": {
+        "selector": "li > .list-collapse-indicator.collapse-indicator",
+        "foundItems": [
+          {
+            "type": "list",
+            "label": "Lesson 8: Collections and frequency counting"
+          },
+          {
+            "type": "list",
+            "label": "Count word frequency with a map"
+          }
+        ],
+        "stateSignal": "is-collapsed class on the .collapse-indicator and on its owning li or heading"
+      },
+      "clickEvents": [
+        "pointerdown",
+        "mousedown",
+        "pointerup",
+        "mouseup",
+        "click",
+        "class-mutation",
+        "class-mutation"
+      ],
+      "clickChangedState": true,
+      "syntheticClickChangedState": true,
+      "render": {
+        "firstEventMs": 32.7,
+        "loadedMs": 32.7,
+        "firstRenderSettledMs": 45.4,
+        "bursts": 1,
+        "replacedElements": 0
+      },
+      "reopenRender": {
+        "firstEventMs": 21.5,
+        "loadedMs": 21.5,
+        "firstRenderSettledMs": 28.7,
+        "bursts": 1
+      },
+      "rerenderAfterSourceEdit": {
+        "bursts": 1,
+        "burstStartsMs": [
+          131.3
+        ],
+        "replacedElements": 0
+      },
+      "retainedAcrossReopen": true,
+      "retainedAcrossReopenWhy": null,
+      "retainedAcrossSourceEdit": false,
+      "retainedAcrossSourceEditWhy": null,
+      "sourceContentUpdatedAfterEdit": true,
+      "sourceContentReadMethod": "visible",
+      "unobservable": []
+    },
+    {
+      "hostMode": "live-preview",
+      "kind": "heading",
+      "verdict": "supported",
+      "reason": null,
+      "toggle": {
+        "selector": "h1-h6 > .heading-collapse-indicator.collapse-indicator",
+        "foundItems": [
+          {
+            "type": "heading",
+            "label": "Lesson 8"
+          },
+          {
+            "type": "list",
+            "label": "Lesson 8: Collections and frequency counting"
+          },
+          {
+            "type": "list",
+            "label": "Count word frequency with a map"
+          }
+        ],
+        "stateSignal": "is-collapsed class on the .collapse-indicator and on its owning li or heading"
+      },
+      "clickEvents": [
+        "pointerdown",
+        "mousedown",
+        "pointerup",
+        "mouseup",
+        "click",
+        "class-mutation",
+        "class-mutation"
+      ],
+      "clickChangedState": true,
+      "syntheticClickChangedState": true,
+      "render": {
+        "firstEventMs": 32.7,
+        "loadedMs": 32.7,
+        "firstRenderSettledMs": 48.1,
+        "bursts": 1,
+        "replacedElements": 0
+      },
+      "reopenRender": {
+        "firstEventMs": 21.6,
+        "loadedMs": 21.6,
+        "firstRenderSettledMs": 29.9,
+        "bursts": 1
+      },
+      "rerenderAfterSourceEdit": {
+        "bursts": 1,
+        "burstStartsMs": [
+          123.9
+        ],
+        "replacedElements": 0
+      },
+      "retainedAcrossReopen": true,
+      "retainedAcrossReopenWhy": null,
+      "retainedAcrossSourceEdit": true,
+      "retainedAcrossSourceEditWhy": null,
+      "sourceContentUpdatedAfterEdit": true,
+      "sourceContentReadMethod": "after-unfold",
+      "unobservable": []
+    },
+    {
+      "hostMode": "live-preview",
+      "kind": "whole-note",
+      "verdict": "supported",
+      "reason": null,
+      "toggle": {
+        "selector": "li > .list-collapse-indicator.collapse-indicator",
+        "foundItems": [
+          {
+            "type": "heading",
+            "label": "Probe Whole Note"
+          },
+          {
+            "type": "heading",
+            "label": "Section A"
+          },
+          {
+            "type": "list",
+            "label": "Item A1"
+          },
+          {
+            "type": "heading",
+            "label": "Section B"
+          },
+          {
+            "type": "list",
+            "label": "Item B1"
+          }
+        ],
+        "stateSignal": "is-collapsed class on the .collapse-indicator and on its owning li or heading"
+      },
+      "clickEvents": [
+        "pointerdown",
+        "mousedown",
+        "pointerup",
+        "mouseup",
+        "click",
+        "class-mutation",
+        "class-mutation"
+      ],
+      "clickChangedState": true,
+      "syntheticClickChangedState": true,
+      "render": {
+        "firstEventMs": 32.7,
+        "loadedMs": 32.7,
+        "firstRenderSettledMs": 50.7,
+        "bursts": 1,
+        "replacedElements": 0
+      },
+      "reopenRender": {
+        "firstEventMs": 21.6,
+        "loadedMs": 21.6,
+        "firstRenderSettledMs": 31.6,
+        "bursts": 1
+      },
+      "rerenderAfterSourceEdit": {
+        "bursts": 1,
+        "burstStartsMs": [
+          167.8
+        ],
+        "replacedElements": 0
+      },
+      "retainedAcrossReopen": true,
+      "retainedAcrossReopenWhy": null,
+      "retainedAcrossSourceEdit": true,
+      "retainedAcrossSourceEditWhy": null,
+      "sourceContentUpdatedAfterEdit": true,
+      "sourceContentReadMethod": "visible",
+      "unobservable": []
+    },
+    {
+      "hostMode": "reading-view",
+      "kind": "block",
+      "verdict": "supported",
+      "reason": null,
+      "toggle": {
+        "selector": "li > .list-collapse-indicator.collapse-indicator",
+        "foundItems": [
+          {
+            "type": "list",
+            "label": "Lesson 8: Collections and frequency counting"
+          },
+          {
+            "type": "list",
+            "label": "Count word frequency with a map"
+          }
+        ],
+        "stateSignal": "is-collapsed class on the .collapse-indicator and on its owning li or heading"
+      },
+      "clickEvents": [
+        "pointerdown",
+        "mousedown",
+        "pointerup",
+        "mouseup",
+        "click",
+        "class-mutation",
+        "class-mutation"
+      ],
+      "clickChangedState": true,
+      "syntheticClickChangedState": true,
+      "render": {
+        "firstEventMs": 24.1,
+        "loadedMs": 24.1,
+        "firstRenderSettledMs": 36.8,
+        "bursts": 1,
+        "replacedElements": 0
+      },
+      "reopenRender": {
+        "firstEventMs": 40.7,
+        "loadedMs": 40.7,
+        "firstRenderSettledMs": 51.4,
+        "bursts": 1
+      },
+      "rerenderAfterSourceEdit": {
+        "bursts": 1,
+        "burstStartsMs": [
+          133.8
+        ],
+        "replacedElements": 0
+      },
+      "retainedAcrossReopen": true,
+      "retainedAcrossReopenWhy": null,
+      "retainedAcrossSourceEdit": false,
+      "retainedAcrossSourceEditWhy": null,
+      "sourceContentUpdatedAfterEdit": true,
+      "sourceContentReadMethod": "visible",
+      "unobservable": []
+    },
+    {
+      "hostMode": "reading-view",
+      "kind": "heading",
+      "verdict": "supported",
+      "reason": null,
+      "toggle": {
+        "selector": "h1-h6 > .heading-collapse-indicator.collapse-indicator",
+        "foundItems": [
+          {
+            "type": "heading",
+            "label": "Lesson 8"
+          },
+          {
+            "type": "list",
+            "label": "Lesson 8: Collections and frequency counting"
+          },
+          {
+            "type": "list",
+            "label": "Count word frequency with a map"
+          }
+        ],
+        "stateSignal": "is-collapsed class on the .collapse-indicator and on its owning li or heading"
+      },
+      "clickEvents": [
+        "pointerdown",
+        "mousedown",
+        "pointerup",
+        "mouseup",
+        "click",
+        "class-mutation",
+        "class-mutation"
+      ],
+      "clickChangedState": true,
+      "syntheticClickChangedState": true,
+      "render": {
+        "firstEventMs": 24.1,
+        "loadedMs": 24.1,
+        "firstRenderSettledMs": 38.7,
+        "bursts": 1,
+        "replacedElements": 0
+      },
+      "reopenRender": {
+        "firstEventMs": 40.7,
+        "loadedMs": 40.7,
+        "firstRenderSettledMs": 53.2,
+        "bursts": 1
+      },
+      "rerenderAfterSourceEdit": {
+        "bursts": 1,
+        "burstStartsMs": [
+          127.2
+        ],
+        "replacedElements": 0
+      },
+      "retainedAcrossReopen": true,
+      "retainedAcrossReopenWhy": null,
+      "retainedAcrossSourceEdit": true,
+      "retainedAcrossSourceEditWhy": null,
+      "sourceContentUpdatedAfterEdit": true,
+      "sourceContentReadMethod": "after-unfold",
+      "unobservable": []
+    },
+    {
+      "hostMode": "reading-view",
+      "kind": "whole-note",
+      "verdict": "supported",
+      "reason": null,
+      "toggle": {
+        "selector": "li > .list-collapse-indicator.collapse-indicator",
+        "foundItems": [
+          {
+            "type": "heading",
+            "label": "Probe Whole Note"
+          },
+          {
+            "type": "heading",
+            "label": "Section A"
+          },
+          {
+            "type": "list",
+            "label": "Item A1"
+          },
+          {
+            "type": "heading",
+            "label": "Section B"
+          },
+          {
+            "type": "list",
+            "label": "Item B1"
+          }
+        ],
+        "stateSignal": "is-collapsed class on the .collapse-indicator and on its owning li or heading"
+      },
+      "clickEvents": [
+        "pointerdown",
+        "mousedown",
+        "pointerup",
+        "mouseup",
+        "click",
+        "class-mutation",
+        "class-mutation"
+      ],
+      "clickChangedState": true,
+      "syntheticClickChangedState": true,
+      "render": {
+        "firstEventMs": 24.1,
+        "loadedMs": 24.1,
+        "firstRenderSettledMs": 41.3,
+        "bursts": 1,
+        "replacedElements": 0
+      },
+      "reopenRender": {
+        "firstEventMs": 40.7,
+        "loadedMs": 40.7,
+        "firstRenderSettledMs": 55.9,
+        "bursts": 1
+      },
+      "rerenderAfterSourceEdit": {
+        "bursts": 1,
+        "burstStartsMs": [
+          161.1
+        ],
+        "replacedElements": 0
+      },
+      "retainedAcrossReopen": true,
+      "retainedAcrossReopenWhy": null,
+      "retainedAcrossSourceEdit": true,
+      "retainedAcrossSourceEditWhy": null,
+      "sourceContentUpdatedAfterEdit": true,
+      "sourceContentReadMethod": "visible",
+      "unobservable": []
+    }
+  ],
+  "foldMemory": {
+    "question": "Is Obsidian's embed fold memory keyed to the source note?",
+    "keyedToSourceNote": true,
+    "danObservation": "refuted",
+    "perKind": {
+      "block": "confirmed",
+      "heading": "confirmed",
+      "whole-note": "refuted"
+    },
+    "statement": "Refuted for whole-note embed. Folded on its own, whole-note embed: the fold also showed up in the source note opened on its own; the same embed in a second host note; the `![](x.md)` embed of the same note in the same host, after the host was reopened. So Obsidian's own fold memory is not independent of the source note for that kind. Confirmed independent for block embed, heading embed.",
+    "perMode": {
+      "lp": {
+        "block": {
+          "obsidianWritesKeyForSourceNote": true,
+          "storageKeys": [
+            "forgetembeds-note-fold-embed-probe/Probe Fundamentals.md"
+          ],
+          "sourceNoteOpensFolded": false,
+          "secondEmbedInSecondHostFolded": false,
+          "secondEmbedOfSameNoteInSameHostFolded": "not-applicable",
+          "answer": "confirmed"
+        },
+        "heading": {
+          "obsidianWritesKeyForSourceNote": true,
+          "storageKeys": [
+            "forgetembeds-note-fold-embed-probe/Probe Fundamentals.md"
+          ],
+          "sourceNoteOpensFolded": false,
+          "secondEmbedInSecondHostFolded": false,
+          "secondEmbedOfSameNoteInSameHostFolded": "not-applicable",
+          "answer": "confirmed"
+        },
+        "whole-note": {
+          "obsidianWritesKeyForSourceNote": true,
+          "storageKeys": [
+            "forgetembeds-note-fold-embed-probe/Probe Whole Note.md"
+          ],
+          "sourceNoteOpensFolded": true,
+          "secondEmbedInSecondHostFolded": true,
+          "secondEmbedOfSameNoteInSameHostFolded": true,
+          "answer": "refuted",
+          "leakedTo": [
+            "the source note opened on its own",
+            "the same embed in a second host note",
+            "the `![](x.md)` embed of the same note in the same host, after the host was reopened"
+          ]
+        }
+      },
+      "rv": {
+        "block": {
+          "obsidianWritesKeyForSourceNote": true,
+          "storageKeys": [
+            "forgetembeds-note-fold-embed-probe/Probe Fundamentals.md"
+          ],
+          "sourceNoteOpensFolded": false,
+          "secondEmbedInSecondHostFolded": false,
+          "secondEmbedOfSameNoteInSameHostFolded": "not-applicable",
+          "answer": "confirmed"
+        },
+        "heading": {
+          "obsidianWritesKeyForSourceNote": true,
+          "storageKeys": [
+            "forgetembeds-note-fold-embed-probe/Probe Fundamentals.md"
+          ],
+          "sourceNoteOpensFolded": false,
+          "secondEmbedInSecondHostFolded": false,
+          "secondEmbedOfSameNoteInSameHostFolded": "not-applicable",
+          "answer": "confirmed"
+        },
+        "whole-note": {
+          "obsidianWritesKeyForSourceNote": true,
+          "storageKeys": [
+            "forgetembeds-note-fold-embed-probe/Probe Whole Note.md"
+          ],
+          "sourceNoteOpensFolded": true,
+          "secondEmbedInSecondHostFolded": true,
+          "secondEmbedOfSameNoteInSameHostFolded": true,
+          "answer": "refuted",
+          "leakedTo": [
+            "the source note opened on its own",
+            "the same embed in a second host note",
+            "the `![](x.md)` embed of the same note in the same host, after the host was reopened"
+          ]
+        }
+      }
+    }
+  },
+  "fixtureCoverage": {
+    "live-preview": {
+      "block": {
+        "tag": "div",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": "block",
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "live-preview"
+        },
+        "toggleCount": 2
+      },
+      "heading": {
+        "tag": "div",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": "heading",
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "live-preview"
+        },
+        "toggleCount": 3
+      },
+      "whole-note": {
+        "tag": "div",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": null,
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "live-preview"
+        },
+        "toggleCount": 5
+      },
+      "md-link": {
+        "tag": "div",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": null,
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "live-preview"
+        },
+        "toggleCount": 5
+      },
+      "image": {
+        "tag": "div",
+        "classes": [
+          "internal-embed",
+          "media-embed",
+          "image-embed",
+          "is-loaded",
+          "no-hover-actions"
+        ],
+        "dataType": null,
+        "isNoteEmbed": false,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": null,
+        "toggleCount": 0
+      },
+      "nested": {
+        "tag": "div",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": null,
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 1,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "live-preview"
+        },
+        "toggleCount": 2
+      }
+    },
+    "reading-view": {
+      "block": {
+        "tag": "span",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": "block",
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "reading-view"
+        },
+        "toggleCount": 2
+      },
+      "heading": {
+        "tag": "span",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": "heading",
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "reading-view"
+        },
+        "toggleCount": 3
+      },
+      "whole-note": {
+        "tag": "span",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": null,
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "reading-view"
+        },
+        "toggleCount": 5
+      },
+      "md-link": {
+        "tag": "span",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": null,
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "reading-view"
+        },
+        "toggleCount": 5
+      },
+      "image": {
+        "tag": "span",
+        "classes": [
+          "internal-embed",
+          "media-embed",
+          "image-embed",
+          "is-loaded"
+        ],
+        "dataType": null,
+        "isNoteEmbed": false,
+        "rendered": true,
+        "nestedEmbeds": 0,
+        "detectedAsHost": null,
+        "toggleCount": 0
+      },
+      "nested": {
+        "tag": "span",
+        "classes": [
+          "internal-embed",
+          "markdown-embed",
+          "inline-embed",
+          "is-loaded"
+        ],
+        "dataType": null,
+        "isNoteEmbed": true,
+        "rendered": true,
+        "nestedEmbeds": 1,
+        "detectedAsHost": {
+          "file": "embed-probe/Probe Host.md",
+          "mode": "reading-view"
+        },
+        "toggleCount": 2
+      }
+    }
+  },
+  "hostDetection": {
+    "live-preview": {
+      "lesson8BlockEmbedDetected": true,
+      "detectedAs": {
+        "file": "embed-probe/Probe Host.md",
+        "mode": "live-preview"
+      }
+    },
+    "reading-view": {
+      "lesson8BlockEmbedDetected": true,
+      "detectedAs": {
+        "file": "embed-probe/Probe Host.md",
+        "mode": "reading-view"
+      }
+    }
+  },
+  "lazyRendering": {
+    "live-preview": {
+      "embedsInHost": 51,
+      "samples": [
+        {
+          "atMs": 0,
+          "actualMs": 0,
+          "inDom": 21,
+          "rendered": 21
+        },
+        {
+          "atMs": 1000,
+          "actualMs": 999.3,
+          "inDom": 5,
+          "rendered": 5
+        },
+        {
+          "atMs": 5000,
+          "actualMs": 5003.3,
+          "inDom": 5,
+          "rendered": 5
+        }
+      ]
+    },
+    "reading-view": {
+      "embedsInHost": 51,
+      "samples": [
+        {
+          "atMs": 0,
+          "actualMs": 0,
+          "inDom": 0,
+          "rendered": 0
+        },
+        {
+          "atMs": 1000,
+          "actualMs": 1001.5,
+          "inDom": 7,
+          "rendered": 7
+        },
+        {
+          "atMs": 5000,
+          "actualMs": 5001.5,
+          "inDom": 7,
+          "rendered": 7
+        }
+      ]
+    }
+  },
+  "hoverPreview": {
+    "popovers": [
+      {
+        "classes": [
+          "popover",
+          "hover-popover"
+        ],
+        "embeds": 4,
+        "noteEmbeds": 4,
+        "loadedNoteEmbeds": 4,
+        "insideWorkspaceMarkdownView": false,
+        "detections": [
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    ],
+    "opened": true
+  },
+  "fixtureRestored": true,
+  "stepErrors": []
+}

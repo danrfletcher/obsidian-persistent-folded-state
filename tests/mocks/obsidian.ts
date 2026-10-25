@@ -145,9 +145,83 @@ export class Editor {
 	constructor(public cm?: unknown) {}
 }
 
+/** The DOM shape a real `MarkdownView` keeps (proven by scripts/e2e-embed-probe.mjs): both
+ * surfaces live under `containerEl`, and the one that does not match the current mode is hidden,
+ * not removed. */
+export function buildViewContainer(doc: Document = document): HTMLElement {
+	const containerEl = doc.createElement("div");
+	containerEl.className = "workspace-leaf-content";
+	const content = doc.createElement("div");
+	content.className = "view-content";
+	const sourceView = doc.createElement("div");
+	sourceView.className = "markdown-source-view cm-s-obsidian mod-cm6";
+	const readingView = doc.createElement("div");
+	readingView.className = "markdown-reading-view";
+	content.append(sourceView, readingView);
+	containerEl.append(content);
+	return containerEl;
+}
+
 export class MarkdownView {
 	file: TFile | null = null;
 	editor?: Editor;
+	/** Real `MarkdownView.getMode()` returns "source" (Source mode and Live Preview alike) or
+	 * "preview" (Reading view). A test sets `mode` directly. */
+	mode: "source" | "preview" = "source";
+	/** Real `getState().source` is true in Source mode and false in Live Preview (both report
+	 * `getMode() === "source"`). A test sets it directly. */
+	sourceMode = false;
+	/** Real `MarkdownView.containerEl`; a test appends embed elements to `sourceSurface()` or
+	 * `readingSurface()`. A pop-out window pane passes a `Document` from another window. */
+	containerEl: HTMLElement;
+	constructor(doc: Document = document) {
+		this.containerEl = buildViewContainer(doc);
+	}
+	getMode(): "source" | "preview" {
+		return this.mode;
+	}
+	getViewType(): string {
+		return "markdown";
+	}
+	getState(): Record<string, unknown> {
+		return { file: this.file?.path, mode: this.mode, source: this.sourceMode };
+	}
+	/** Real `TextFileView.data` / `getViewData()`: the note's current text. A test sets `data`. */
+	data = "";
+	getViewData(): string {
+		return this.data;
+	}
+	sourceSurface(): HTMLElement {
+		return this.containerEl.querySelector(".markdown-source-view") as HTMLElement;
+	}
+	readingSurface(): HTMLElement {
+		return this.containerEl.querySelector(".markdown-reading-view") as HTMLElement;
+	}
+}
+
+/** A canvas / graph / image style view: a workspace leaf's view that is deliberately not a
+ * `MarkdownView`, but has its own `containerEl` (a canvas card's embedded markdown lives in it). */
+export class CanvasLikeView {
+	containerEl: HTMLElement;
+	constructor(
+		private readonly type = "canvas",
+		doc: Document = document
+	) {
+		this.containerEl = doc.createElement("div");
+		this.containerEl.className = "workspace-leaf-content";
+	}
+	getViewType(): string {
+		return this.type;
+	}
+}
+
+/** A hover popover / page preview: real Obsidian appends `.hover-popover` to the document body,
+ * outside every workspace leaf. Its embeds are not workspace Markdown views. */
+export function buildHoverPopover(doc: Document = document): HTMLElement {
+	const popover = doc.createElement("div");
+	popover.className = "popover hover-popover";
+	doc.body.append(popover);
+	return popover;
 }
 
 /** Just enough of real Obsidian's `Vault` (PR-7, G9/G10) to exercise `app.vault.on("rename"/
@@ -170,6 +244,56 @@ export class Vault extends Events {
 		if (exists) this.paths.add(path);
 		else this.paths.delete(path);
 	}
+
+	private contents = new Map<string, string>();
+	/** Test helper: a note that exists and has this text (what `cachedRead` returns). */
+	setContent(path: string, text: string): void {
+		this.paths.add(path);
+		this.contents.set(path, text);
+	}
+	/** Every path a test has told this vault about. */
+	allPaths(): string[] {
+		return [...this.paths];
+	}
+	/** Real `Vault.getFileByPath`: the file, or null. */
+	getFileByPath(path: string): TFile | null {
+		return this.paths.has(path) ? new TFile(path) : null;
+	}
+	/** Real `Vault.cachedRead`: read-only; "" for a note with no text set. */
+	async cachedRead(file: TFile): Promise<string> {
+		return this.contents.get(file.path) ?? "";
+	}
+}
+
+/** Just enough of real `MetadataCache`: `getFirstLinkpathDest` (an exact path, with or without
+ * `.md`, else the first note whose name matches, else null; ignores the source path), the `Events`
+ * base (so `metadataCache.on("changed", ...)` and `trigger("changed", file, data, cache)` behave as
+ * in Obsidian) and `getFileCache` over caches a test sets with `setCache`. */
+export interface MockCachedMetadata {
+	headings?: { heading: string; level: number }[];
+	embeds?: { link: string }[];
+}
+
+export class MetadataCache extends Events {
+	private caches = new Map<string, MockCachedMetadata>();
+	constructor(private readonly vault: Vault) {
+		super();
+	}
+	/** Test helper: the cache `getFileCache` answers for `path`. */
+	setCache(path: string, cache: MockCachedMetadata): void {
+		this.caches.set(path, cache);
+	}
+	getFileCache(file: TFile): MockCachedMetadata | null {
+		return this.caches.get(file.path) ?? null;
+	}
+	getFirstLinkpathDest(linkpath: string, _sourcePath: string): TFile | null {
+		const wanted = linkpath.replace(/\.md$/i, "");
+		for (const path of this.vault.allPaths()) {
+			const bare = path.replace(/\.md$/i, "");
+			if (bare === wanted || bare.slice(bare.lastIndexOf("/") + 1) === wanted) return new TFile(path);
+		}
+		return null;
+	}
 }
 
 /** PR-7 adds `extends Events` (real Obsidian's `Workspace` does too) so `on("file-open", ...)`/
@@ -179,6 +303,17 @@ export class Vault extends Events {
  * set it directly" rationale as `getActiveViewOfType`. */
 export class Workspace extends Events {
 	private active: unknown = null;
+	private leaves: { view: unknown }[] = [];
+	/** Test helper: opens a leaf holding `view`, in the order real `iterateAllLeaves` would visit. */
+	addLeaf(view: unknown): { view: unknown } {
+		const leaf = { view };
+		this.leaves.push(leaf);
+		return leaf;
+	}
+	/** Real Obsidian's `Workspace.iterateAllLeaves` (main area, sidebars and pop-out windows). */
+	iterateAllLeaves(callback: (leaf: { view: unknown }) => unknown): void {
+		for (const leaf of [...this.leaves]) callback(leaf);
+	}
 	/** PR-7 (R1): starts `false` — unlike real Obsidian (where layout readiness depends on the
 	 * app's own startup sequence, already finished long before most tests' synchronous setup
 	 * runs), a test here must opt in to "layout is ready" explicitly via `triggerLayoutReady`,
@@ -227,6 +362,7 @@ export class Workspace extends Events {
 export class App {
 	workspace = new Workspace();
 	vault = new Vault();
+	metadataCache = new MetadataCache(this.vault);
 }
 
 // --- UI --------------------------------------------------------------------------------------

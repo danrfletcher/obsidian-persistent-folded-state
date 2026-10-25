@@ -80,3 +80,133 @@ describe("fence: F1 — no write-capable vault/editor/adapter API reached for by
 	// disk) and was never what F1 was guarding against.
 });
 
+
+describe("fence: F3 — src/embed-host.ts is detection only", () => {
+	const hostText = readFileSync(join(SRC, "embed-host.ts"), "utf8");
+	// Comments are stripped first: the file's own doc comment legitimately names what it must not do.
+	const code = hostText.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+	const FORBIDDEN = [
+		{ label: "fold dispatch (.dispatch()", pattern: /\.dispatch\s*\(/ },
+		{ label: "foldEffect", pattern: /\bfoldEffect\b/ },
+		{ label: "unfoldEffect", pattern: /\bunfoldEffect\b/ },
+		{ label: "foldCode / unfoldCode", pattern: /\b(?:foldCode|unfoldCode|toggleFold)\b/ },
+		{ label: "registerMarkdownPostProcessor", pattern: /\bregisterMarkdownPostProcessor\b/ },
+		{ label: "registerMarkdownCodeBlockProcessor", pattern: /\bregisterMarkdownCodeBlockProcessor\b/ },
+		{ label: "registerEvent / registerDomEvent / registerEditorExtension", pattern: /\bregister(?:Event|DomEvent|EditorExtension|Interval)\b/ },
+		{ label: "canvas hooks", pattern: /canvas/i },
+		{ label: "hover hooks (hover-link, page-preview, hover-popover)", pattern: /hover-link|page-preview|hover-popover|HoverParent/i },
+		{ label: "Bases hooks", pattern: /\bbases?\b/i },
+		{ label: "a MutationObserver or event listener", pattern: /\bMutationObserver\b|\baddEventListener\b/ },
+	];
+
+	it.each(FORBIDDEN)("src/embed-host.ts has no $label", ({ pattern }) => {
+		expect(code).not.toMatch(pattern);
+	});
+
+	it("src/embed-host.ts uses no desktop-only API (E11): no electron, fs, path or process", () => {
+		expect(code).not.toMatch(/from\s+["'](?:electron|fs|path|node:[a-z/]+|child_process|os)["']|\brequire\s*\(|\bprocess\./);
+	});
+
+	it("src/embed-capabilities.ts imports nothing and reaches no host API", () => {
+		const text = readFileSync(join(SRC, "embed-capabilities.ts"), "utf8");
+		expect(text).not.toMatch(/^\s*import\s/m);
+	});
+
+	it("manifest.json still has isDesktopOnly: false (E11)", () => {
+		const manifest = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8")) as { isDesktopOnly: boolean };
+		expect(manifest.isDesktopOnly).toBe(false);
+	});
+});
+
+describe("fence: F3 — src/main.ts adds no post processor for embed detection", () => {
+	const mainText = readFileSync(join(SRC, "main.ts"), "utf8");
+
+	it("src/main.ts registers no markdown post processor (the command list is pinned in tests/unit/lifecycle.test.ts)", () => {
+		expect(mainText).not.toMatch(/registerMarkdownPostProcessor|registerMarkdownCodeBlockProcessor/);
+	});
+});
+
+// Ticket warkworth-21 PR-5: the embed restore (src/embed-fold-restorer.ts, src/embed-restore-plan.ts,
+// src/embed-render-coalescer.ts) reads the stored embed state and drives the embed's own arrows.
+// Comments are stripped first: the files' doc comments name what they must never do.
+describe("fence: PR-5 embed restore files", () => {
+	const RESTORE_FILES = ["embed-fold-restorer.ts", "embed-restore-plan.ts", "embed-render-coalescer.ts"];
+	const sources = RESTORE_FILES.map((name) => {
+		const text = readFileSync(join(SRC, name), "utf8");
+		return { name, text, code: text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "") };
+	});
+	const restorer = sources[0].code;
+
+	it.each(sources.map((s) => [s.name, s.code] as const))("%s uses no localStorage, loadLocalStorage or saveLocalStorage (F10)", (_name, code) => {
+		expect(code).not.toMatch(/localStorage|loadLocalStorage|saveLocalStorage/);
+	});
+
+	it.each(sources.map((s) => [s.name, s.code] as const))("%s reaches for no write-capable vault, editor or adapter API (F7)", (_name, code) => {
+		expect(code).not.toMatch(/\bvault\.(?:modify|append|create|process|delete|rename|trash)\s*\(|\badapter\b|\breplaceRange\b|\breplaceSelection\b|\bsetValue\b/);
+	});
+
+	it("the restorer drives folds only through the embed's own arrow: no CM6 dispatch, fold effect or fold command (F10)", () => {
+		expect(restorer).not.toMatch(/\.dispatch\s*\(|\bfoldEffect\b|\bunfoldEffect\b|\bfoldCode\b|\bunfoldCode\b|\btoggleFold\b/);
+		expect(restorer).toMatch(/indicator\.click\s*\(/);
+	});
+
+	it("the restorer adds no element, attribute, class or control to the page (F1)", () => {
+		expect(restorer).not.toMatch(/\bcreateElement\b|\bcreateDiv\b|\bcreateEl\b|\bcreateSpan\b|\.append\s*\(|\.prepend\s*\(|\.insertAdjacent|\.innerHTML|\.outerHTML|\.setAttribute\s*\(|\.classList\.(?:add|toggle|replace)\s*\(|\.style\b|\.textContent\s*=/);
+		expect(restorer).not.toMatch(/\baddCommand\b|\baddSettingTab\b|\baddRibbonIcon\b|\baddStatusBarItem\b|\bregisterView\b/);
+	});
+
+	it("the restorer's only store calls are the read of the one embed's record and its refresh after a re-match, and it never reads a note's own state (F2)", () => {
+		expect(restorer).not.toMatch(/\.files\b|\bstore\.get\s*\(|\.embedRecords\s*\(/);
+		// PR-6: the one write is `setEmbed`, bringing a changed slice's anchors and hash up to date.
+		const calls = [...restorer.matchAll(/\bstore\.(\w+)/g)].map((m) => m[1]);
+		expect(new Set(calls)).toEqual(new Set(["getEmbed", "setEmbed"]));
+		expect(readFileSync(join(SRC, "embed-fold-restorer.ts"), "utf8")).toMatch(/store:\s*\{\s*getEmbed\(id: EmbedIdentity\)/);
+	});
+
+	it("restore reuses buildAnchors and matchAnchors from the existing modules, with no second matcher and no copied constants", () => {
+		expect(restorer).toMatch(/import\s*\{[^}]*\bbuildAnchors\b[^}]*\}\s*from\s*"\.\/anchors"/);
+		// PR-6: the matcher call moved into the re-match planner (src/embed-rematch.ts). PR-7: the restorer
+		// calls it through the embed pass (src/embed-anchor-dormancy.ts), which also retries dormant anchors.
+		expect(restorer).toMatch(/import\s*\{[^}]*\bplanEmbedPass\b[^}]*\}\s*from\s*"\.\/embed-anchor-dormancy"/);
+		const passText = readFileSync(join(SRC, "embed-anchor-dormancy.ts"), "utf8");
+		expect(passText).toMatch(/import\s*\{[^}]*\bplanEmbedRematch\b[^}]*\}\s*from\s*"\.\/embed-rematch"/);
+		expect(passText).toMatch(/import\s*\{[^}]*\bdropDormantClaimedByActive\b[^}]*\}\s*from\s*"\.\/dormant"/);
+		const matcherText = readFileSync(join(SRC, "matcher.ts"), "utf8");
+		const constants = [...matcherText.matchAll(/^export const (\w+)\s*=\s*([\d.]+);/gm)];
+		expect(constants.length).toBeGreaterThan(0);
+		for (const { name, code } of sources) {
+			expect(code, `${name}: no similarity or threshold of its own`).not.toMatch(/\bsimilarity\b|[Tt]hreshold|\bfunction\s+\w*[Mm]atch\w*|\bimport[^;]*"\.\/similarity"/);
+			for (const [, constName, value] of constants) {
+				expect(code, `${name}: copies matcher constant ${constName}`).not.toMatch(new RegExp(`\\b${constName}\\b`));
+				expect(code, `${name}: copies the value of ${constName} (${value})`).not.toMatch(new RegExp(`(?:=|:)\\s*${value.replace(".", "\\.")}\\b`));
+			}
+		}
+	});
+
+	it("restore matches over PR-3's slice text only: it builds anchors from the slice, never from the host or source note", () => {
+		expect(restorer).toMatch(/buildAnchors\(resolved\.sliceText\)/);
+		expect(restorer).not.toMatch(/buildAnchors\((?!resolved\.sliceText)/);
+	});
+
+	it("the embed key and slice come from the recorder's own chain resolution, shared rather than copied", () => {
+		expect(restorer).toMatch(/resolveEmbedChain\(/);
+		expect(restorer).not.toMatch(/\blocateEmbed\b|\bsliceEmbed\b|\bfindEmbeds\b/);
+	});
+
+	it("the planner and the coalescer are free of the DOM, Obsidian, the store and timers of their own", () => {
+		for (const { name, code } of sources.slice(1)) {
+			expect(code, name).not.toMatch(/from\s+["']obsidian["']|from\s+["']@codemirror|\bdocument\b|\bfold-store\b/);
+		}
+		expect(sources[1].code).not.toMatch(/\bwindow\b|\bsetTimeout\b|\bDate\b/);
+		// The render window is a SettleDebouncer of its own, never the store's flush timer.
+		expect(sources[2].code).toMatch(/new SettleDebouncer</);
+		expect(sources[2].code).not.toMatch(/FoldStore|flushAtOnce/);
+	});
+
+	it("manifest.json still has isDesktopOnly: false (no desktop-only API in the restore)", () => {
+		const manifest = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8")) as { isDesktopOnly: boolean };
+		expect(manifest.isDesktopOnly).toBe(false);
+		for (const { name, code } of sources) expect(code, name).not.toMatch(/from\s+["'](?:electron|fs|path|node:[a-z/]+|child_process|os)["']|\brequire\s*\(|\bprocess\./);
+	});
+});

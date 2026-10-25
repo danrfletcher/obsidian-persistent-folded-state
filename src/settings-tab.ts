@@ -30,7 +30,7 @@ export class PersistentFoldedStateSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Forget all stored folds")
-			.setDesc("Clears every note's stored fold state on this device. This cannot be undone.")
+			.setDesc("Clears every note's and every embed's stored fold state on this device. This cannot be undone.")
 			.addButton((button) =>
 				button
 					.setButtonText("Forget all stored folds")
@@ -40,8 +40,11 @@ export class PersistentFoldedStateSettingTab extends PluginSettingTab {
 						this.modalOpen = true;
 
 						const modal = new ForgetAllFoldsModal(this.app, () => {
+							const embeds = this.plugin.store.embedSize;
 							const count = this.plugin.store.forgetAll();
-							new Notice(count === 1 ? "Cleared stored folds for 1 note." : `Cleared stored folds for ${count} notes.`);
+							const notes = count === 1 ? "1 note" : `${count} notes`;
+							const embedPart = embeds === 0 ? "" : embeds === 1 ? " and 1 embed" : ` and ${embeds} embeds`;
+							new Notice(`Cleared stored folds for ${notes}${embedPart}.`);
 						});
 						const originalOnClose = modal.onClose.bind(modal);
 						modal.onClose = () => {

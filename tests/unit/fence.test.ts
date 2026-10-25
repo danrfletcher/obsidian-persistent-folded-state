@@ -70,6 +70,28 @@ describe("fence: no extra UI surface beyond this PR's command/button/modal (F7)"
 	});
 });
 
+// Ticket warkworth-21 PR-1 (F4/F9): embed state is stored in the plugin's own data.json through
+// loadData/saveData only. No new file, folder or vault note may be created, and no node fs/net
+// module reached for, by any src file (including ones added later in this stack).
+const NO_NEW_FILES_OR_NETWORK: { label: string; pattern: RegExp }[] = [
+	{ label: "node:fs import", pattern: /from\s+[\"'](node:)?fs(\/promises)?[\"']/ },
+	{ label: "adapter write/mkdir/append/remove/rename", pattern: /\badapter\.(write|writeBinary|append|appendBinary|mkdir|rmdir|remove|rename|copy)\w*\s*\(/ },
+	{ label: "vault.createFolder/createBinary/copy/rename/delete/trash", pattern: /\bvault\.(createFolder|createBinary|copy|rename|delete|trash)\s*\(/ },
+	{ label: "fileManager.renameFile/trashFile/processFrontMatter", pattern: /\bfileManager\.(renameFile|trashFile|processFrontMatter)\s*\(/ },
+	{ label: "localStorage", pattern: /\blocalStorage\b/ },
+];
+
+describe("fence: embed state adds no new file, folder, note or network surface (F4/F9)", () => {
+	it.each(NO_NEW_FILES_OR_NETWORK)("src/ does not use $label", ({ pattern }) => {
+		expect(srcText).not.toMatch(pattern);
+	});
+
+	it("the command list stays exactly one registration, with no ribbon, status bar or view", () => {
+		expect(srcText.match(/\.addCommand\s*\(/g) ?? []).toHaveLength(1);
+		expect(srcText).not.toMatch(/\b(addRibbonIcon|addStatusBarItem|registerView)\s*\(/);
+	});
+});
+
 describe("fence: manifest.json", () => {
 	const manifest = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8"));
 
@@ -96,4 +118,38 @@ describe("fence: built main.js (run `npm run build` first)", () => {
 	if (!built) {
 		it.skip("main.js has not been built yet — run `npm run build` before this suite to check the bundle too", () => {});
 	}
+});
+
+// Ticket warkworth-21 PR-5 (F1/F3/F7): the embed restore adds no UI surface and acts only on
+// workspace markdown views.
+describe("fence: PR-5 embed restore adds no UI surface and acts only on workspace markdown views", () => {
+	const RESTORE = ["embed-fold-restorer.ts", "embed-restore-plan.ts", "embed-render-coalescer.ts"].map((name) => ({
+		name,
+		code: readFileSync(join(SRC, name), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, ""),
+	}));
+
+	it.each(RESTORE.map((r) => [r.name, r.code] as const))("%s registers no command, setting, modal, ribbon, status bar item or view (F7)", (_name, code) => {
+		expect(code).not.toMatch(/\.addCommand\s*\(|\.addSettingTab\s*\(|extends Modal\b|\baddRibbonIcon\b|\baddStatusBarItem\b|\bregisterView\b|\bregisterMarkdownPostProcessor\b/);
+	});
+
+	it.each(RESTORE.map((r) => [r.name, r.code] as const))("%s reaches for no network or telemetry API (F8)", (_name, code) => {
+		for (const { pattern } of FORBIDDEN) expect(code).not.toMatch(pattern);
+	});
+
+	it("every restore pass goes through detectEmbedHost, which accepts only a workspace markdown view in Live Preview or Reading view (F3)", () => {
+		const restorer = RESTORE[0].code;
+		expect(restorer).toMatch(/detectEmbedHost\(this\.deps\.workspace, el\)/);
+		expect(restorer).toMatch(/if \(host === null \|\| !this\.supported\(host, el\)\) return;/);
+		// No path from a DOM element to a fold that skips the host check: the only click is after it.
+		expect(restorer.indexOf("detectEmbedHost(")).toBeGreaterThan(-1);
+		expect(restorer.indexOf("detectEmbedHost(")).toBeLessThan(restorer.indexOf("indicator.click("));
+	});
+
+	it("src/ still has one command and one settings tab, and the restorer is created and disposed in main.ts", () => {
+		const main = readFileSync(join(SRC, "main.ts"), "utf8");
+		expect(srcText.match(/\.addCommand\s*\(/g) ?? []).toHaveLength(1);
+		expect(srcText.match(/\.addSettingTab\s*\(/g) ?? []).toHaveLength(1);
+		expect(main).toMatch(/new EmbedFoldRestorer\(/);
+		expect(main).toMatch(/this\.embedRestorer\?\.dispose\(\)/);
+	});
 });
