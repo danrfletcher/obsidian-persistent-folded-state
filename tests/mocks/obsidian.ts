@@ -240,6 +240,12 @@ export class MemoryAdapter {
 	hang = false;
 	/** When set, `read` rejects with this (an existing file that cannot be read). */
 	readFailWith: unknown = undefined;
+	/** Warkworth-46 PR-2: where `read` looks for a note that is not one of `files` (the plugin's
+	 * own log). The vault points it at the same `contents` map `setContent` fills. */
+	noteText: (path: string) => string | undefined = () => undefined;
+	/** Warkworth-46 PR-2: paths whose `read` rejects with the error given (a note that cannot be
+	 * read), set through `Vault.failReadsOf`. */
+	readonly failingReads = new Map<string, unknown>();
 
 	exists(path: string): Promise<boolean> {
 		this.calls.push({ method: "exists", path });
@@ -248,7 +254,8 @@ export class MemoryAdapter {
 	read(path: string): Promise<string> {
 		this.calls.push({ method: "read", path });
 		if (this.readFailWith !== undefined) return Promise.reject(this.readFailWith);
-		const text = this.files.get(path);
+		if (this.failingReads.has(path)) return Promise.reject(this.failingReads.get(path));
+		const text = this.files.get(path) ?? this.noteText(path);
 		return text === undefined ? Promise.reject(new Error(`ENOENT: ${path}`)) : Promise.resolve(text);
 	}
 	write(path: string, data: string): Promise<void> {
@@ -278,6 +285,10 @@ export class MemoryAdapter {
 export class Vault extends Events {
 	/** Real `Vault.adapter`: the in-memory stand-in below (warkworth-46 PR-1: the diagnostic log). */
 	adapter = new MemoryAdapter();
+	constructor() {
+		super();
+		this.adapter.noteText = (path) => this.contents.get(path);
+	}
 	/** Real `Vault.configDir`. */
 	configDir = ".obsidian";
 	private paths = new Set<string>();
@@ -298,6 +309,23 @@ export class Vault extends Events {
 	setContent(path: string, text: string): void {
 		this.paths.add(path);
 		this.contents.set(path, text);
+	}
+	/** Warkworth-46 PR-2: true when `setContent` has given `path` a text. */
+	hasContent(path: string): boolean {
+		return this.contents.has(path);
+	}
+	/** Warkworth-46 PR-2: the note's text goes away (as if the file were deleted from disk): the
+	 * adapter's `read` of it rejects, as the real one does for a missing file. */
+	removeContent(path: string): void {
+		this.contents.delete(path);
+	}
+	/** Warkworth-46 PR-2: makes the adapter's `read` of `path` reject with `error` (a note that
+	 * exists but cannot be read). `restoreReads` undoes it. */
+	failReadsOf(path: string, error: unknown = new Error("EIO: read failed")): void {
+		this.adapter.failingReads.set(path, error);
+	}
+	restoreReads(path: string): void {
+		this.adapter.failingReads.delete(path);
 	}
 	/** Every path a test has told this vault about. */
 	allPaths(): string[] {

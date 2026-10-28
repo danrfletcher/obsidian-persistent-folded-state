@@ -8,6 +8,11 @@
  * construction regardless of why (including, concretely, every test harness in this repo that
  * builds a view directly against an already-seeded store). "A file actually became the active
  * one" is the narrower, Obsidian-level signal this feature needs; `file-open` is that signal.
+ * Warkworth-46 PR-2: `file-open` does not call this directly any more. A fresh pane's document is
+ * still empty when it fires, so `restoreOnOpenWhenLoaded` (src/open-wait.ts) waits until the pane
+ * shows this note's real text (src/load-wait.ts) and only then calls this with that text. The
+ * decision made here is unchanged, and `scheduleNativeRestoreGuard` below starts from inside it, so the guard
+ * now starts only after the wait ends.
  * The pane this runs against may be brand new, or may be the same pane CM6 happens to reuse for
  * a different file — either way, the entry the store already has for `path` (as opposed to no
  * entry at all, which stays `src/editor-watcher.ts`'s E5/G15 job) is what's being reconciled.
@@ -125,6 +130,10 @@ export interface OpenRestoreDeps {
 	 * by every caller that does not collect the log. Fire and forget: the pass never waits on it
 	 * and a failure in it never reaches the pass. */
 	diagnosticLog?: DiagnosticSink;
+	/** Warkworth-46 PR-2: the length of the note's text on disk when the wait compared it with the
+	 * editor (src/load-wait.ts), for the log line only. Omitted by a caller that made no disk read;
+	 * the line then says -1. */
+	diskLen?: number;
 }
 
 function isFoldable(range: LineRange): boolean {
@@ -470,7 +479,7 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 	const logPass = (outcome: "applied" | "rematched"): void =>
 		reportDiagnostic(
 			deps.diagnosticLog,
-			diagnosticEntry({ path, pass: "open", outcome, editorLen: text.length, before, after: recordCounts(deps.store.get(path)) }),
+			diagnosticEntry({ path, pass: "open", outcome, editorLen: text.length, diskLen: deps.diskLen, before, after: recordCounts(deps.store.get(path)) }),
 		);
 	if (!needsRematchOnOpen(record.contentHash, currentHash)) {
 		applyStoredFoldsVerbatim(view, record.folds);

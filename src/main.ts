@@ -105,6 +105,12 @@
  * command, "Copy diagnostic log", copies it. `restoreOnOpen`, `restoreSettledChange` (through the
  * editor watcher) and the embed restorer each get the writer's `log` as an optional sink; none
  * waits on it. No setting turns it off and no other UI is added.
+ *
+ * Warkworth-46 PR-2 (E1, E4, E5, E10-E13, E17): the `file-open` handler below no longer reads the
+ * pane's text itself (it is still empty at that moment on a fresh pane). `restoreOnOpenWhenLoaded`
+ * (src/open-wait.ts) starts a per-pane wait (src/load-wait.ts, src/load-wait-host.ts) and calls
+ * `restoreOnOpen` only once the pane shows the right note with its real text. `loadWaits` holds
+ * those waits; `onunload()` cancels them all.
  */
 import { Events, Plugin } from "obsidian";
 import type { TFile } from "obsidian";
@@ -115,7 +121,9 @@ import { DiagnosticLogWriter } from "./diagnostic-log-writer";
 import type { DiagnosticSink } from "./diagnostic-log";
 import { PersistentFoldedStateSettingTab } from "./settings-tab";
 import { createEditorWatcher } from "./editor-watcher";
-import { restoreOnOpen } from "./open-restore";
+import { restoreOnOpenWhenLoaded } from "./open-wait";
+import { LoadWaitRegistry } from "./load-wait";
+import { createLoadWaitIo } from "./load-wait-host";
 import { EmbedFoldRecorder } from "./embed-fold-recorder";
 import { EmbedFoldRestorer } from "./embed-fold-restorer";
 import { EmbedDormancyTracker } from "./embed-dormancy";
@@ -143,6 +151,9 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	private embedRestorer: EmbedFoldRestorer | null = null;
 	/** PR-7: the dormancy tracker, kept so `onunload()` can cancel its pending second looks. */
 	private dormancy: EmbedDormancyTracker | null = null;
+	/** Warkworth-46 PR-2: one live wait per pane for the editor to hold the note's real text before
+	 * the open pass runs. Every pending wait is cancelled in `onunload()`. */
+	private readonly loadWaits = new LoadWaitRegistry<EditorView>();
 	/** Warkworth-46 PR-1: the diagnostic log writer. Created in `onload()`, drained in `onunload()`. */
 	diagnosticLog: DiagnosticLogWriter | null = null;
 
@@ -330,9 +341,12 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 					if (!info || info.file?.path !== file.path) return;
 					const cm = (info.editor as unknown as { cm?: EditorView } | undefined)?.cm;
 					if (!cm) return;
-					const text = cm.state.doc.toString();
-					restoreOnOpen(cm, file.path, text, {
+					// Warkworth-46 PR-2: the pane's document is still empty when file-open fires, so
+					// its text is not read here. The pass runs once the wait sees the real text.
+					restoreOnOpenWhenLoaded(cm, file.path, {
 						store: this.store,
+						registry: this.loadWaits,
+						makeIo: (view) => createLoadWaitIo({ app: this.app, view }),
 						// T8: resolved fresh on every scheduleNativeRestoreGuard check, not
 						// just once here — see src/open-restore.ts's OpenRestoreDeps comment
 						// for why a view captured only at file-open time was found, live,
@@ -358,6 +372,9 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	onunload(): void {
 		// R14: must run before `flushAtOnce()` can do anything async — see the file comment.
 		this.editorWatcherDisposed.current = true;
+		// Warkworth-46 PR-2: a wait still pending runs no pass, writes no log line and leaves no
+		// timer or listener behind.
+		this.loadWaits.cancelAll();
 		// E9: no embed listener or observer outlives the plugin, and nothing queued is recorded.
 		this.embedRecorder?.dispose();
 		this.embedRecorder = null;

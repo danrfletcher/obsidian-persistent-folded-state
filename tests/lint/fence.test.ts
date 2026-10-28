@@ -45,14 +45,34 @@ describe("fence: F9 — no interception of Obsidian's own localStorage fold stor
 });
 
 describe("fence: F10 — no vault-modify fallback", () => {
-	it('src/ does not call vault.on("modify", ...)', () => {
-		expect(srcText).not.toMatch(/\bvault\.on\s*\(\s*["']modify["']/);
+	// Warkworth-46 PR-2: the open-path wait re-reads the note from disk when its `modify` event
+	// fires while the wait is open (src/load-wait-host.ts). That is the one allowed listener: it
+	// is added only for the length of a wait and removed with `offref`, it never triggers a
+	// restore pass, and it is not a `registerEvent`. Everything else is still checked against
+	// src/ without that file, and the file itself is pinned below.
+	const WAIT_HOST = join(SRC, "load-wait-host.ts");
+	const srcTextOutsideWaitHost = srcFiles
+		.filter((f) => f !== WAIT_HOST)
+		.map((f) => readFileSync(f, "utf8"))
+		.join("\n");
+
+	it('src/ does not call vault.on("modify", ...) outside the wait host', () => {
+		expect(srcTextOutsideWaitHost).not.toMatch(/\bvault\.on\s*\(\s*["']modify["']/);
 	});
 
 	it('src/ does not registerEvent(...) a "modify" vault event', () => {
 		// Covers both `this.registerEvent(this.app.vault.on("modify", ...))` and any other
 		// wrapping of the same event name through registerEvent.
 		expect(srcText).not.toMatch(/registerEvent\s*\([^)]*["']modify["']/s);
+	});
+
+	it("the wait host listens for modify only through vault.on + offref, never registerEvent", () => {
+		const code = readFileSync(WAIT_HOST, "utf8")
+			.replace(/\/\*[\s\S]*?\*\//g, "")
+			.replace(/^\s*\/\/.*$/gm, "");
+		expect((code.match(/vault\.on\s*\(\s*["']modify["']/g) ?? []).length).toBe(1);
+		expect(code).toMatch(/vault\.offref\(/);
+		expect(code).not.toMatch(/\bregisterEvent\b/);
 	});
 });
 

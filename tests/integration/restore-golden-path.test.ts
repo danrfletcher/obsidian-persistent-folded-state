@@ -185,6 +185,10 @@ describe("golden path GP6: opening tasks-before.md / tasks-after.md logs one `op
 		const markdownView = new MockMarkdownView();
 		markdownView.file = file;
 		markdownView.editor = new MockEditor(view);
+		// Warkworth-46 PR-2: the open pass compares the editor with the note on disk; here the
+		// pane is fully loaded, so the disk holds the text the view shows.
+		vault.setContent(NOTE_PATH, text);
+		(app.workspace as unknown as MockWorkspace).addLeaf(markdownView);
 		(app.workspace as unknown as MockWorkspace).setActiveView(markdownView);
 		(app.workspace as unknown as MockWorkspace).trigger("file-open", file);
 		await settle();
@@ -206,7 +210,7 @@ describe("golden path GP6: opening tasks-before.md / tasks-after.md logs one `op
 			pass: "open",
 			outcome: "applied",
 			editorLen: BEFORE.length,
-			diskLen: -1,
+			diskLen: BEFORE.length,
 			foldsBefore: 2,
 			dormantBefore: 0,
 			foldsAfter: 2,
@@ -224,7 +228,7 @@ describe("golden path GP6: opening tasks-before.md / tasks-after.md logs one `op
 			pass: "open",
 			outcome: "rematched",
 			editorLen: AFTER.length,
-			diskLen: -1,
+			diskLen: AFTER.length,
 			foldsBefore: 2,
 			dormantBefore: 0,
 			foldsAfter: 2,
