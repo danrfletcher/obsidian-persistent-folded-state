@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "obsidian";
 import type { PluginManifest } from "obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
-import { FORGET_NOTE_FOLDS_COMMAND_ID } from "../../src/commands";
+import { COPY_DIAGNOSTIC_LOG_COMMAND_ID, FORGET_NOTE_FOLDS_COMMAND_ID } from "../../src/commands";
 import { HEADED_NOTE, HEADED_TEXT, LESSONS_NOTE, LESSONS_TEXT, SOURCE, SOURCE_TEXT, World, arrowFor } from "../fixtures/embed-recording-world";
 import type { Mode } from "../fixtures/embed-recording-world";
 
@@ -135,13 +135,14 @@ describe.each(["live-preview", "reading-view"] as const)("%s: fences hold across
 });
 
 describe("F8: the registered commands and settings tab are unchanged by this PR", () => {
-	it("one command (forget note folds), one settings tab, no embed command", async () => {
+	it("two commands (forget note folds, copy diagnostic log), one settings tab, no embed command", async () => {
 		const plugin = new PersistentFoldedStatePlugin(new App(), manifest);
 		const mock = plugin as unknown as { getCommands(): { id: string }[]; getSettingTabs(): unknown[] };
 
 		await plugin.onload();
 
-		expect(mock.getCommands().map((c) => c.id)).toEqual([FORGET_NOTE_FOLDS_COMMAND_ID]);
+		// Warkworth-46 PR-1 (F6): narrowed from one command to these two; any embed command still fails.
+		expect(mock.getCommands().map((c) => c.id)).toEqual([FORGET_NOTE_FOLDS_COMMAND_ID, COPY_DIAGNOSTIC_LOG_COMMAND_ID]);
 		expect(mock.getSettingTabs()).toHaveLength(1);
 		plugin.unload();
 	});

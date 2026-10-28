@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, Plugin, type PluginManifest } from "obsidian";
 import type { Plugin as MockPlugin, Vault as MockVault } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
-import { FORGET_NOTE_FOLDS_COMMAND_ID } from "../../src/commands";
+import { COPY_DIAGNOSTIC_LOG_COMMAND_ID, FORGET_NOTE_FOLDS_COMMAND_ID } from "../../src/commands";
+
+// Warkworth-46 PR-1 (F6): the command list is exactly these two, in this order. The second is
+// "Copy diagnostic log". Any other command, ribbon icon, status bar item or view still fails.
+const COMMAND_IDS = [FORGET_NOTE_FOLDS_COMMAND_ID, COPY_DIAGNOSTIC_LOG_COMMAND_ID];
 import { SEED_EMBEDS, SEED_FILES } from "../fixtures/embed-seed";
 import type { EmbedFoldRecord } from "../../src/types";
 
@@ -29,20 +33,19 @@ describe("lifecycle: onload/onunload flush", () => {
 		vi.useRealTimers();
 	});
 
-	it("onload registers exactly the one command and one settings tab", async () => {
+	it("onload registers exactly the two commands and one settings tab", async () => {
 		const plugin = makePlugin();
 		const addCommand = vi.spyOn(plugin, "addCommand");
 		const addSettingTab = vi.spyOn(plugin, "addSettingTab");
 
 		await plugin.onload();
 
-		expect(addCommand).toHaveBeenCalledTimes(1);
-		expect(addCommand.mock.calls[0][0].id).toBe(FORGET_NOTE_FOLDS_COMMAND_ID);
+		expect(addCommand).toHaveBeenCalledTimes(2);
+		expect(addCommand.mock.calls.map((call) => call[0].id)).toEqual(COMMAND_IDS);
 		expect(addSettingTab).toHaveBeenCalledTimes(1);
-		// F10: no debug command — the registered command list is exactly this one.
-		expect((plugin as unknown as MockPlugin).getCommands().map((command) => command.id)).toEqual([
-			FORGET_NOTE_FOLDS_COMMAND_ID,
-		]);
+		// F10 (narrowed by warkworth-46 PR-1): no debug command — the registered command list is
+		// exactly the forget command and "Copy diagnostic log".
+		expect((plugin as unknown as MockPlugin).getCommands().map((command) => command.id)).toEqual(COMMAND_IDS);
 	});
 
 	it("onunload flushes pending state at once", async () => {
@@ -185,8 +188,8 @@ describe("onload resilience: absent, corrupt, rejecting or wrong-shape loadData 
 
 			await expect(plugin.onload()).resolves.toBeUndefined();
 
-			expect(addCommand).toHaveBeenCalledTimes(1);
-			expect(addCommand.mock.calls[0][0].id).toBe(FORGET_NOTE_FOLDS_COMMAND_ID);
+			expect(addCommand).toHaveBeenCalledTimes(2);
+			expect(addCommand.mock.calls.map((call) => call[0].id)).toEqual(COMMAND_IDS);
 			expect(addSettingTab).toHaveBeenCalledTimes(1);
 		});
 	}
@@ -251,7 +254,7 @@ describe("lifecycle: embeds survive disable then re-enable (E9)", () => {
 		expect(second.store.get("Rocketship.md")).toEqual(SEED_FILES["Rocketship.md"]);
 	});
 
-	it("still registers exactly one command after a disable and re-enable", async () => {
+	it("still registers exactly the two commands after a disable and re-enable", async () => {
 		const app = new App();
 		const first = new PersistentFoldedStatePlugin(app, manifest);
 		first.loadData = async () => structuredClone(SEED_DISK);
@@ -261,7 +264,7 @@ describe("lifecycle: embeds survive disable then re-enable (E9)", () => {
 		const second = new PersistentFoldedStatePlugin(app, manifest);
 		second.loadData = async () => structuredClone(SEED_DISK);
 		await second.onload();
-		expect((second as unknown as MockPlugin).getCommands().map((c) => c.id)).toEqual([FORGET_NOTE_FOLDS_COMMAND_ID]);
+		expect((second as unknown as MockPlugin).getCommands().map((c) => c.id)).toEqual(COMMAND_IDS);
 	});
 });
 
@@ -336,7 +339,7 @@ describe("lifecycle: the embed restore adds no UI and leaves nothing behind (PR-
 		await plugin.onload();
 
 		expect(document.body.innerHTML).toBe(bodyBefore);
-		expect((plugin as unknown as MockPlugin).getCommands().map((command) => command.id)).toEqual([FORGET_NOTE_FOLDS_COMMAND_ID]);
+		expect((plugin as unknown as MockPlugin).getCommands().map((command) => command.id)).toEqual(COMMAND_IDS);
 		expect(addSettingTab).toHaveBeenCalledTimes(1);
 		plugin.onunload();
 	});

@@ -14,6 +14,7 @@ import { FoldStore } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
 import { OWN_FOLD_ANNOTATION } from "../../src/fold-recorder";
 import type { FileFoldRecord } from "../../src/types";
+import { makeGuardRig } from "../guard-rig";
 
 const NOTE_PATH = "Projects/Quarry/Tasks.md";
 
@@ -267,5 +268,64 @@ describe("restore-cm6: F5 — the restore never moves the cursor, selection or s
 		await settle();
 		expect(liveFoldedRanges(view)).toHaveLength(1); // sanity: the restore actually ran, not just skipped
 		expect(view.state.selection.main.head).toBe(selectionBeforeSettle);
+	});
+});
+
+describe("restore-cm6: PR-3 E2 — text delivered by EditorView.setState while a settled wait is pending", () => {
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	it("the recreated ViewPlugin finds the pending wait, the restore runs once, and the fold applies", async () => {
+		const FULL = ["intro 1", "intro 2", ...BEFORE.split("\n")].join("\n");
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, FULL);
+		const { store } = await makeStore({ [NOTE_PATH]: { contentHash: "stale", folds: [TUESDAY_ANCHOR], dormant: [] } });
+		const watcher = createEditorWatcher({ store, ...rig.watcherDeps });
+		const extensions = [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))];
+		const view = new EditorView({ state: EditorState.create({ doc: "", extensions }), parent: document.body });
+
+		// An empty reload reaches the settled pass: it leaves a wait and changes nothing.
+		view.dispatch({ changes: { from: 0, to: 0, insert: " " }, annotations: Transaction.userEvent.of("set") });
+		view.dispatch({ changes: { from: 0, to: 1, insert: "" }, annotations: Transaction.userEvent.of("set") });
+		await settle();
+		expect(rig.gate.isHolding(view)).toBe(true);
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+		expect((store.get(NOTE_PATH) as FileFoldRecord).contentHash).toBe("stale");
+		const lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["settled", "refused-empty"]]);
+
+		// The real text arrives with no transaction: `update()` never sees it, and the ViewPlugin
+		// instance that started the wait is thrown away and recreated.
+		view.setState(EditorState.create({ doc: FULL, extensions }));
+		await settle();
+
+		expect(rig.gate.isHolding(view)).toBe(false);
+		const folded = liveFoldedLineRanges(view);
+		expect(folded).toHaveLength(1);
+		expect(folded[0].startLine).toBe(3); // "## Tuesday" is on line 3 of the real text
+		expect((store.get(NOTE_PATH) as FileFoldRecord).contentHash).not.toBe("stale");
+		expect((store.get(NOTE_PATH) as FileFoldRecord).dormant).toEqual([]);
+		const after = await rig.lines();
+		expect(after.map((l) => [l.pass, l.outcome])).toEqual([
+			["settled", "refused-empty"],
+			["settled", "rematched"],
+		]); // the restore ran once
+		view.destroy();
+	});
+
+	it("a pane with no wait pending is left alone by the recreated instance (setState is not a trigger by itself)", async () => {
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, BEFORE);
+		const { store } = await makeStore({ [NOTE_PATH]: { contentHash: "stale", folds: [TUESDAY_ANCHOR], dormant: [] } });
+		const watcher = createEditorWatcher({ store, ...rig.watcherDeps });
+		const extensions = [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))];
+		const view = new EditorView({ state: EditorState.create({ doc: BEFORE, extensions }), parent: document.body });
+		view.setState(EditorState.create({ doc: BEFORE, extensions }));
+		await settle();
+		expect(rig.gate.isHolding(view)).toBe(false);
+		expect((await rig.lines())).toEqual([]);
+		expect((store.get(NOTE_PATH) as FileFoldRecord).contentHash).toBe("stale");
+		view.destroy();
 	});
 });

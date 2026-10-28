@@ -159,7 +159,8 @@ export function blockIndexForToggle(blocks: readonly AnchoredBlock[], toggle: To
  * The embed's record after the user folded (`folded` true) or unfolded one anchor, or null when
  * nothing would change. A fold upserts that one anchor (repeats collapse to one, keyed by
  * `anchorKey`); an unfold removes it; every anchor the click does not mention carries over
- * untouched, as do the dormant anchors. Unfolding in an embed with no record creates none
+ * untouched, as do the dormant anchors, except that a fold also removes that anchor's key from
+ * the embed's `dormant` (warkworth-46 E15: never in both lists). Unfolding in an embed with no record creates none
  * (state exists only once Dan has folded something, E12), and nothing is ever added for a block
  * nobody clicked (G16). `contentHash` is the hash of the slice the anchors were described over.
  *
@@ -190,10 +191,20 @@ export function applyEmbedFold(
 	else folds.delete(key);
 
 	const nextFolds = Array.from(folds.values());
+	// Warkworth-46 PR-4 (E15): folding an anchor makes it active, so a set-aside copy of the same
+	// anchor leaves `dormant`. An unfold, and every other dormant entry, is left as it is.
+	const existingDormant = existing?.dormant ?? [];
+	const nextDormant = folded
+		? existingDormant.filter((raw) => {
+				const parsed = parseAnchor(raw);
+				return parsed === null || anchorKey(parsed) !== key;
+			})
+		: existingDormant;
 	const unchanged =
 		existing !== undefined &&
 		existing.contentHash === sliceHash &&
 		nextFolds.length === existing.folds.length &&
+		nextDormant.length === existingDormant.length &&
 		(folded ? JSON.stringify(before) === JSON.stringify(anchor) : before === undefined);
 	if (unchanged) return null;
 
@@ -204,7 +215,7 @@ export function applyEmbedFold(
 		occurrence: identity.occurrence,
 		contentHash: sliceHash,
 		folds: nextFolds,
-		dormant: existing?.dormant ?? [],
+		dormant: nextDormant,
 	};
 	if (identity.outer !== undefined && identity.outer.length > 0) {
 		record.outer = identity.outer.map((link) => ({ target: link.target, subpath: link.subpath, occurrence: link.occurrence }));

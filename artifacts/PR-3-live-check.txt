@@ -1,0 +1,32 @@
+PR-3 live check after the T1 fix (coder round 2). Obsidian 1.14.5 in container desktop-warkworth-46,
+scratch vault /config/vault-c2 (removed afterwards), CDP on scratch port 9611, built main.js from this branch.
+Fixture: tests/fixtures/competitive-coding-140.md. Folds made with the real command editor:toggle-fold on each
+"Lesson N" task line (140 user-origin folds). Checks are DOM (.cm-foldPlaceholder), Obsidian's own
+currentMode.getFoldInfo() and data.json; no screenshots were relied on. Output below is as returned.
+
+T1 reproduction (before the fix, tester's rewritten fixture + its data.json, hash equal to the file's):
+  log open:applied 139/1, placeholders 0, getFoldInfo not folded. Cause: 0 of the 139 stored anchors resolve by
+  exact key against the note's text (every later lesson's siblingIndex dropped by one when "Lesson 1" was removed),
+  and the unchanged-hash open looks anchors up by exact key only.
+
+GP4 (C30): 5 cycles of blur/focus/visibilitychange
+  {"byteIdentical":true,"ph0":40,"ph1":40,"fi0":140,"fi1":140}
+  data.json: folds 140, dormant 0, hash a64da5b3b866fb10 before and after.
+
+GP5 (C31): note closed, on disk Lesson 1 block removed and Lesson 5 block moved below Lesson 8, reopened
+  {"ph":41,"foldInfo":139,"folds":139,"dormant":1,"hash":"b02bb18992fd72ab","log":["open:rematched:140>139/d1"]}
+  dormant: [('lesson 1: arrays part 1', 1793204257110)] (one entry); DOM lines after Lesson 8 read
+  "Lesson 5: stacks part 1…" (the moved block is folded).
+
+Relaunch (T1 scenario): Obsidian stopped and started with the note open
+  {"ph":39,"foldInfo":139,"folds":139,"dormant":1,"hash":"b02bb18992fd72ab","log":[...,"open:applied:139>139/d1"]}
+  data.json byte-identical before and after the relaunch (cmp). Lines read "Lesson 2: hashing part 1…" etc.
+
+Reload checkpoint (C32): note open, overwritten on disk
+  log "settled:rematched:139>139/d0": folds stay at 139, pass settled, outcome rematched.
+
+Embed checkpoint (C33): Host PR3.md embeds ![[Competitive Coding Fundamentals#Competitive Coding Fundamentals]],
+live preview. Embeds are rendered note content with .list-collapse-indicator arrows, not a CodeMirror editor
+(embedCm 0 is expected). Real mouse press/release on the Lesson 7 arrow (Input.dispatchMouseEvent):
+  data.json embeds: 1 record, folds 1, dormant 0, no dormantSince anywhere.
+  After relaunch: collapsed ["Lesson 7: linked lists p"], embed records identical to before the relaunch.

@@ -12,7 +12,7 @@ import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { editorInfoField } from "../../tests/mocks/obsidian";
-import { FoldStore } from "../../src/fold-store";
+import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
 import { OWN_FOLD_ANNOTATION } from "../../src/fold-recorder";
 import type { FileFoldRecord } from "../../src/types";
@@ -97,7 +97,7 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 		vi.useRealTimers();
 	});
 
-	it("G1: each recorded fold stores the note's current content hash", () => {
+	it("G1: a note with a record carries a content hash (adopted as baseline, not written by a fold)", () => {
 		const { store } = makeStore();
 		const view = makeView(store);
 		const from = lineStart(view, LINES.heading);
@@ -342,5 +342,197 @@ describe("fold recorder: stored entries and effects it does not own", () => {
 		const folds = store.get(NOTE_PATH)?.folds as unknown as Array<{ kind: string }>;
 		expect(folds).toHaveLength(1);
 		expect(folds[0].kind).toBe("heading");
+	});
+});
+
+/**
+ * Warkworth-46 PR-4 (E15): recording a fold removes its anchor from `dormant` and never rewrites an
+ * existing `contentHash`. Real `EditorState`/`EditorView` over the fixture note; the set-aside
+ * entries are made from the anchor the recorder itself produces for the block, so they are
+ * duplicates in the same sense the vault's real ones are.
+ */
+describe("fold recorder: dormant and contentHash (E15)", () => {
+	const STALE_HASH = "not-the-hash-of-this-doc";
+	const SINCE = 123_456;
+
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	/** Folds and unfolds `lineNumber` once to learn the anchor the recorder stores for it, then
+	 * leaves the store holding `contentHash: STALE_HASH`, no folds, and that anchor set aside. */
+	function setAside(store: FoldStore, view: EditorView, lineNumbers: number[]): Record<string, unknown>[] {
+		const anchors: Record<string, unknown>[] = [];
+		for (const lineNumber of lineNumbers) {
+			const from = lineStart(view, lineNumber);
+			view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+			anchors.push((store.get(NOTE_PATH)?.folds ?? []).at(-1) as unknown as Record<string, unknown>);
+			view.dispatch({ effects: [unfoldEffect.of({ from, to: from + 1 })] });
+		}
+		store.set(NOTE_PATH, {
+			contentHash: STALE_HASH,
+			folds: [],
+			dormant: anchors.map((a) => ({ ...a, dormantSince: SINCE }) as never),
+		});
+		return anchors;
+	}
+
+	it("a fold removes that anchor from dormant and it appears once in folds", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		const [heading] = setAside(store, view, [LINES.heading]);
+
+		const from = lineStart(view, LINES.heading);
+		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+
+		const record = store.get(NOTE_PATH);
+		expect(record?.dormant).toEqual([]);
+		expect(record?.folds).toEqual([heading]);
+	});
+
+	it("only the folded anchor leaves dormant; another set-aside anchor keeps its own dormantSince and place", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		const [heading, task] = setAside(store, view, [LINES.heading, LINES.task]);
+
+		const from = lineStart(view, LINES.task);
+		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+
+		const record = store.get(NOTE_PATH);
+		expect(record?.dormant).toEqual([{ ...heading, dormantSince: SINCE }]);
+		expect(record?.folds).toEqual([task]);
+	});
+
+	it("contentHash stays the stored one after a fold, on a record whose hash differs from the doc", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		setAside(store, view, [LINES.heading]);
+
+		const from = lineStart(view, LINES.task);
+		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(STALE_HASH);
+	});
+
+	it("contentHash stays the stored one after an unfold too, and an unfold leaves dormant untouched", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		const [heading] = setAside(store, view, [LINES.heading]);
+		const taskFrom = lineStart(view, LINES.task);
+		view.dispatch({ effects: [foldEffect.of({ from: taskFrom, to: taskFrom + 1 })] });
+
+		view.dispatch({ effects: [unfoldEffect.of({ from: taskFrom, to: taskFrom + 1 })] });
+
+		const record = store.get(NOTE_PATH);
+		expect(record?.contentHash).toBe(STALE_HASH);
+		expect(record?.dormant).toEqual([{ ...heading, dormantSince: SINCE }]);
+	});
+
+	it("an unfold of an anchor that is set aside leaves it set aside", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		const [heading] = setAside(store, view, [LINES.heading]);
+
+		const from = lineStart(view, LINES.heading);
+		view.dispatch({ effects: [unfoldEffect.of({ from, to: from + 1 })] });
+
+		expect(store.get(NOTE_PATH)?.dormant).toEqual([{ ...heading, dormantSince: SINCE }]);
+		expect(store.get(NOTE_PATH)?.folds).toEqual([]);
+	});
+
+	it("a fold on a note with no stored record creates one with a hash of the current text", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		store.forget(NOTE_PATH);
+		expect(store.get(NOTE_PATH)).toBeUndefined();
+
+		const from = lineStart(view, LINES.heading);
+		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(FIXTURE_TEXT));
+		expect(store.get(NOTE_PATH)?.folds).toHaveLength(1);
+		expect(store.get(NOTE_PATH)?.dormant).toEqual([]);
+	});
+
+	it("effects tagged OWN_FOLD_ANNOTATION change nothing: dormant, folds and hash are all as they were", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		setAside(store, view, [LINES.heading]);
+		const before = JSON.stringify(store.get(NOTE_PATH));
+
+		const from = lineStart(view, LINES.heading);
+		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })], annotations: OWN_FOLD_ANNOTATION.of(true) });
+
+		expect(JSON.stringify(store.get(NOTE_PATH))).toBe(before);
+	});
+
+	it("a transaction with no fold effect (a plain edit) changes nothing", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		setAside(store, view, [LINES.heading]);
+		const before = JSON.stringify(store.get(NOTE_PATH));
+
+		view.dispatch({ changes: { from: 0, to: 0, insert: "x" } });
+
+		expect(JSON.stringify(store.get(NOTE_PATH))).toBe(before);
+	});
+
+	it("an untagged fold effect, as a native restore dispatches it, moves a set-aside anchor out of dormant and keeps the hash", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		const [heading, task] = setAside(store, view, [LINES.heading, LINES.task]);
+
+		// Obsidian re-applying its own folds: fold effects, no OWN_FOLD_ANNOTATION, several in one dispatch.
+		const h = lineStart(view, LINES.heading);
+		const t = lineStart(view, LINES.task);
+		view.dispatch({ effects: [foldEffect.of({ from: h, to: h + 1 }), foldEffect.of({ from: t, to: t + 1 })] });
+
+		const record = store.get(NOTE_PATH);
+		expect(record?.dormant).toEqual([]);
+		expect(record?.folds).toEqual([heading, task]);
+		expect(record?.contentHash).toBe(STALE_HASH);
+	});
+
+	it("one transaction that folds and then unfolds the same block ends with no folds entry, and the fold step still clears dormant", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		setAside(store, view, [LINES.heading]);
+
+		const from = lineStart(view, LINES.heading);
+		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 }), unfoldEffect.of({ from, to: from + 1 })] });
+
+		const record = store.get(NOTE_PATH);
+		expect(record?.folds).toEqual([]);
+		expect(record?.dormant).toEqual([]);
+	});
+
+	it("one transaction that unfolds and then folds the same block ends with it in folds, once", () => {
+		const { store } = makeStore();
+		const view = makeView(store);
+		const [heading] = setAside(store, view, [LINES.heading]);
+
+		const from = lineStart(view, LINES.heading);
+		view.dispatch({ effects: [unfoldEffect.of({ from, to: from + 1 }), foldEffect.of({ from, to: from + 1 })] });
+
+		expect(store.get(NOTE_PATH)?.folds).toEqual([heading]);
+		expect(store.get(NOTE_PATH)?.dormant).toEqual([]);
+	});
+
+	it("a user fold during a wait on a not-yet-loaded editor records the fold and leaves the stored hash alone", () => {
+		const { store } = makeStore();
+		// Editor holds only a stub of the note (as at file-open, before the real text arrives).
+		const watcher = createEditorWatcher({ store, window });
+		const state = EditorState.create({
+			doc: "# stub\n\n- [ ] one\n  - body\n",
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		const view = new EditorView({ state, parent: document.body });
+		store.set(NOTE_PATH, { contentHash: STALE_HASH, folds: [], dormant: [] });
+
+		const from = view.state.doc.line(3).from;
+		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
+
+		expect(store.get(NOTE_PATH)?.folds).toHaveLength(1);
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(STALE_HASH); // a later pass still sees the old hash
 	});
 });

@@ -224,6 +224,62 @@ export function buildHoverPopover(doc: Document = document): HTMLElement {
 	return popover;
 }
 
+/** A fake in-memory `DataAdapter` with the four calls the diagnostic log uses (warkworth-46
+ * PR-1): `exists`, `read`, `write` and `append`. Files live in a `Map`. `read` of a missing file
+ * rejects, as the real adapter does; `append` to a missing file creates it. Test hooks make a
+ * call reject (`failWith`), throw synchronously (`throwSync`) or never settle (`hang`), and
+ * `calls` records every call in order. */
+export class MemoryAdapter {
+	readonly files = new Map<string, string>();
+	readonly calls: { method: "exists" | "read" | "write" | "append"; path: string }[] = [];
+	/** When set, `write` and `append` reject with this. */
+	failWith: unknown = undefined;
+	/** When true, `write` and `append` throw before returning a promise. */
+	throwSync = false;
+	/** When true, `write` and `append` return a promise that never settles. */
+	hang = false;
+	/** When set, `read` rejects with this (an existing file that cannot be read). */
+	readFailWith: unknown = undefined;
+	/** Warkworth-46 PR-2: where `read` looks for a note that is not one of `files` (the plugin's
+	 * own log). The vault points it at the same `contents` map `setContent` fills. */
+	noteText: (path: string) => string | undefined = () => undefined;
+	/** Warkworth-46 PR-2: paths whose `read` rejects with the error given (a note that cannot be
+	 * read), set through `Vault.failReadsOf`. */
+	readonly failingReads = new Map<string, unknown>();
+
+	exists(path: string): Promise<boolean> {
+		this.calls.push({ method: "exists", path });
+		return Promise.resolve(this.files.has(path));
+	}
+	read(path: string): Promise<string> {
+		this.calls.push({ method: "read", path });
+		if (this.readFailWith !== undefined) return Promise.reject(this.readFailWith);
+		if (this.failingReads.has(path)) return Promise.reject(this.failingReads.get(path));
+		const text = this.files.get(path) ?? this.noteText(path);
+		return text === undefined ? Promise.reject(new Error(`ENOENT: ${path}`)) : Promise.resolve(text);
+	}
+	/** Warkworth-46 PR-3: the real adapter's `stat`: `{ size }` in bytes for a file, null for none. */
+	stat(path: string): Promise<{ size: number } | null> {
+		const text = this.files.get(path) ?? this.noteText(path);
+		return Promise.resolve(text === undefined ? null : { size: new TextEncoder().encode(text).length });
+	}
+	write(path: string, data: string): Promise<void> {
+		this.calls.push({ method: "write", path });
+		return this.mutate(() => void this.files.set(path, data));
+	}
+	append(path: string, data: string): Promise<void> {
+		this.calls.push({ method: "append", path });
+		return this.mutate(() => void this.files.set(path, (this.files.get(path) ?? "") + data));
+	}
+	private mutate(apply: () => void): Promise<void> {
+		if (this.throwSync) throw new Error("adapter threw synchronously");
+		if (this.hang) return new Promise<void>(() => {});
+		if (this.failWith !== undefined) return Promise.reject(this.failWith);
+		apply();
+		return Promise.resolve();
+	}
+}
+
 /** Just enough of real Obsidian's `Vault` (PR-7, G9/G10) to exercise `app.vault.on("rename"/
  * "delete", ...)` and `getAbstractFileByPath`: extends `Events` (declared just above), so
  * `vault.on(...)`/`vault.trigger(...)` behave exactly like every other Obsidian event (same
@@ -232,6 +288,14 @@ export function buildHoverPopover(doc: Document = document): HTMLElement {
  * filesystem) — Obsidian itself decides what's actually in the vault; this mock only needs to
  * answer "does this path exist" the way `main.ts`'s own `pruneOrphans` call asks it to. */
 export class Vault extends Events {
+	/** Real `Vault.adapter`: the in-memory stand-in below (warkworth-46 PR-1: the diagnostic log). */
+	adapter = new MemoryAdapter();
+	constructor() {
+		super();
+		this.adapter.noteText = (path) => this.contents.get(path);
+	}
+	/** Real `Vault.configDir`. */
+	configDir = ".obsidian";
 	private paths = new Set<string>();
 
 	getAbstractFileByPath(path: string): TFile | null {
@@ -250,6 +314,23 @@ export class Vault extends Events {
 	setContent(path: string, text: string): void {
 		this.paths.add(path);
 		this.contents.set(path, text);
+	}
+	/** Warkworth-46 PR-2: true when `setContent` has given `path` a text. */
+	hasContent(path: string): boolean {
+		return this.contents.has(path);
+	}
+	/** Warkworth-46 PR-2: the note's text goes away (as if the file were deleted from disk): the
+	 * adapter's `read` of it rejects, as the real one does for a missing file. */
+	removeContent(path: string): void {
+		this.contents.delete(path);
+	}
+	/** Warkworth-46 PR-2: makes the adapter's `read` of `path` reject with `error` (a note that
+	 * exists but cannot be read). `restoreReads` undoes it. */
+	failReadsOf(path: string, error: unknown = new Error("EIO: read failed")): void {
+		this.adapter.failingReads.set(path, error);
+	}
+	restoreReads(path: string): void {
+		this.adapter.failingReads.delete(path);
 	}
 	/** Every path a test has told this vault about. */
 	allPaths(): string[] {

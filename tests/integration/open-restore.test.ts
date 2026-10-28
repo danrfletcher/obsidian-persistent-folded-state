@@ -7,8 +7,11 @@
  * compare, re-match, E4 native-restore replacement), not just `src/open-restore.ts`'s pure
  * decision logic in isolation.
  */
-import { afterEach, describe, expect, it } from "vitest";
-import { EditorState } from "@codemirror/state";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { EditorState, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { App, type PluginManifest } from "obsidian";
@@ -23,7 +26,10 @@ import {
 import PersistentFoldedStatePlugin from "../../src/main";
 import { createEditorWatcher } from "../../src/editor-watcher";
 import { buildAnchors } from "../../src/anchors";
-import { hashText } from "../../src/fold-store";
+import { FoldStore, hashText } from "../../src/fold-store";
+import { restoreOnOpen } from "../../src/open-restore";
+import { addDormant, MAX_DORMANT_AGE_MS } from "../../src/dormant";
+import { LOAD_WAIT_GIVE_UP_MS } from "../../src/load-wait";
 import type { FileFoldRecord } from "../../src/types";
 
 const NOTE_PATH = "Projects/Quarry/Tasks.md";
@@ -75,14 +81,25 @@ function makeView(text: string): EditorView {
 }
 
 /** Wires a CM6 `EditorView` as the active pane for `path`, the same shape `main.ts`'s
- * `file-open` handler reads (`workspace.activeEditor.editor.cm`), and fires the event. */
-function openFile(app: App, path: string, view: EditorView): void {
+ * `file-open` handler reads (`workspace.activeEditor.editor.cm`), and fires the event.
+ *
+ * Warkworth-46 PR-2: the open pass now compares the editor with the note's text on disk
+ * (`vault.adapter.read`), so the mock vault needs that text. `diskText` sets it; without it, a note
+ * the test has not given any text is taken to be on disk exactly as the view shows it, which is the
+ * "fully loaded pane" every case here was written for. */
+function openFile(app: App, path: string, view: EditorView, diskText?: string): MockMarkdownView {
+	const vault = app.vault as unknown as MockVault;
+	if (diskText !== undefined) vault.setContent(path, diskText);
+	else if (!vault.hasContent(path)) vault.setContent(path, view.state.doc.toString());
 	const file = new MockTFile(path);
 	const markdownView = new MockMarkdownView();
 	markdownView.file = file;
 	markdownView.editor = new MockEditor(view);
-	(app.workspace as unknown as MockWorkspace).setActiveView(markdownView);
-	(app.workspace as unknown as MockWorkspace).trigger("file-open", file);
+	const workspace = app.workspace as unknown as MockWorkspace;
+	workspace.addLeaf(markdownView);
+	workspace.setActiveView(markdownView);
+	workspace.trigger("file-open", file);
+	return markdownView;
 }
 
 function liveFoldedLineRanges(view: EditorView): { startLine: number; endLine: number }[] {
@@ -673,5 +690,875 @@ describe("open-restore via the plugin's file-open handler", () => {
 
 		expect(() => (app.workspace as unknown as MockWorkspace).trigger("file-open", null)).not.toThrow();
 		await settle();
+	});
+});
+
+// --- The diagnostic log's `open` lines (warkworth-46 PR-1, GP6, F4, E16) ----------------------
+
+describe("diagnostic log: restoreOnOpen logs one `open` line per pass", () => {
+	const LOG_PATH = ".obsidian/plugins/persistent-folded-state/diagnostic-log.jsonl";
+	const MARKER = "OPEN-MARKER-5d2e";
+
+	async function openWithLog(
+		text: string,
+		record: FileFoldRecord,
+		breakAdapter?: (adapter: MockVault["adapter"]) => void,
+	) {
+		const app = new App();
+		const vault = app.vault as unknown as MockVault;
+		vault.setExists(NOTE_PATH);
+		breakAdapter?.(vault.adapter);
+		const plugin = makePlugin(app, { value: { version: 1, files: { [NOTE_PATH]: record } } });
+		await plugin.onload();
+		const view = makeView(text);
+		openFile(app, NOTE_PATH, view);
+		await settle();
+		// A never-resolving adapter never drains: the pass has finished either way, so don't wait on it.
+		await Promise.race([plugin.diagnosticLog?.drain(), new Promise((resolve) => setTimeout(resolve, 20))]);
+		const lines = logLinesOf(vault.adapter.files.get(LOG_PATH));
+		return { plugin, view, lines, vault };
+	}
+
+	function logLinesOf(raw: string | undefined): Record<string, unknown>[] {
+		return (raw ?? "")
+			.split("\n")
+			.filter((l) => l !== "")
+			.map((l) => JSON.parse(l) as Record<string, unknown>);
+	}
+
+	it("verbatim path (hash unchanged): one `applied` line, counts from the store before and after", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { view, lines } = await openWithLog(TEXT_V1, record);
+
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 2 }]);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({
+			path: NOTE_PATH,
+			pass: "open",
+			editorLen: TEXT_V1.length,
+			diskLen: TEXT_V1.length,
+			foldsBefore: 1,
+			dormantBefore: 0,
+			foldsAfter: 1,
+			dormantAfter: 0,
+			outcome: "applied",
+		});
+		expect(typeof lines[0].t).toBe("string");
+		expect(new Date(lines[0].t as string).toISOString()).toBe(lines[0].t);
+	});
+
+	it("re-match path (hash changed): one `rematched` line with the counts after the store write", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { plugin, view, lines } = await openWithLog(TEXT_V2, record);
+
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 2, endLine: 3 }]);
+		expect(plugin.store.get(NOTE_PATH)?.contentHash).toBe(hashText(TEXT_V2));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({
+			pass: "open",
+			outcome: "rematched",
+			editorLen: TEXT_V2.length,
+			diskLen: TEXT_V2.length,
+			foldsBefore: 1,
+			dormantBefore: 0,
+			foldsAfter: 1,
+			dormantAfter: 0,
+		});
+	});
+
+	it("re-match path with a fold that no longer matches: the set-aside count goes up", async () => {
+		const gone = { kind: "heading", indent: 0, text: "zzz qqq www completely different", siblingIndex: 0, parentChain: [] };
+		const record = {
+			contentHash: hashText(TEXT_V1),
+			folds: [tuesdayAnchorFor(TEXT_V1), gone as unknown as FileFoldRecord["folds"][number]],
+			dormant: [],
+		};
+		const { lines } = await openWithLog(TEXT_V2, record);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({ outcome: "rematched", foldsBefore: 2, dormantBefore: 0, foldsAfter: 1, dormantAfter: 1 });
+	});
+
+	it("reopening logs one more line each time", async () => {
+		const app = new App();
+		const vault = app.vault as unknown as MockVault;
+		vault.setExists(NOTE_PATH);
+		const plugin = makePlugin(app, {
+			value: { version: 1, files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } } },
+		});
+		await plugin.onload();
+		for (let i = 0; i < 3; i++) {
+			openFile(app, NOTE_PATH, makeView(TEXT_V1));
+			await settle();
+		}
+		await plugin.diagnosticLog?.drain();
+		expect(logLinesOf(vault.adapter.files.get(LOG_PATH))).toHaveLength(3);
+	});
+
+	it("the note's text never reaches the log", async () => {
+		const text = `## Tuesday\n${MARKER} under Tuesday.\n## Wednesday\nMore.`;
+		const record = { contentHash: hashText(text), folds: [tuesdayAnchorFor(text)], dormant: [] };
+		const { vault, lines } = await openWithLog(text, record);
+		expect(lines).toHaveLength(1);
+		const raw = vault.adapter.files.get(LOG_PATH) as string;
+		for (const secret of [MARKER, "Tuesday", "tuesday", "Wednesday", "More."]) expect(raw).not.toContain(secret);
+		expect(Object.keys(lines[0])).toEqual([
+			"t", "path", "pass", "editorLen", "diskLen", "foldsBefore", "dormantBefore", "foldsAfter", "dormantAfter", "outcome",
+		]);
+	});
+
+	it.each([
+		{ label: "a rejecting adapter", fail: (a: MockVault["adapter"]) => void (a.failWith = new Error("disk full")) },
+		{ label: "a synchronously throwing adapter", fail: (a: MockVault["adapter"]) => void (a.throwSync = true) },
+		{ label: "a never-resolving adapter", fail: (a: MockVault["adapter"]) => void (a.hang = true) },
+	])("E16: $label leaves the verbatim and re-match passes unchanged", async ({ fail }) => {
+		const verbatim = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const good = await openWithLog(TEXT_V1, verbatim);
+		const bad = await openWithLog(TEXT_V1, verbatim, fail);
+		expect(liveFoldedLineRanges(bad.view)).toEqual(liveFoldedLineRanges(good.view));
+		expect(bad.plugin.store.get(NOTE_PATH)).toEqual(good.plugin.store.get(NOTE_PATH));
+		expect(bad.lines).toEqual([]); // nothing reached the file, and nothing broke
+
+		const changed = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const goodMatch = await openWithLog(TEXT_V2, changed);
+		const badMatch = await openWithLog(TEXT_V2, changed, fail);
+		expect(liveFoldedLineRanges(badMatch.view)).toEqual(liveFoldedLineRanges(goodMatch.view));
+		expect(badMatch.plugin.store.get(NOTE_PATH)).toEqual(goodMatch.plugin.store.get(NOTE_PATH));
+		expect(badMatch.view.state.doc.toString()).toBe(TEXT_V2);
+	});
+});
+
+// --- Warkworth-46 PR-2: the open pass waits for the editor to hold the note's real text ------------
+//
+// A real CM6 `EditorView` is built with an EMPTY document, file-open is triggered, and the full text
+// lands later in an ordinary `view.dispatch({ changes })`, the shape proven live in Dan's vault
+// (the pane is empty at file-open; the text arrives about 35 ms later).
+
+describe("open-restore waits for the real text (warkworth-46 PR-2)", () => {
+	const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
+	const BIG_PATH = "Competitive Coding Fundamentals/Competitive Coding Fundamentals.md";
+	const BIG_LF = readFileSync(join(FIXTURES, "competitive-coding-140.md"), "utf8");
+	const BIG_CRLF = readFileSync(join(FIXTURES, "competitive-coding-140-crlf.md"), "utf8");
+	const LOG_PATH = ".obsidian/plugins/persistent-folded-state/diagnostic-log.jsonl";
+	const MARKER = "WAIT-MARKER-91c4";
+	const OTHER_PATH = "Projects/Quarry/Other.md";
+	const THREE = ["## Alpha", "alpha body", "## Beta", "beta body", "## Gamma", "gamma body"].join("\n");
+
+	/** Every foldable lesson task in the 140-fold fixture, as a stored anchor. */
+	function lessonAnchors(text: string): FileFoldRecord["folds"] {
+		return buildAnchors(text)
+			.filter((c) => c.anchor.kind === "task" && c.range.endLine > c.range.startLine)
+			.map((c) => c.anchor as unknown as FileFoldRecord["folds"][number]);
+	}
+
+	function headingAnchor(text: string, heading: string): FileFoldRecord["folds"][number] {
+		const found = buildAnchors(text).find((c) => c.anchor.kind === "heading" && c.anchor.text === heading);
+		if (!found) throw new Error(`no heading ${heading}`);
+		return found.anchor as unknown as FileFoldRecord["folds"][number];
+	}
+
+	async function boot(files: Record<string, FileFoldRecord>) {
+		const app = new App();
+		const vault = app.vault as unknown as MockVault;
+		for (const path of Object.keys(files)) vault.setExists(path);
+		const stored = { value: { version: 1, files } as unknown };
+		const plugin = makePlugin(app, stored);
+		await plugin.onload();
+		const setSpy = vi.spyOn(plugin.store, "set");
+		return { app, vault, stored, plugin, setSpy };
+	}
+
+	/** A view over `text` that counts the transactions carrying a fold or unfold effect. */
+	function observedView(text: string, extensions: Extension[] = []) {
+		let foldTransactions = 0;
+		const state = EditorState.create({
+			doc: text,
+			extensions: [
+				codeFolding(),
+				EditorView.updateListener.of((update) => {
+					for (const tr of update.transactions) {
+						if (tr.effects.some((e) => e.is(foldEffect) || e.is(unfoldEffect))) foldTransactions++;
+					}
+				}),
+				...extensions,
+			],
+		});
+		const view = new EditorView({ state, parent: document.body });
+		return { view, foldTransactions: () => foldTransactions };
+	}
+
+	/** The text arrives in a later transaction, the way Obsidian delivers it. */
+	function land(view: EditorView, text: string): void {
+		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
+	}
+
+	const pause = (ms = 30): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+	async function until(condition: () => boolean, timeoutMs = 5000): Promise<void> {
+		const start = Date.now();
+		while (!condition()) {
+			if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+			await pause(10);
+		}
+	}
+
+	async function logOf(plugin: PersistentFoldedStatePlugin, vault: MockVault): Promise<Record<string, unknown>[]> {
+		await plugin.diagnosticLog?.drain();
+		return (vault.adapter.files.get(LOG_PATH) ?? "")
+			.split("\n")
+			.filter((l) => l !== "")
+			.map((l) => JSON.parse(l) as Record<string, unknown>);
+	}
+
+	const outcomes = (lines: Record<string, unknown>[]): unknown[] => lines.map((l) => l.outcome);
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("fixtures: the 140-fold note has 140 foldable lessons and its CRLF copy is the same note", () => {
+		expect(lessonAnchors(BIG_LF)).toHaveLength(140);
+		expect(BIG_LF).not.toContain("\r");
+		expect(BIG_CRLF).toContain("\r\n");
+		expect(BIG_CRLF.replace(/\r\n/g, "\n")).toBe(BIG_LF);
+		expect(hashText(BIG_CRLF)).toBe(hashText(BIG_LF));
+	});
+
+	it("GP1: closing the note and opening others leaves the store exactly as it was", async () => {
+		const bigRecord = { contentHash: hashText(BIG_LF), folds: lessonAnchors(BIG_LF), dormant: [] };
+		const otherRecord = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, stored, plugin, setSpy } = await boot({ [BIG_PATH]: bigRecord, [OTHER_PATH]: otherRecord });
+		const before = JSON.stringify(stored.value);
+		const bigEntry = plugin.store.get(BIG_PATH);
+
+		const big = makeView(BIG_LF);
+		openFile(app, BIG_PATH, big);
+		await until(() => liveFoldedLineRanges(big).length === 140);
+		big.destroy(); // closing the note
+		const other = makeView(TEXT_V1);
+		openFile(app, OTHER_PATH, other);
+		openFile(app, "Projects/Quarry/NoEntry.md", makeView("No folds stored for this one.\n"));
+		await pause(50);
+		await plugin.store.flush();
+
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(JSON.stringify(stored.value)).toBe(before);
+		expect(plugin.store.get(BIG_PATH)).toBe(bigEntry);
+		expect(plugin.store.get(BIG_PATH)?.folds).toHaveLength(140);
+	});
+
+	it("GP2: file-open on an empty editor, the 140-fold text lands later: every fold shows, nothing is set aside, the hash is the real one", async () => {
+		const record = { contentHash: hashText(BIG_LF), folds: lessonAnchors(BIG_LF), dormant: [] };
+		const { app, vault, plugin, setSpy } = await boot({ [BIG_PATH]: record });
+		const entry = plugin.store.get(BIG_PATH);
+
+		const { view, foldTransactions } = observedView("");
+		openFile(app, BIG_PATH, view, BIG_LF);
+		await pause(50);
+
+		// While the editor is empty: nothing happened.
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(foldTransactions()).toBe(0);
+		expect(plugin.store.get(BIG_PATH)).toBe(entry);
+
+		land(view, BIG_LF);
+		await until(() => liveFoldedLineRanges(view).length === 140);
+
+		const after = plugin.store.get(BIG_PATH);
+		expect(after?.folds).toHaveLength(140);
+		expect(after?.dormant).toHaveLength(0);
+		expect(after?.contentHash).toBe(hashText(BIG_LF));
+		expect(setSpy).not.toHaveBeenCalled(); // hash unchanged: stored folds applied verbatim
+		expect(view.state.doc.toString()).toBe(BIG_LF);
+
+		const lines = await logOf(plugin, vault);
+		expect(outcomes(lines)).toEqual(["waiting", "applied"]);
+		expect(lines.every((l) => l.pass === "open" && l.path === BIG_PATH)).toBe(true);
+		expect(lines[0]).toMatchObject({ editorLen: 0, diskLen: BIG_LF.length, foldsBefore: 140, foldsAfter: 140 });
+		expect(lines[1]).toMatchObject({ editorLen: BIG_LF.length, diskLen: BIG_LF.length, foldsBefore: 140, dormantAfter: 0 });
+	});
+
+	it("GP2 x10: reopening ten times in a row never drops a fold or leaves anything set aside", async () => {
+		const record = { contentHash: hashText(BIG_LF), folds: lessonAnchors(BIG_LF), dormant: [] };
+		const { app, vault, plugin, setSpy } = await boot({ [BIG_PATH]: record });
+		for (let i = 0; i < 10; i++) {
+			const { view } = observedView("");
+			openFile(app, BIG_PATH, view, BIG_LF);
+			await pause(5);
+			land(view, BIG_LF);
+			await until(() => liveFoldedLineRanges(view).length === 140);
+			expect(plugin.store.get(BIG_PATH)?.dormant).toHaveLength(0);
+			expect(plugin.store.get(BIG_PATH)?.folds).toHaveLength(140);
+			view.destroy();
+		}
+		expect(setSpy).not.toHaveBeenCalled();
+		const lines = await logOf(plugin, vault);
+		expect(lines.filter((l) => l.outcome === "refused-empty" || l.outcome === "gave-up")).toEqual([]);
+		expect(lines.filter((l) => l.outcome === "applied")).toHaveLength(10);
+	});
+
+	it("E1: an empty editor over a non-empty file runs no pass and never calls store.set; the pass runs once the text matches", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+		const entry = plugin.store.get(NOTE_PATH);
+
+		const { view, foldTransactions } = observedView("");
+		openFile(app, NOTE_PATH, view, TEXT_V1);
+		await pause(60);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(foldTransactions()).toBe(0);
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+
+		land(view, TEXT_V1);
+		await until(() => liveFoldedLineRanges(view).length === 1);
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 2 }]);
+		expect(plugin.store.get(NOTE_PATH)).toBe(entry); // verbatim: no re-match, no write
+		expect(setSpy).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ label: "a prefix of the file", partial: TEXT_V1.slice(0, 14) },
+		{ label: "same length but different text", partial: TEXT_V1.replace("Tuesday", "Tuesdaz") },
+		{ label: "the full text with one character missing", partial: TEXT_V1.slice(0, -1) },
+		{ label: "the full text with one character missing in the middle", partial: TEXT_V1.slice(0, 5) + TEXT_V1.slice(6) },
+	])("E4: a half-loaded editor ($label) is not loaded: no pass, no store write, until the real text lands", async ({ partial }) => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+		const entry = plugin.store.get(NOTE_PATH);
+
+		const { view, foldTransactions } = observedView("");
+		openFile(app, NOTE_PATH, view, TEXT_V1);
+		await pause(20);
+		land(view, partial);
+		await pause(60);
+		expect(foldTransactions()).toBe(0);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(plugin.store.get(NOTE_PATH)).toBe(entry);
+
+		land(view, TEXT_V1);
+		await until(() => liveFoldedLineRanges(view).length === 1);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(plugin.store.get(NOTE_PATH)).toBe(entry);
+	});
+
+	it("E5: a reused pane still showing the previous note's text does not match the new note's folds against it", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+		const entry = plugin.store.get(NOTE_PATH);
+		const OLD_NOTE = "## Tuesday\nThis is the PREVIOUS note's Tuesday.\n## Elsewhere\nOther text.";
+
+		const { view, foldTransactions } = observedView(OLD_NOTE);
+		openFile(app, NOTE_PATH, view, TEXT_V1);
+		await pause(80);
+		expect(foldTransactions()).toBe(0);
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(plugin.store.get(NOTE_PATH)).toBe(entry);
+
+		land(view, TEXT_V1);
+		await until(() => liveFoldedLineRanges(view).length === 1);
+		expect(setSpy).not.toHaveBeenCalled();
+	});
+
+	it("E5: the right text in a pane that still shows another file is not loaded until the pane shows this file", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+		const { view, foldTransactions } = observedView(TEXT_V1);
+		const pane = openFile(app, NOTE_PATH, view, TEXT_V1);
+		pane.file = new MockTFile("Projects/Quarry/Previous.md"); // the leaf's file is not this note yet
+		await pause(80);
+		expect(foldTransactions()).toBe(0);
+		expect(setSpy).not.toHaveBeenCalled();
+
+		pane.file = new MockTFile(NOTE_PATH);
+		await until(() => liveFoldedLineRanges(view).length === 1, 3000);
+		expect(plugin.store.get(NOTE_PATH)?.folds).toHaveLength(1);
+	});
+
+	it("E9: a CRLF note on disk with LF text in the editor counts as loaded; unchanged hash applies the folds verbatim", async () => {
+		const record = { contentHash: hashText(BIG_CRLF), folds: lessonAnchors(BIG_LF), dormant: [] };
+		const { app, vault, plugin, setSpy } = await boot({ [BIG_PATH]: record });
+		const entry = plugin.store.get(BIG_PATH);
+
+		const { view } = observedView(BIG_LF); // LF in the editor
+		openFile(app, BIG_PATH, view, BIG_CRLF); // CRLF on disk
+		await until(() => liveFoldedLineRanges(view).length === 140);
+
+		expect(plugin.store.get(BIG_PATH)).toBe(entry);
+		expect(setSpy).not.toHaveBeenCalled(); // no re-match
+		const lines = await logOf(plugin, vault);
+		expect(outcomes(lines)).toEqual(["applied"]);
+		expect(lines[0]).toMatchObject({ editorLen: BIG_LF.length, diskLen: BIG_CRLF.length });
+	});
+
+	it("E10: 30 s without the text matching: one `gave-up` line, nothing set aside, hash not rewritten, no fold effect dispatched", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, vault, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+		const entry = plugin.store.get(NOTE_PATH);
+		const { view, foldTransactions } = observedView("");
+		vi.useFakeTimers();
+
+		openFile(app, NOTE_PATH, view, TEXT_V1);
+		await vi.advanceTimersByTimeAsync(LOAD_WAIT_GIVE_UP_MS - 1);
+		expect((await logOf(plugin, vault)).map((l) => l.outcome)).toEqual(["waiting"]);
+
+		await vi.advanceTimersByTimeAsync(1);
+		const lines = await logOf(plugin, vault);
+		expect(lines.filter((l) => l.outcome === "gave-up")).toHaveLength(1);
+		expect(lines.find((l) => l.outcome === "gave-up")).toMatchObject({
+			path: NOTE_PATH,
+			pass: "open",
+			editorLen: 0,
+			diskLen: TEXT_V1.length,
+			foldsBefore: 1,
+			dormantBefore: 0,
+			foldsAfter: 1,
+			dormantAfter: 0,
+		});
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(plugin.store.get(NOTE_PATH)).toBe(entry);
+		expect(plugin.store.get(NOTE_PATH)?.contentHash).toBe(hashText(TEXT_V1));
+		expect(foldTransactions()).toBe(0);
+
+		// Given up means given up: text arriving afterwards starts no pass.
+		land(view, TEXT_V1);
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(foldTransactions()).toBe(0);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect((await logOf(plugin, vault)).filter((l) => l.outcome === "gave-up")).toHaveLength(1);
+	});
+
+	it("E11: a fold and an unfold made by hand during the wait are recorded as today and win over the later pass", async () => {
+		const record = {
+			contentHash: hashText(THREE),
+			folds: [headingAnchor(THREE, "alpha"), headingAnchor(THREE, "beta"), headingAnchor(THREE, "gamma")],
+			dormant: [],
+		};
+		const { app, plugin } = await boot({ [NOTE_PATH]: record });
+		const prefix = THREE.split("\n").slice(0, 4).join("\n"); // Alpha and Beta have arrived; Gamma has not
+		const watcher = createEditorWatcher({ store: plugin.store, window });
+		const { view } = observedView(prefix, [watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))]);
+		openFile(app, NOTE_PATH, view, THREE);
+		await pause(40);
+
+		// Dan folds "Beta" (lines 3-4) and unfolds "Alpha" (lines 1-2) by hand, untagged like a gutter click.
+		view.dispatch({ effects: foldEffect.of({ from: view.state.doc.line(3).to, to: view.state.doc.line(4).to }) });
+		view.dispatch({ effects: unfoldEffect.of({ from: view.state.doc.line(1).to, to: view.state.doc.line(2).to }) });
+		const during = plugin.store.get(NOTE_PATH);
+		const keys = (during?.folds as unknown as { text: string }[]).map((f) => f.text);
+		expect(keys).toContain("beta"); // recorded
+		expect(keys).not.toContain("alpha"); // his unfold recorded
+
+		land(view, THREE);
+		await until(() => liveFoldedLineRanges(view).length === 2);
+		await pause(400); // past the settle pass the watcher also runs on the landed text
+
+		const folded = liveFoldedLineRanges(view);
+		expect(folded).toEqual([
+			{ startLine: 3, endLine: 4 }, // Beta, the one he folded: still folded
+			{ startLine: 5, endLine: 6 }, // Gamma, the stored fold the pass restored
+		]); // Alpha, the one he opened: not refolded
+		const after = plugin.store.get(NOTE_PATH);
+		const texts = (after?.folds as unknown as { text: string }[]).map((f) => f.text).sort();
+		expect(texts).toEqual(["beta", "gamma"]);
+		expect(after?.dormant).toHaveLength(0);
+		expect(after?.contentHash).toBe(hashText(THREE));
+	});
+
+	it("E12: adapter.read rejects: nothing in the store changes, no pass runs, one `read-failed` line", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, vault, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+		const entry = plugin.store.get(NOTE_PATH);
+		vault.setContent(NOTE_PATH, TEXT_V1);
+		vault.failReadsOf(NOTE_PATH);
+		const { view, foldTransactions } = observedView("");
+
+		openFile(app, NOTE_PATH, view);
+		await pause(60);
+		land(view, TEXT_V1);
+		await pause(60);
+
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(plugin.store.get(NOTE_PATH)).toBe(entry);
+		expect(foldTransactions()).toBe(0);
+		const lines = await logOf(plugin, vault);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({ path: NOTE_PATH, pass: "open", outcome: "read-failed", editorLen: 0, diskLen: -1 });
+	});
+
+	it("E12: the file goes missing mid-wait (a modify event whose re-read fails): one `read-failed` line, no pass", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, vault, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+		const entry = plugin.store.get(NOTE_PATH);
+		const { view, foldTransactions } = observedView("");
+		openFile(app, NOTE_PATH, view, TEXT_V1);
+		await pause(30);
+
+		vault.removeContent(NOTE_PATH);
+		vault.trigger("modify", new MockTFile(NOTE_PATH));
+		await pause(30);
+		land(view, TEXT_V1);
+		await pause(60);
+
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(plugin.store.get(NOTE_PATH)).toBe(entry);
+		expect(foldTransactions()).toBe(0);
+		expect(outcomes(await logOf(plugin, vault))).toEqual(["waiting", "read-failed"]);
+	});
+
+	it("E12: the file is deleted mid-wait: the wait ends as read-failed and no pass runs", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, vault, plugin } = await boot({ [NOTE_PATH]: record });
+		const { view, foldTransactions } = observedView("");
+		openFile(app, NOTE_PATH, view, TEXT_V1);
+		await pause(30);
+
+		vault.removeContent(NOTE_PATH);
+		vault.trigger("delete", new MockTFile(NOTE_PATH));
+		await pause(30);
+		land(view, TEXT_V1);
+		await pause(60);
+
+		expect(foldTransactions()).toBe(0);
+		expect(outcomes(await logOf(plugin, vault))).toEqual(["waiting", "read-failed"]);
+	});
+
+	it("E12: a note renamed away mid-wait ends the wait as read-failed too", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, vault, plugin } = await boot({ [NOTE_PATH]: record });
+		const { view, foldTransactions } = observedView("");
+		openFile(app, NOTE_PATH, view, TEXT_V1);
+		await pause(30);
+
+		vault.trigger("rename", new MockTFile("Projects/Quarry/Renamed.md"), NOTE_PATH);
+		await pause(30);
+		land(view, TEXT_V1);
+		await pause(60);
+
+		expect(foldTransactions()).toBe(0);
+		expect(outcomes(await logOf(plugin, vault))).toEqual(["waiting", "read-failed"]);
+	});
+
+	describe("E13: data already holding the empty-text hash with the folds set aside", () => {
+		const fresh = (): FileFoldRecord["dormant"] =>
+			lessonAnchors(BIG_LF).reduce<FileFoldRecord["dormant"]>(
+				(list, anchor) => addDormant(list, anchor as never, Date.now() - 5 * 60_000),
+				[],
+			);
+
+		it("gets one real-text pass once loaded: the set-aside folds come back as folds and the hash becomes the real one", async () => {
+			const record = { contentHash: hashText(""), folds: [], dormant: fresh() };
+			expect(record.dormant).toHaveLength(140);
+			const { app, plugin, setSpy } = await boot({ [BIG_PATH]: record });
+			const { view } = observedView("");
+			openFile(app, BIG_PATH, view, BIG_LF);
+			await pause(50);
+			expect(setSpy).not.toHaveBeenCalled(); // still waiting: untouched
+
+			land(view, BIG_LF);
+			await until(() => plugin.store.get(BIG_PATH)?.contentHash === hashText(BIG_LF));
+			await until(() => liveFoldedLineRanges(view).length === 140);
+			const after = plugin.store.get(BIG_PATH);
+			expect(after?.folds).toHaveLength(140);
+			expect(after?.dormant).toHaveLength(0);
+			expect(setSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("boundary: with `dormantSince` older than MAX_DORMANT_AGE_MS it behaves exactly as restoreOnOpen does today", async () => {
+			const aged = lessonAnchors(BIG_LF).reduce<FileFoldRecord["dormant"]>(
+				(list, anchor) => addDormant(list, anchor as never, Date.now() - MAX_DORMANT_AGE_MS - 60_000),
+				[],
+			);
+			const record = { contentHash: hashText(""), folds: [], dormant: aged };
+
+			// What a real-text pass produces today, called directly with no wait.
+			const direct = new FoldStore({
+				loadData: () => Promise.resolve({ version: 1, files: { [BIG_PATH]: record } }),
+				saveData: () => Promise.resolve(),
+			});
+			await direct.load();
+			const directView = makeView(BIG_LF);
+			await restoreOnOpen(directView, BIG_PATH, BIG_LF, { store: direct });
+			const expected = direct.get(BIG_PATH);
+			expect(expected?.folds).toHaveLength(0); // the window is not extended
+			expect(expected?.contentHash).toBe(hashText(BIG_LF));
+
+			const { app, plugin } = await boot({ [BIG_PATH]: record });
+			const { view } = observedView("");
+			openFile(app, BIG_PATH, view, BIG_LF);
+			await pause(30);
+			land(view, BIG_LF);
+			await until(() => plugin.store.get(BIG_PATH)?.contentHash === hashText(BIG_LF));
+			expect(plugin.store.get(BIG_PATH)).toEqual(expected);
+			expect(liveFoldedLineRanges(view)).toEqual(liveFoldedLineRanges(directView));
+		});
+	});
+
+	describe("E17: two panes on one note", () => {
+		it("a pane still loading does not touch the folds of the pane that has loaded; the store is written once, by the pane that loads first", async () => {
+			// Stored hash is stale, so the pass that runs is a re-match and writes once.
+			const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+			const { app, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+			const paneA = observedView(TEXT_V2);
+			const paneB = observedView("");
+
+			openFile(app, NOTE_PATH, paneA.view, TEXT_V2);
+			openFile(app, NOTE_PATH, paneB.view, TEXT_V2);
+			await until(() => plugin.store.get(NOTE_PATH)?.contentHash === hashText(TEXT_V2));
+			const aFolds = liveFoldedLineRanges(paneA.view);
+			expect(aFolds).toEqual([{ startLine: 2, endLine: 3 }]);
+			expect(setSpy).toHaveBeenCalledTimes(1);
+
+			await pause(80);
+			expect(paneB.foldTransactions()).toBe(0); // B's wait is still waiting
+			expect(liveFoldedLineRanges(paneB.view)).toEqual([]);
+			expect(liveFoldedLineRanges(paneA.view)).toEqual(aFolds);
+			expect(setSpy).toHaveBeenCalledTimes(1);
+
+			land(paneB.view, TEXT_V2);
+			await until(() => liveFoldedLineRanges(paneB.view).length === 1);
+			expect(liveFoldedLineRanges(paneB.view)).toEqual(aFolds);
+			expect(liveFoldedLineRanges(paneA.view)).toEqual(aFolds);
+			expect(setSpy).toHaveBeenCalledTimes(1); // B found the hash current: verbatim, no write
+		});
+
+		it("a new file-open for one pane cancels only that pane's wait; the other pane's wait keeps running", async () => {
+			const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+			const { app, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+			const paneA = observedView("");
+			const paneB = observedView("");
+			openFile(app, NOTE_PATH, paneA.view, TEXT_V1);
+			openFile(app, NOTE_PATH, paneB.view, TEXT_V1);
+			await pause(30);
+			const waits = (plugin as unknown as { loadWaits: { size: number } }).loadWaits;
+			expect(waits.size).toBe(2);
+
+			// Pane B moves on to a note with nothing stored.
+			openFile(app, "Projects/Quarry/NoEntry.md", paneB.view, "plain\n");
+			expect(waits.size).toBe(1);
+			land(paneB.view, TEXT_V1); // B's old text arriving now must not start anything
+			await pause(60);
+			expect(paneB.foldTransactions()).toBe(0);
+
+			land(paneA.view, TEXT_V1);
+			await until(() => liveFoldedLineRanges(paneA.view).length === 1);
+			expect(setSpy).not.toHaveBeenCalled();
+			expect(waits.size).toBe(0);
+		});
+
+		it("a pane that closes mid-wait cancels its wait and never runs a pass", async () => {
+			const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+			const { app, vault, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+			const { view } = observedView("");
+			vi.useFakeTimers();
+			openFile(app, NOTE_PATH, view, TEXT_V1);
+			await vi.advanceTimersByTimeAsync(100);
+			const waits = (plugin as unknown as { loadWaits: { size: number } }).loadWaits;
+			expect(waits.size).toBe(1);
+
+			view.destroy(); // the pane is closed
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(waits.size).toBe(0);
+			await vi.advanceTimersByTimeAsync(LOAD_WAIT_GIVE_UP_MS);
+			expect(setSpy).not.toHaveBeenCalled();
+			expect(outcomes(await logOf(plugin, vault))).toEqual(["waiting"]); // no gave-up line for a closed pane
+		});
+	});
+
+	it("added: a note that really is empty on disk, with an empty editor, is loaded at once and proceeds as today", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, vault, plugin } = await boot({ [NOTE_PATH]: record });
+		const { view } = observedView("");
+		openFile(app, NOTE_PATH, view, "");
+		await until(() => plugin.store.get(NOTE_PATH)?.contentHash === hashText(""));
+
+		const after = plugin.store.get(NOTE_PATH);
+		expect(after?.folds).toHaveLength(0);
+		expect(after?.dormant).toHaveLength(1); // the real change: the fold has nowhere to go
+		const lines = await logOf(plugin, vault);
+		expect(outcomes(lines)).toEqual(["rematched"]); // no waiting line: loaded at once
+		expect(lines[0]).toMatchObject({ editorLen: 0, diskLen: 0 });
+	});
+
+	it("added: rapid file-open for one pane (A -> B -> A within 100 ms) leaves one live wait and runs only the last file's pass", async () => {
+		const A = "Projects/Quarry/A.md";
+		const B = "Projects/Quarry/B.md";
+		const TEXT_B = "## Beta\nBeta body.\n";
+		const { app, vault, plugin, setSpy } = await boot({
+			[A]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] },
+			[B]: { contentHash: hashText(TEXT_B), folds: [headingAnchor(TEXT_B, "beta")], dormant: [] },
+		});
+		const waits = (plugin as unknown as { loadWaits: { size: number } }).loadWaits;
+		const { view } = observedView("");
+		openFile(app, A, view, TEXT_V1);
+		openFile(app, B, view, TEXT_B);
+		openFile(app, A, view, TEXT_V1);
+		expect(waits.size).toBe(1);
+		await pause(40);
+		expect(waits.size).toBe(1);
+
+		land(view, TEXT_V1);
+		await until(() => liveFoldedLineRanges(view).length === 1);
+		await pause(40);
+		expect(waits.size).toBe(0);
+		expect(setSpy).not.toHaveBeenCalled();
+		const lines = await logOf(plugin, vault);
+		expect(lines.filter((l) => l.outcome === "applied")).toHaveLength(1);
+		expect(lines.filter((l) => l.path === B)).toEqual([]); // B's pass never ran
+	});
+
+	it("added: unloading the plugin mid-wait leaves no timer, listener or log write behind", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, vault, plugin, setSpy } = await boot({ [NOTE_PATH]: record });
+		const { view, foldTransactions } = observedView("");
+		vi.useFakeTimers();
+		openFile(app, NOTE_PATH, view, TEXT_V1);
+		await vi.advanceTimersByTimeAsync(100);
+		const waits = (plugin as unknown as { loadWaits: { size: number } }).loadWaits;
+		expect(waits.size).toBe(1);
+		const linesBefore = (await logOf(plugin, vault)).length;
+		const adapterCalls = vault.adapter.calls.length;
+
+		plugin.unload();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(waits.size).toBe(0);
+		const timersAfterUnload = vi.getTimerCount();
+
+		vault.trigger("modify", new MockTFile(NOTE_PATH)); // no listener left to re-read the disk
+		land(view, TEXT_V1); // no listener left to notice the text
+		await vi.advanceTimersByTimeAsync(LOAD_WAIT_GIVE_UP_MS + 5_000);
+
+		expect(vi.getTimerCount()).toBe(timersAfterUnload);
+		expect(vault.adapter.calls.length).toBe(adapterCalls); // not one more read or log write
+		expect(foldTransactions()).toBe(0);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect((await logOf(plugin, vault)).length).toBe(linesBefore);
+	});
+
+	it("F3: the wait path writes only through store.set and the log in the plugin folder; never a note", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { app, vault, plugin } = await boot({ [NOTE_PATH]: record, [BIG_PATH]: { contentHash: hashText(""), folds: [], dormant: [] } });
+		const modify = vi.fn();
+		const process = vi.fn();
+		Object.assign(vault, { modify, process });
+
+		for (const [path, text] of [
+			[NOTE_PATH, TEXT_V1],
+			[BIG_PATH, BIG_LF],
+		] as const) {
+			const { view } = observedView("");
+			openFile(app, path, view, text);
+			await pause(30);
+			land(view, text);
+			await pause(100);
+		}
+		await plugin.diagnosticLog?.drain();
+
+		expect(modify).not.toHaveBeenCalled();
+		expect(process).not.toHaveBeenCalled();
+		const writes = vault.adapter.calls.filter((c) => c.method === "write" || c.method === "append");
+		expect(writes.length).toBeGreaterThan(0);
+		for (const write of writes) expect(write.path).toBe(LOG_PATH);
+		const reads = vault.adapter.calls.filter((c) => c.method === "read" && c.path !== LOG_PATH);
+		expect(reads.length).toBeGreaterThan(0);
+	});
+
+	it("the log holds paths, counts and codes only: no note text in any field of a waiting, gave-up or read-failed line", async () => {
+		const secretText = `## Tuesday\n${MARKER} body.\n## Wednesday\nSecond.`;
+		const record = { contentHash: hashText(secretText), folds: [tuesdayAnchorFor(secretText)], dormant: [] };
+		const { app, vault, plugin } = await boot({ [NOTE_PATH]: record });
+		const { view } = observedView("");
+		vi.useFakeTimers();
+		openFile(app, NOTE_PATH, view, secretText);
+		await vi.advanceTimersByTimeAsync(LOAD_WAIT_GIVE_UP_MS);
+		const lines = await logOf(plugin, vault);
+		expect(outcomes(lines)).toEqual(["waiting", "gave-up"]);
+		const raw = vault.adapter.files.get(LOG_PATH) as string;
+		for (const secret of [MARKER, "Tuesday", "tuesday", "Wednesday", "Second."]) expect(raw).not.toContain(secret);
+		for (const line of lines) {
+			expect(Object.keys(line)).toEqual([
+				"t", "path", "pass", "editorLen", "diskLen", "foldsBefore", "dormantBefore", "foldsAfter", "dormantAfter", "outcome",
+			]);
+		}
+	});
+});
+
+describe("native-restore guard behind the load wait (warkworth-46 PR-3)", () => {
+	const LOG_PATH = ".obsidian/plugins/persistent-folded-state/diagnostic-log.jsonl";
+	const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+	async function boot(delays: number[]) {
+		const app = new App();
+		const vault = app.vault as unknown as MockVault;
+		vault.setExists(NOTE_PATH);
+		const stored = {
+			value: { version: 1, files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } } },
+		};
+		const plugin = makePlugin(app, stored);
+		plugin.guardDelaysMs = delays;
+		await plugin.onload();
+		return { app, vault, plugin };
+	}
+
+	async function logOf(plugin: PersistentFoldedStatePlugin, vault: MockVault): Promise<Record<string, unknown>[]> {
+		await plugin.diagnosticLog?.drain();
+		return (vault.adapter.files.get(LOG_PATH) ?? "")
+			.split("\n")
+			.filter((l) => l !== "")
+			.map((l) => JSON.parse(l) as Record<string, unknown>);
+	}
+
+	it("the guard's checks start after the wait: a stale native fold that lands once the text has loaded is still corrected", async () => {
+		const { app, plugin } = await boot([10, 200]);
+		const view = makeView("");
+		openFile(app, NOTE_PATH, view, TEXT_V3); // the disk has the real (reordered) text, the pane is still empty
+		await pause(60); // longer than the first guard delay: if it were timed from file-open it would be spent by now
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+
+		view.dispatch({ changes: { from: 0, to: 0, insert: TEXT_V3 } });
+		for (let i = 0; i < 100 && liveFoldedLineRanges(view).length === 0; i++) await pause(10);
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+
+		// Obsidian's own restore arrives late with the stale offsets: the guard still has its 200 ms check.
+		view.dispatch({
+			effects: [
+				unfoldEffect.of({ from: view.state.doc.line(3).to, to: view.state.doc.line(4).to }),
+				foldEffect.of({ from: view.state.doc.line(1).to, to: view.state.doc.line(2).to }),
+			],
+		});
+		for (let i = 0; i < 100 && JSON.stringify(liveFoldedLineRanges(view)) !== JSON.stringify([{ startLine: 3, endLine: 4 }]); i++) await pause(10);
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+		expect(view.state.doc.toString()).toBe(TEXT_V3);
+	}, 10000);
+
+	it("a check that finds the pane showing other text does nothing to it, writes nothing, and logs one `native-guard` waiting line", async () => {
+		const { app, vault, plugin } = await boot([60, 90, 120]);
+		const view = makeView(TEXT_V3);
+		openFile(app, NOTE_PATH, view);
+		await pause(20);
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+		const setSpy = vi.spyOn(plugin.store, "set"); // the open pass's own re-match write is behind us
+
+		// The pane is reused for another note before the guard's later checks run.
+		const other = "# Another note\nbody\n## Heading\nmore body\n";
+		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: other } });
+		const folded = JSON.stringify(liveFoldedLineRanges(view));
+		view.dispatch({ effects: foldEffect.of({ from: view.state.doc.line(1).to, to: view.state.doc.line(2).to }) }); // a native fold on the new note
+		await pause(200);
+
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 2 }]); // the guard left the other note's fold alone
+		expect(JSON.stringify(liveFoldedLineRanges(view))).not.toBe(folded);
+		const lines = (await logOf(plugin, vault)).filter((l) => l.pass === "native-guard");
+		expect(lines).toHaveLength(1); // once per open, however many checks skip
+		expect(lines[0]).toMatchObject({ path: NOTE_PATH, outcome: "waiting", editorLen: other.length });
+		expect(JSON.stringify(lines)).not.toContain("Another note");
+	}, 10000);
+
+	it("a pane that still shows the note's text through the whole window logs no native-guard line", async () => {
+		const { app, vault, plugin } = await boot([10, 40]);
+		const view = makeView(TEXT_V3);
+		openFile(app, NOTE_PATH, view);
+		await pause(100);
+		expect((await logOf(plugin, vault)).filter((l) => l.pass === "native-guard")).toEqual([]);
 	});
 });
