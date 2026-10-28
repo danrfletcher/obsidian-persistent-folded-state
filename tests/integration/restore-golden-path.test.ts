@@ -14,7 +14,16 @@ import { fileURLToPath } from "node:url";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldedRanges } from "@codemirror/language";
-import { editorInfoField } from "../mocks/obsidian";
+import { App, type PluginManifest } from "obsidian";
+import {
+	Editor as MockEditor,
+	MarkdownView as MockMarkdownView,
+	TFile as MockTFile,
+	Vault as MockVault,
+	Workspace as MockWorkspace,
+	editorInfoField,
+} from "../mocks/obsidian";
+import PersistentFoldedStatePlugin from "../../src/main";
 import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
 import { buildAnchors, anchorKey, type Anchor, type AnchoredBlock } from "../../src/anchors";
@@ -126,5 +135,100 @@ describe("golden path GP1-GP3 (tasks-before.md -> tasks-after.md)", () => {
 
 		// The stored content hash is refreshed to the settled (GP2) text (PR-7's hook).
 		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(AFTER));
+	});
+});
+
+// --- GP6: the same fixture pair, opened through the plugin's file-open handler, is logged -------
+// (warkworth-46 PR-1). One line per open pass; counts come from the store before and after.
+
+describe("golden path GP6: opening tasks-before.md / tasks-after.md logs one `open` line per pass", () => {
+	const LOG_PATH = ".obsidian/plugins/persistent-folded-state/diagnostic-log.jsonl";
+	const manifest: PluginManifest = {
+		id: "persistent-folded-state",
+		name: "Persistent Folded State",
+		version: "0.1.0",
+		minAppVersion: "1.13.0",
+		description: "test",
+		author: "Dan Fletcher",
+		isDesktopOnly: false,
+	};
+
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	async function openFixture(text: string) {
+		const blocks = buildAnchors(BEFORE);
+		const tuesday = findOneBlock(blocks, (a) => a.kind === "heading" && a.text === "tuesday").anchor;
+		const draftProposal = findOneBlock(blocks, (a) => a.kind === "task" && a.text === "draft proposal").anchor;
+		const stored = {
+			value: {
+				version: 1,
+				files: { [NOTE_PATH]: { contentHash: hashText(BEFORE), folds: [tuesday, draftProposal], dormant: [] } },
+			},
+		};
+		const app = new App();
+		const vault = app.vault as unknown as MockVault;
+		vault.setExists(NOTE_PATH);
+		const plugin = new PersistentFoldedStatePlugin(app, manifest);
+		plugin.loadData = async () => stored.value;
+		plugin.saveData = async (data: unknown) => {
+			stored.value = data as typeof stored.value;
+		};
+		await plugin.onload();
+
+		const view = new EditorView({
+			state: EditorState.create({ doc: text, selection: { anchor: 0 }, extensions: [codeFolding()] }),
+			parent: document.body,
+		});
+		const file = new MockTFile(NOTE_PATH);
+		const markdownView = new MockMarkdownView();
+		markdownView.file = file;
+		markdownView.editor = new MockEditor(view);
+		(app.workspace as unknown as MockWorkspace).setActiveView(markdownView);
+		(app.workspace as unknown as MockWorkspace).trigger("file-open", file);
+		await settle();
+		await plugin.diagnosticLog?.drain();
+
+		const lines = (vault.adapter.files.get(LOG_PATH) ?? "")
+			.split("\n")
+			.filter((l) => l !== "")
+			.map((l) => JSON.parse(l) as Record<string, unknown>);
+		return { view, lines, plugin };
+	}
+
+	it("tasks-before.md (hash unchanged): the verbatim path logs `applied`, 2 folds before and after", async () => {
+		const { view, lines } = await openFixture(BEFORE);
+		expect(liveFoldedLineRanges(view)).toHaveLength(2);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({
+			path: NOTE_PATH,
+			pass: "open",
+			outcome: "applied",
+			editorLen: BEFORE.length,
+			diskLen: -1,
+			foldsBefore: 2,
+			dormantBefore: 0,
+			foldsAfter: 2,
+			dormantAfter: 0,
+		});
+	});
+
+	it("tasks-after.md (rewritten while closed): the re-match path logs `rematched`, 2 folds before and after, none set aside", async () => {
+		const { view, lines, plugin } = await openFixture(AFTER);
+		expect(liveFoldedLineRanges(view)).toHaveLength(2);
+		expect(plugin.store.get(NOTE_PATH)?.contentHash).toBe(hashText(AFTER));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({
+			path: NOTE_PATH,
+			pass: "open",
+			outcome: "rematched",
+			editorLen: AFTER.length,
+			diskLen: -1,
+			foldsBefore: 2,
+			dormantBefore: 0,
+			foldsAfter: 2,
+			dormantAfter: 0,
+		});
 	});
 });

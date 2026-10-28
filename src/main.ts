@@ -98,12 +98,21 @@
  * also calls `pruneOrphanEmbeds`. A heading renamed inside Obsidian is noticed from the metadata
  * cache (`EmbedHeadingRenameTracker`, src/embed-heading-rename.ts), which only reads it. Nothing
  * here writes to a note, and none of it goes through the dormancy tracker.
+ *
+ * Warkworth-46 PR-1 (GP6, F4, F6): an always-on diagnostic log. `DiagnosticLogWriter`
+ * (src/diagnostic-log-writer.ts) appends one JSON line per logged restore pass to
+ * `diagnostic-log.jsonl` in this plugin's own folder, through the vault adapter, and the one new
+ * command, "Copy diagnostic log", copies it. `restoreOnOpen`, `restoreSettledChange` (through the
+ * editor watcher) and the embed restorer each get the writer's `log` as an optional sink; none
+ * waits on it. No setting turns it off and no other UI is added.
  */
 import { Events, Plugin } from "obsidian";
 import type { TFile } from "obsidian";
 import type { EditorView } from "@codemirror/view";
 import { FoldStore } from "./fold-store";
-import { registerForgetNoteFoldsCommand } from "./commands";
+import { registerCopyDiagnosticLogCommand, registerForgetNoteFoldsCommand } from "./commands";
+import { DiagnosticLogWriter } from "./diagnostic-log-writer";
+import type { DiagnosticSink } from "./diagnostic-log";
 import { PersistentFoldedStateSettingTab } from "./settings-tab";
 import { createEditorWatcher } from "./editor-watcher";
 import { restoreOnOpen } from "./open-restore";
@@ -134,6 +143,8 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	private embedRestorer: EmbedFoldRestorer | null = null;
 	/** PR-7: the dormancy tracker, kept so `onunload()` can cancel its pending second looks. */
 	private dormancy: EmbedDormancyTracker | null = null;
+	/** Warkworth-46 PR-1: the diagnostic log writer. Created in `onload()`, drained in `onunload()`. */
+	diagnosticLog: DiagnosticLogWriter | null = null;
 
 	async onload(): Promise<void> {
 		this.store = new FoldStore({
@@ -141,6 +152,15 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 			saveData: (data) => this.saveData(data),
 		});
 		await this.store.load();
+
+		// Warkworth-46 PR-1: the log lives in this plugin's own folder. `manifest.dir` is optional
+		// in Obsidian's typings; the same folder is rebuilt from the config folder when absent.
+		const logWriter = new DiagnosticLogWriter(
+			this.app.vault.adapter,
+			this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+		);
+		this.diagnosticLog = logWriter;
+		const diagnosticSink: DiagnosticSink = (entry) => logWriter.log(entry);
 
 		// PR-8 (G17): notices a heading renamed inside Obsidian, so the embeds that link to it
 		// follow it instead of looking retargeted. Reads the metadata cache only.
@@ -172,12 +192,14 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		});
 
 		registerForgetNoteFoldsCommand(this);
+		registerCopyDiagnosticLogCommand(this, logWriter);
 		this.addSettingTab(new PersistentFoldedStateSettingTab(this.app, this));
 		this.registerEditorExtension(
 			createEditorWatcher({
 				store: this.store,
 				onSettledNonUserChange: (path, text) => this.events.trigger(SETTLED_NON_USER_CHANGE_EVENT, path, text),
 				disposed: this.editorWatcherDisposed,
+				diagnosticLog: diagnosticSink,
 			})
 		);
 		// T2: forces every already-open pane onto the extension just registered above (and
@@ -259,6 +281,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 			positionOf,
 			whenRecorded: () => recorder.whenIdle(),
 			dormancy,
+			diagnosticLog: diagnosticSink,
 		});
 		this.embedRestorer = restorer;
 		restorer.attach(document);
@@ -321,6 +344,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 						},
 						onLayoutReady: (cb) => this.app.workspace.onLayoutReady(cb),
 						guardDelaysMs: this.guardDelaysMs,
+						diagnosticLog: diagnosticSink,
 					}).catch((err: unknown) => {
 						console.error("persistent-folded-state: open restore failed", err);
 					});
@@ -341,6 +365,10 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		this.embedRestorer = null;
 		this.dormancy?.dispose();
 		this.dormancy = null;
+		// Warkworth-46 PR-1: lines already queued are still written (drain never rejects); a
+		// re-enabled plugin builds a new writer that keeps appending to the same file.
+		void this.diagnosticLog?.drain();
+		this.diagnosticLog = null;
 		this.flushAtOnce();
 	}
 

@@ -9,9 +9,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldedRanges } from "@codemirror/language";
-import { editorInfoField } from "../mocks/obsidian";
-import { FoldStore } from "../../src/fold-store";
+import { MemoryAdapter, editorInfoField } from "../mocks/obsidian";
+import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
+import { restoreSettledChange } from "../../src/fold-restorer";
+import { DiagnosticLogWriter } from "../../src/diagnostic-log-writer";
+import { DIAGNOSTIC_LOG_FIELDS, logLines, type DiagnosticEntry } from "../../src/diagnostic-log";
 import type { FileFoldRecord } from "../../src/types";
 
 const NOTE_PATH = "Tasks.md";
@@ -173,5 +176,168 @@ describe("restore edge cases: idempotent re-apply against the real CM6 pipeline"
 		await settle();
 
 		expect(liveFoldedRanges(view)).toEqual(foldedAfterFirst);
+	});
+});
+
+// --- The diagnostic log's `settled` lines (warkworth-46 PR-1, GP6, F4, E16) -------------------
+
+describe("diagnostic log: restoreSettledChange logs a `settled` line when it changes stored data", () => {
+	const DIR = ".obsidian/plugins/persistent-folded-state";
+	const LOG_PATH = `${DIR}/diagnostic-log.jsonl`;
+	// An extra line above "## Tuesday" changes the text (and so its hash) but not the heading.
+	const AFTER = ["(a line inserted above)", "## Tuesday", "body line", "## Another"].join("\n");
+	const UNPLACEABLE = { kind: "heading", indent: 0, text: "zzz qqq www completely different", siblingIndex: 0, parentChain: [] };
+	const MARKER = "SETTLED-MARKER-77c1";
+
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	function logTo(adapter: MemoryAdapter): DiagnosticLogWriter {
+		return new DiagnosticLogWriter(adapter, DIR, { now: () => new Date("2026-10-28T10:00:00.000Z"), warn: () => {} });
+	}
+
+	function entriesOf(adapter: MemoryAdapter): Record<string, unknown>[] {
+		return logLines(adapter.files.get(LOG_PATH) ?? "").map((line) => JSON.parse(line) as Record<string, unknown>);
+	}
+
+	function watchedView(store: FoldStore, doc: string, log: DiagnosticLogWriter): EditorView {
+		const watcher = createEditorWatcher({ store, window, diagnosticLog: (entry) => log.log(entry) });
+		const state = EditorState.create({
+			doc,
+			selection: { anchor: 0 },
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		return new EditorView({ state, parent: document.body });
+	}
+
+	function rewrite(view: EditorView, text: string): void {
+		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, annotations: Transaction.userEvent.of("set") });
+	}
+
+	it("an external rewrite that re-matches one fold and sets one aside logs one line with the counts before and after", async () => {
+		const adapter = new MemoryAdapter();
+		const log = logTo(adapter);
+		const store = await makeStore({
+			[NOTE_PATH]: { contentHash: hashText(BEFORE), folds: [TUESDAY_ANCHOR, UNPLACEABLE], dormant: [] },
+		});
+		const view = watchedView(store, BEFORE, log);
+
+		rewrite(view, AFTER);
+		await settle();
+		await log.drain();
+
+		const lines = entriesOf(adapter);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({
+			path: NOTE_PATH,
+			pass: "settled",
+			editorLen: AFTER.length,
+			diskLen: -1,
+			foldsBefore: 2,
+			dormantBefore: 0,
+			foldsAfter: 1,
+			dormantAfter: 1,
+			outcome: "rematched",
+		});
+		expect(Object.keys(lines[0])).toEqual([...DIAGNOSTIC_LOG_FIELDS]);
+		// The counts are what the store really holds after the pass.
+		expect(store.get(NOTE_PATH)?.folds).toHaveLength(1);
+		expect(store.get(NOTE_PATH)?.dormant).toHaveLength(1);
+	});
+
+	it("the produced line holds no note text, heading or anchor text", async () => {
+		const adapter = new MemoryAdapter();
+		const log = logTo(adapter);
+		const body = ["## Tuesday", `${MARKER} body line`, "## Another"].join("\n");
+		const edited = `(inserted)\n${body}`;
+		const store = await makeStore({
+			[NOTE_PATH]: { contentHash: hashText(body), folds: [TUESDAY_ANCHOR, UNPLACEABLE], dormant: [] },
+		});
+		const view = watchedView(store, body, log);
+
+		rewrite(view, edited);
+		await settle();
+		await log.drain();
+
+		const raw = adapter.files.get(LOG_PATH) as string;
+		expect(raw).not.toBe("");
+		for (const secret of [MARKER, "body line", "tuesday", "Tuesday", "zzz qqq", "Another", "inserted"]) expect(raw).not.toContain(secret);
+		for (const line of entriesOf(adapter)) {
+			expect(Object.keys(line)).toEqual([...DIAGNOSTIC_LOG_FIELDS]);
+			for (const banned of ["text", "heading", "anchor", "content"]) expect(Object.keys(line)).not.toContain(banned);
+		}
+	});
+
+	it("a pass that changes nothing stored logs nothing", async () => {
+		const adapter = new MemoryAdapter();
+		const log = logTo(adapter);
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: hashText(BEFORE), folds: [TUESDAY_ANCHOR], dormant: [] } });
+		const view = watchedView(store, BEFORE, log);
+
+		rewrite(view, BEFORE); // the same text again: same hash, same folds, same set-aside list
+		await settle();
+		await log.drain();
+
+		expect(adapter.calls).toEqual([]);
+		expect(entriesOf(adapter)).toEqual([]);
+	});
+
+	it("a superseded run logs nothing, and neither does a run whose path no longer matches", async () => {
+		const seen: DiagnosticEntry[] = [];
+		const record = { contentHash: hashText(BEFORE), folds: [TUESDAY_ANCHOR], dormant: [] };
+		const run = async (opts: { superseded: boolean; activePath: string | null }): Promise<void> => {
+			const store = await makeStore({ [NOTE_PATH]: structuredClone(record) });
+			const view = watchedView(store, BEFORE, logTo(new MemoryAdapter()));
+			await restoreSettledChange(view, NOTE_PATH, AFTER, {
+				store,
+				getActivePath: () => opts.activePath,
+				isSuperseded: () => opts.superseded,
+				diagnosticLog: (entry) => seen.push(entry),
+			});
+			expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(BEFORE)); // nothing was stored either
+		};
+
+		await run({ superseded: true, activePath: NOTE_PATH });
+		await run({ superseded: false, activePath: OTHER_PATH });
+		await run({ superseded: false, activePath: null });
+		expect(seen).toEqual([]);
+
+		// And the same call, not superseded and on the right path, does log: the test is not vacuous.
+		const store = await makeStore({ [NOTE_PATH]: structuredClone(record) });
+		const view = watchedView(store, BEFORE, logTo(new MemoryAdapter()));
+		await restoreSettledChange(view, NOTE_PATH, AFTER, {
+			store,
+			getActivePath: () => NOTE_PATH,
+			diagnosticLog: (entry) => seen.push(entry),
+		});
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).toMatchObject({ pass: "settled", outcome: "rematched", foldsBefore: 1, foldsAfter: 1 });
+	});
+
+	it.each([
+		{ label: "a rejecting adapter", setup: (a: MemoryAdapter) => void (a.failWith = new Error("disk full")) },
+		{ label: "a synchronously throwing adapter", setup: (a: MemoryAdapter) => void (a.throwSync = true) },
+		{ label: "a never-resolving adapter", setup: (a: MemoryAdapter) => void (a.hang = true) },
+	])("E16: $label leaves the pass's folds and the store exactly as when logging works", async ({ setup }) => {
+		const outcomeWith = async (breakAdapter: boolean) => {
+			const adapter = new MemoryAdapter();
+			if (breakAdapter) setup(adapter);
+			const log = logTo(adapter);
+			const store = await makeStore({
+				[NOTE_PATH]: { contentHash: hashText(BEFORE), folds: [TUESDAY_ANCHOR, UNPLACEABLE], dormant: [] },
+			});
+			const view = watchedView(store, BEFORE, log);
+			rewrite(view, AFTER);
+			await settle();
+			return { folded: liveFoldedRanges(view), record: structuredClone(store.get(NOTE_PATH)) };
+		};
+		const working = await outcomeWith(false);
+		const broken = await outcomeWith(true);
+		expect(working.folded).toHaveLength(1);
+		// `dormantSince` is a wall-clock stamp: compare everything else exactly.
+		const strip = (r: typeof working.record) => ({ ...r, dormant: r?.dormant.map((d) => ({ ...d, dormantSince: 0 })) });
+		expect(broken.folded).toEqual(working.folded);
+		expect(strip(broken.record)).toEqual(strip(working.record));
 	});
 });

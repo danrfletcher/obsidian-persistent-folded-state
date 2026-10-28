@@ -675,3 +675,137 @@ describe("open-restore via the plugin's file-open handler", () => {
 		await settle();
 	});
 });
+
+// --- The diagnostic log's `open` lines (warkworth-46 PR-1, GP6, F4, E16) ----------------------
+
+describe("diagnostic log: restoreOnOpen logs one `open` line per pass", () => {
+	const LOG_PATH = ".obsidian/plugins/persistent-folded-state/diagnostic-log.jsonl";
+	const MARKER = "OPEN-MARKER-5d2e";
+
+	async function openWithLog(
+		text: string,
+		record: FileFoldRecord,
+		breakAdapter?: (adapter: MockVault["adapter"]) => void,
+	) {
+		const app = new App();
+		const vault = app.vault as unknown as MockVault;
+		vault.setExists(NOTE_PATH);
+		breakAdapter?.(vault.adapter);
+		const plugin = makePlugin(app, { value: { version: 1, files: { [NOTE_PATH]: record } } });
+		await plugin.onload();
+		const view = makeView(text);
+		openFile(app, NOTE_PATH, view);
+		await settle();
+		// A never-resolving adapter never drains: the pass has finished either way, so don't wait on it.
+		await Promise.race([plugin.diagnosticLog?.drain(), new Promise((resolve) => setTimeout(resolve, 20))]);
+		const lines = logLinesOf(vault.adapter.files.get(LOG_PATH));
+		return { plugin, view, lines, vault };
+	}
+
+	function logLinesOf(raw: string | undefined): Record<string, unknown>[] {
+		return (raw ?? "")
+			.split("\n")
+			.filter((l) => l !== "")
+			.map((l) => JSON.parse(l) as Record<string, unknown>);
+	}
+
+	it("verbatim path (hash unchanged): one `applied` line, counts from the store before and after", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { view, lines } = await openWithLog(TEXT_V1, record);
+
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 2 }]);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({
+			path: NOTE_PATH,
+			pass: "open",
+			editorLen: TEXT_V1.length,
+			diskLen: -1,
+			foldsBefore: 1,
+			dormantBefore: 0,
+			foldsAfter: 1,
+			dormantAfter: 0,
+			outcome: "applied",
+		});
+		expect(typeof lines[0].t).toBe("string");
+		expect(new Date(lines[0].t as string).toISOString()).toBe(lines[0].t);
+	});
+
+	it("re-match path (hash changed): one `rematched` line with the counts after the store write", async () => {
+		const record = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const { plugin, view, lines } = await openWithLog(TEXT_V2, record);
+
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 2, endLine: 3 }]);
+		expect(plugin.store.get(NOTE_PATH)?.contentHash).toBe(hashText(TEXT_V2));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({
+			pass: "open",
+			outcome: "rematched",
+			editorLen: TEXT_V2.length,
+			diskLen: -1,
+			foldsBefore: 1,
+			dormantBefore: 0,
+			foldsAfter: 1,
+			dormantAfter: 0,
+		});
+	});
+
+	it("re-match path with a fold that no longer matches: the set-aside count goes up", async () => {
+		const gone = { kind: "heading", indent: 0, text: "zzz qqq www completely different", siblingIndex: 0, parentChain: [] };
+		const record = {
+			contentHash: hashText(TEXT_V1),
+			folds: [tuesdayAnchorFor(TEXT_V1), gone as unknown as FileFoldRecord["folds"][number]],
+			dormant: [],
+		};
+		const { lines } = await openWithLog(TEXT_V2, record);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatchObject({ outcome: "rematched", foldsBefore: 2, dormantBefore: 0, foldsAfter: 1, dormantAfter: 1 });
+	});
+
+	it("reopening logs one more line each time", async () => {
+		const app = new App();
+		const vault = app.vault as unknown as MockVault;
+		vault.setExists(NOTE_PATH);
+		const plugin = makePlugin(app, {
+			value: { version: 1, files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } } },
+		});
+		await plugin.onload();
+		for (let i = 0; i < 3; i++) {
+			openFile(app, NOTE_PATH, makeView(TEXT_V1));
+			await settle();
+		}
+		await plugin.diagnosticLog?.drain();
+		expect(logLinesOf(vault.adapter.files.get(LOG_PATH))).toHaveLength(3);
+	});
+
+	it("the note's text never reaches the log", async () => {
+		const text = `## Tuesday\n${MARKER} under Tuesday.\n## Wednesday\nMore.`;
+		const record = { contentHash: hashText(text), folds: [tuesdayAnchorFor(text)], dormant: [] };
+		const { vault, lines } = await openWithLog(text, record);
+		expect(lines).toHaveLength(1);
+		const raw = vault.adapter.files.get(LOG_PATH) as string;
+		for (const secret of [MARKER, "Tuesday", "tuesday", "Wednesday", "More."]) expect(raw).not.toContain(secret);
+		expect(Object.keys(lines[0])).toEqual([
+			"t", "path", "pass", "editorLen", "diskLen", "foldsBefore", "dormantBefore", "foldsAfter", "dormantAfter", "outcome",
+		]);
+	});
+
+	it.each([
+		{ label: "a rejecting adapter", fail: (a: MockVault["adapter"]) => void (a.failWith = new Error("disk full")) },
+		{ label: "a synchronously throwing adapter", fail: (a: MockVault["adapter"]) => void (a.throwSync = true) },
+		{ label: "a never-resolving adapter", fail: (a: MockVault["adapter"]) => void (a.hang = true) },
+	])("E16: $label leaves the verbatim and re-match passes unchanged", async ({ fail }) => {
+		const verbatim = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const good = await openWithLog(TEXT_V1, verbatim);
+		const bad = await openWithLog(TEXT_V1, verbatim, fail);
+		expect(liveFoldedLineRanges(bad.view)).toEqual(liveFoldedLineRanges(good.view));
+		expect(bad.plugin.store.get(NOTE_PATH)).toEqual(good.plugin.store.get(NOTE_PATH));
+		expect(bad.lines).toEqual([]); // nothing reached the file, and nothing broke
+
+		const changed = { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] };
+		const goodMatch = await openWithLog(TEXT_V2, changed);
+		const badMatch = await openWithLog(TEXT_V2, changed, fail);
+		expect(liveFoldedLineRanges(badMatch.view)).toEqual(liveFoldedLineRanges(goodMatch.view));
+		expect(badMatch.plugin.store.get(NOTE_PATH)).toEqual(goodMatch.plugin.store.get(NOTE_PATH));
+		expect(badMatch.view.state.doc.toString()).toBe(TEXT_V2);
+	});
+});

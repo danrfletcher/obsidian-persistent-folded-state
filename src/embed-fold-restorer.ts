@@ -49,6 +49,7 @@
 import type { Workspace } from "obsidian";
 import { buildAnchors, parseAnchor } from "./anchors";
 import type { Anchor, AnchoredBlock } from "./anchors";
+import { diagnosticEntry, recordChanged, recordCounts, reportDiagnostic, type DiagnosticSink } from "./diagnostic-log";
 import { EMBED_CAPABILITIES } from "./embed-capabilities";
 import type { EmbedCapability, EmbedHostModeId, EmbedKind } from "./embed-capabilities";
 import { planEmbedPass } from "./embed-anchor-dormancy";
@@ -114,6 +115,9 @@ export interface EmbedFoldRestorerDeps {
 	dormancyRecheckMs?: number;
 	/** Wall clock in ms for the dormant retry (PR-7). Defaults to `Date.now`. */
 	now?: () => number;
+	/** Warkworth-46 PR-1 (GP6): where a pass that changes an embed's stored record logs its one
+	 * `embed` line (its `path` is the host's). Optional; fire and forget. */
+	diagnosticLog?: DiagnosticSink;
 }
 
 /** The window an element lives in (a pop-out window has its own `MutationObserver`). */
@@ -472,12 +476,27 @@ export class EmbedFoldRestorer {
 			if (rematch.update !== null) {
 				const current = this.deps.store.getEmbed(resolved.identity);
 				if (current !== undefined) {
-					this.deps.store.setEmbed({
+					const next = {
 						...current,
 						contentHash: rematch.update.contentHash,
 						folds: rematch.update.folds,
 						dormant: rematch.update.dormant,
-					});
+					};
+					this.deps.store.setEmbed(next);
+					if (recordChanged(current, next)) {
+						// Warkworth-46 PR-1: counts of the embed's own record; `path` is the host's.
+						reportDiagnostic(
+							this.deps.diagnosticLog,
+							diagnosticEntry({
+								path: host.file.path,
+								pass: "embed",
+								outcome: "rematched",
+								editorLen: hostText.length,
+								before: recordCounts(current),
+								after: recordCounts(next),
+							}),
+						);
+					}
 				}
 			}
 			const toClick = [...plan.fold, ...plan.unfold];

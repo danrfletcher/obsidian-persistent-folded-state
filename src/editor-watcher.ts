@@ -130,6 +130,7 @@ import { groupCandidatesByStartLine, liveFoldedLineRanges, resolveCandidateForLi
 import { anchorKey, buildAnchors, parseAnchor } from "./anchors";
 import { MAX_FOLDS, type MatcherOptions } from "./matcher";
 import type { FoldStore } from "./fold-store";
+import type { DiagnosticSink } from "./diagnostic-log";
 import type { StoredAnchor } from "./types";
 
 export interface EditorWatcherDeps {
@@ -162,6 +163,9 @@ export interface EditorWatcherDeps {
 	 * from any one `ViewPlugin` instance's own `destroyed` flag, which also goes true on an
 	 * ordinary single-pane CM6 reconfigure (T20) that must NOT suppress this recheck. */
 	disposed?: { current: boolean };
+	/** Warkworth-46 PR-1 (GP6): passed through to `restoreSettledChange`, which logs a `settled`
+	 * line whenever its pass changes stored data. Optional. */
+	diagnosticLog?: DiagnosticSink;
 }
 
 function activeMarkdownPath(view: EditorView): string | null {
@@ -325,6 +329,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				isSuperseded: () => this.generation !== startGeneration,
 				getChangesSinceSnapshot: () => this.changesSinceSnapshot ?? ChangeSet.empty(this.view.state.doc.length),
 				now: deps.now,
+				diagnosticLog: deps.diagnosticLog,
 			})
 				.then((deferred) => {
 					if (this.destroyed) return;

@@ -224,6 +224,50 @@ export function buildHoverPopover(doc: Document = document): HTMLElement {
 	return popover;
 }
 
+/** A fake in-memory `DataAdapter` with the four calls the diagnostic log uses (warkworth-46
+ * PR-1): `exists`, `read`, `write` and `append`. Files live in a `Map`. `read` of a missing file
+ * rejects, as the real adapter does; `append` to a missing file creates it. Test hooks make a
+ * call reject (`failWith`), throw synchronously (`throwSync`) or never settle (`hang`), and
+ * `calls` records every call in order. */
+export class MemoryAdapter {
+	readonly files = new Map<string, string>();
+	readonly calls: { method: "exists" | "read" | "write" | "append"; path: string }[] = [];
+	/** When set, `write` and `append` reject with this. */
+	failWith: unknown = undefined;
+	/** When true, `write` and `append` throw before returning a promise. */
+	throwSync = false;
+	/** When true, `write` and `append` return a promise that never settles. */
+	hang = false;
+	/** When set, `read` rejects with this (an existing file that cannot be read). */
+	readFailWith: unknown = undefined;
+
+	exists(path: string): Promise<boolean> {
+		this.calls.push({ method: "exists", path });
+		return Promise.resolve(this.files.has(path));
+	}
+	read(path: string): Promise<string> {
+		this.calls.push({ method: "read", path });
+		if (this.readFailWith !== undefined) return Promise.reject(this.readFailWith);
+		const text = this.files.get(path);
+		return text === undefined ? Promise.reject(new Error(`ENOENT: ${path}`)) : Promise.resolve(text);
+	}
+	write(path: string, data: string): Promise<void> {
+		this.calls.push({ method: "write", path });
+		return this.mutate(() => void this.files.set(path, data));
+	}
+	append(path: string, data: string): Promise<void> {
+		this.calls.push({ method: "append", path });
+		return this.mutate(() => void this.files.set(path, (this.files.get(path) ?? "") + data));
+	}
+	private mutate(apply: () => void): Promise<void> {
+		if (this.throwSync) throw new Error("adapter threw synchronously");
+		if (this.hang) return new Promise<void>(() => {});
+		if (this.failWith !== undefined) return Promise.reject(this.failWith);
+		apply();
+		return Promise.resolve();
+	}
+}
+
 /** Just enough of real Obsidian's `Vault` (PR-7, G9/G10) to exercise `app.vault.on("rename"/
  * "delete", ...)` and `getAbstractFileByPath`: extends `Events` (declared just above), so
  * `vault.on(...)`/`vault.trigger(...)` behave exactly like every other Obsidian event (same
@@ -232,6 +276,10 @@ export function buildHoverPopover(doc: Document = document): HTMLElement {
  * filesystem) — Obsidian itself decides what's actually in the vault; this mock only needs to
  * answer "does this path exist" the way `main.ts`'s own `pruneOrphans` call asks it to. */
 export class Vault extends Events {
+	/** Real `Vault.adapter`: the in-memory stand-in below (warkworth-46 PR-1: the diagnostic log). */
+	adapter = new MemoryAdapter();
+	/** Real `Vault.configDir`. */
+	configDir = ".obsidian";
 	private paths = new Set<string>();
 
 	getAbstractFileByPath(path: string): TFile | null {

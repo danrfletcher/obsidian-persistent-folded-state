@@ -94,6 +94,7 @@ import {
 	survivorsStillDormant,
 } from "./dormant";
 import { buildBaseline } from "./baseline";
+import { diagnosticEntry, recordChanged, recordCounts, reportDiagnostic, type DiagnosticSink } from "./diagnostic-log";
 import type { StoredAnchor } from "./types";
 
 /** G13's deferred queue, kept across updates by src/editor-watcher.ts. Positions, not line
@@ -140,6 +141,10 @@ export interface RestoreRunDeps {
 	/** PR-6 (G6): clock used for `dormantSince`/age checks. Defaults to `Date.now`; overridable
 	 * so a test can drive dormancy and expiry with a fake clock instead of real wall time. */
 	now?: () => number;
+	/** Warkworth-46 PR-1 (GP6): where a pass that changes stored data logs its one `settled`
+	 * line. Optional; fire and forget (the pass never waits on it, a failure in it never reaches
+	 * the pass). A superseded run, a path mismatch and a pass that changes nothing log nothing. */
+	diagnosticLog?: DiagnosticSink;
 }
 
 /** T1: delegates to `src/live-folds.ts` so this agrees with `src/baseline.ts` on the same
@@ -426,11 +431,27 @@ export async function restoreSettledChange(
 			}
 		}
 
-		deps.store.set(path, {
+		const next = {
 			contentHash: hashText(text),
 			folds: Array.from(activeFolds.values()),
 			dormant: dormantList,
-		});
+		};
+		deps.store.set(path, next);
+		// Warkworth-46 PR-1: one log line, only when this pass changed what is stored. Counts
+		// only: `snapshot` is the record as the pass started, `store.get` is what it is now.
+		if (recordChanged(latest, next)) {
+			reportDiagnostic(
+				deps.diagnosticLog,
+				diagnosticEntry({
+					path,
+					pass: "settled",
+					outcome: "rematched",
+					editorLen: text.length,
+					before: recordCounts(snapshot),
+					after: recordCounts(deps.store.get(path)),
+				}),
+			);
+		}
 	}
 
 	const activeDeferred = plan.deferred

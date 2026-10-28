@@ -67,8 +67,16 @@ describe("fence: F1 — no write-capable vault/editor/adapter API reached for by
 		{ label: "editor.setValue(", pattern: /\bsetValue\s*\(/ },
 	];
 
-	it.each(WRITE_APIS)("src/ does not call $label", ({ pattern }) => {
-		expect(srcText).not.toMatch(pattern);
+	// Warkworth-46 PR-1 (F3): the one allowed adapter write is the diagnostic log writer's, into
+	// the plugin's own folder. The adapter patterns are checked against src/ without that file, so
+	// a write anywhere else still fails (tests/unit/fence.test.ts pins what the writer may do).
+	const srcTextOutsideLogWriter = srcFiles
+		.filter((f) => !f.endsWith("diagnostic-log-writer.ts"))
+		.map((f) => readFileSync(f, "utf8"))
+		.join("\n");
+
+	it.each(WRITE_APIS)("src/ does not call $label", ({ label, pattern }) => {
+		expect(label.startsWith("adapter.") ? srcTextOutsideLogWriter : srcText).not.toMatch(pattern);
 	});
 
 	// PR-2's own self-imposed fence ("it records what it sees but never dispatches — restore is

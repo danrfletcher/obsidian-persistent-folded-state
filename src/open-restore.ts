@@ -82,6 +82,7 @@ import {
 	splitDormantResults,
 	survivorsStillDormant,
 } from "./dormant";
+import { diagnosticEntry, recordCounts, reportDiagnostic, type DiagnosticSink } from "./diagnostic-log";
 import type { StoredAnchor } from "./types";
 
 export interface OpenRestoreDeps {
@@ -120,6 +121,10 @@ export interface OpenRestoreDeps {
 	 * for real) — the real schedule `scheduleNativeRestoreGuard` checks on, replacing
 	 * `NATIVE_RESTORE_GUARD_DELAYS_MS`'s own default when supplied. */
 	guardDelaysMs?: readonly number[];
+	/** Warkworth-46 PR-1 (GP6): where this pass logs its one diagnostic line. Optional; omitted
+	 * by every caller that does not collect the log. Fire and forget: the pass never waits on it
+	 * and a failure in it never reaches the pass. */
+	diagnosticLog?: DiagnosticSink;
 }
 
 function isFoldable(range: LineRange): boolean {
@@ -459,8 +464,17 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 	if (!record) return; // defensive: callers only invoke this when an entry already exists
 
 	const currentHash = hashText(text);
+	// Warkworth-46 PR-1: the counts the log reports are read from the store before and after the
+	// pass (never the arrays themselves), and the line is written once the pass has finished.
+	const before = recordCounts(record);
+	const logPass = (outcome: "applied" | "rematched"): void =>
+		reportDiagnostic(
+			deps.diagnosticLog,
+			diagnosticEntry({ path, pass: "open", outcome, editorLen: text.length, before, after: recordCounts(deps.store.get(path)) }),
+		);
 	if (!needsRematchOnOpen(record.contentHash, currentHash)) {
 		applyStoredFoldsVerbatim(view, record.folds);
+		logPass("applied");
 		return;
 	}
 
@@ -498,6 +512,7 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 			deps.onLayoutReady,
 			deps.guardDelaysMs
 		);
+		logPass("rematched");
 		return;
 	}
 
@@ -628,4 +643,5 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 			dormant: dormantList,
 		});
 	}
+	logPass("rematched");
 }
