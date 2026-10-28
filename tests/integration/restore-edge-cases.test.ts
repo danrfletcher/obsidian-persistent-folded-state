@@ -16,6 +16,7 @@ import { restoreSettledChange } from "../../src/fold-restorer";
 import { DiagnosticLogWriter } from "../../src/diagnostic-log-writer";
 import { DIAGNOSTIC_LOG_FIELDS, logLines, type DiagnosticEntry } from "../../src/diagnostic-log";
 import type { FileFoldRecord } from "../../src/types";
+import { makeGuardRig, type GuardRig } from "../guard-rig";
 
 const NOTE_PATH = "Tasks.md";
 const OTHER_PATH = "Other.md";
@@ -339,5 +340,163 @@ describe("diagnostic log: restoreSettledChange logs a `settled` line when it cha
 		const strip = (r: typeof working.record) => ({ ...r, dormant: r?.dormant.map((d) => ({ ...d, dormantSince: 0 })) });
 		expect(broken.folded).toEqual(working.folded);
 		expect(strip(broken.record)).toEqual(strip(working.record));
+	});
+});
+
+describe("PR-3: the settled pass waits for the pane to hold the note's real text (E3, E1, last text wins)", () => {
+	// Heading text only changes the lines around it, so the stored "tuesday" anchor re-matches.
+	const FULL = ["(a line inserted above)", "## Tuesday", "SETTLED-GUARD-MARKER body line", "## Another"].join("\n");
+	const OLD = ["## Tuesday", "SETTLED-GUARD-MARKER body line", "## Another"].join("\n");
+	const UNPLACEABLE = { kind: "heading", indent: 0, text: "zzz qqq www completely different", siblingIndex: 0, parentChain: [] };
+
+	afterEach(() => {
+		document.body.replaceChildren();
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	function guardedView(rig: GuardRig, store: FoldStore, doc: string): EditorView {
+		const watcher = createEditorWatcher({ store, ...rig.watcherDeps });
+		const state = EditorState.create({
+			doc,
+			selection: { anchor: 0 },
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		return new EditorView({ state, parent: document.body });
+	}
+
+	function set(view: EditorView, text: string): void {
+		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, annotations: Transaction.userEvent.of("set") });
+	}
+
+	async function seeded(): Promise<{ store: FoldStore; setSpy: ReturnType<typeof vi.spyOn> }> {
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: hashText(OLD), folds: [TUESDAY_ANCHOR, UNPLACEABLE], dormant: [] } });
+		return { store, setSpy: vi.spyOn(store, "set") };
+	}
+
+	it("E3: an empty `set` then the full `set` inside the 150 ms window: only the full text is matched, dormant gets only the unmatched fold, the hash is the file's", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, FULL);
+		const { store, setSpy } = await seeded();
+		const view = guardedView(rig, store, OLD);
+		await vi.advanceTimersByTimeAsync(0);
+
+		set(view, "");
+		await vi.advanceTimersByTimeAsync(50);
+		set(view, FULL);
+		await vi.advanceTimersByTimeAsync(400);
+
+		const lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["settled", "rematched"]]); // one pass, no wait, no refusal
+		expect(lines[0]).toMatchObject({ editorLen: FULL.length, diskLen: FULL.length, foldsBefore: 2, foldsAfter: 1, dormantBefore: 0, dormantAfter: 1 });
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(FULL));
+		expect(store.get(NOTE_PATH)?.folds).toHaveLength(1); // the Tuesday fold re-matched ...
+		expect(store.get(NOTE_PATH)?.dormant).toHaveLength(1); // ... and only the genuinely unplaceable one was set aside
+		expect(liveFoldedRanges(view)).toHaveLength(1);
+		// Every store write was made for the full text, never for "".
+		for (const call of setSpy.mock.calls) expect((call[1] as FileFoldRecord).contentHash).not.toBe(hashText(""));
+	});
+
+	it("an empty settled text that does reach the pass (after the debounce) is refused: nothing matched, nothing stored, one refused-empty line", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, FULL);
+		const { store, setSpy } = await seeded();
+		const before = structuredClone(store.get(NOTE_PATH));
+		const view = guardedView(rig, store, OLD);
+		await vi.advanceTimersByTimeAsync(0);
+
+		set(view, ""); // the pane is emptied by a reload; the full text has not arrived yet
+		await vi.advanceTimersByTimeAsync(400); // the debounce fires with ""
+
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(store.get(NOTE_PATH)).toEqual(before); // folds, dormant and hash untouched
+		const lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["settled", "refused-empty"]]);
+		expect(lines[0]).toMatchObject({ editorLen: 0, diskLen: FULL.length, foldsBefore: 2, foldsAfter: 2, dormantBefore: 0, dormantAfter: 0 });
+		expect(rig.gate.isHolding(view)).toBe(true); // it waits, it does not give up
+
+		// The text lands: the pass runs, once, on the real text.
+		set(view, FULL);
+		await vi.advanceTimersByTimeAsync(400);
+		const after = await rig.lines();
+		expect(after.map((l) => [l.pass, l.outcome])).toEqual([
+			["settled", "refused-empty"],
+			["settled", "rematched"],
+		]);
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(FULL));
+		expect(store.get(NOTE_PATH)?.dormant).toHaveLength(1);
+	});
+
+	it("restoreSettledChange called directly with \"\" and the guard on: returns [] and never calls store.set", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, FULL);
+		const { store, setSpy } = await seeded();
+		const view = guardedView(rig, store, "");
+		await vi.advanceTimersByTimeAsync(0);
+		setSpy.mockClear();
+
+		const result = await restoreSettledChange(view, NOTE_PATH, "", {
+			store,
+			getActivePath: () => NOTE_PATH,
+			loadGuard: { gate: rig.gate, makeIo: () => rig.watcherDeps.loadGuard!.makeIo(view, NOTE_PATH), rerun: () => {} },
+		});
+		expect(result).toEqual([]);
+		expect(setSpy).not.toHaveBeenCalled();
+		rig.gate.cancelAll();
+	});
+
+	it("several triggers queue behind one wait; when the text lands the pass runs once and the last settled text wins", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, FULL);
+		const { store } = await seeded();
+		const view = guardedView(rig, store, OLD);
+		await vi.advanceTimersByTimeAsync(0);
+
+		set(view, ""); // three separate settles, each reaching the pass while the pane is not loaded
+		await vi.advanceTimersByTimeAsync(300);
+		set(view, FULL.slice(0, 20));
+		await vi.advanceTimersByTimeAsync(300);
+		set(view, FULL.slice(0, 40));
+		await vi.advanceTimersByTimeAsync(300);
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(OLD)); // still untouched
+
+		set(view, FULL);
+		await vi.advanceTimersByTimeAsync(1000);
+
+		const lines = await rig.lines();
+		const outcomes = lines.map((l) => l.outcome);
+		expect(outcomes.filter((o) => o === "rematched")).toHaveLength(1); // once, not once per trigger
+		expect(outcomes.filter((o) => o === "refused-empty" || o === "waiting")).toHaveLength(1); // one wait, one line for it
+		expect(lines[lines.length - 1]).toMatchObject({ editorLen: FULL.length, outcome: "rematched" });
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(FULL));
+	});
+
+	it("the log holds no note text, heading or anchor text", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, FULL);
+		const { store } = await seeded();
+		const view = guardedView(rig, store, OLD);
+		await vi.advanceTimersByTimeAsync(0);
+		set(view, "");
+		await vi.advanceTimersByTimeAsync(300);
+		set(view, FULL);
+		await vi.advanceTimersByTimeAsync(1000);
+
+		const raw = await rig.raw();
+		expect(raw).not.toBe("");
+		for (const secret of ["SETTLED-GUARD-MARKER", "body line", "Tuesday", "tuesday", "Another", "zzz qqq", "inserted"]) expect(raw).not.toContain(secret);
+	});
+
+	it("without a loadGuard the pass runs on the text it is given, as before", async () => {
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: hashText(OLD), folds: [TUESDAY_ANCHOR], dormant: [] } });
+		const view = makeView(store, OLD, NOTE_PATH);
+		set(view, FULL);
+		await settle();
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(FULL));
 	});
 });

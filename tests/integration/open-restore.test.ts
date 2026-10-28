@@ -1481,3 +1481,84 @@ describe("open-restore waits for the real text (warkworth-46 PR-2)", () => {
 		}
 	});
 });
+
+describe("native-restore guard behind the load wait (warkworth-46 PR-3)", () => {
+	const LOG_PATH = ".obsidian/plugins/persistent-folded-state/diagnostic-log.jsonl";
+	const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+	async function boot(delays: number[]) {
+		const app = new App();
+		const vault = app.vault as unknown as MockVault;
+		vault.setExists(NOTE_PATH);
+		const stored = {
+			value: { version: 1, files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } } },
+		};
+		const plugin = makePlugin(app, stored);
+		plugin.guardDelaysMs = delays;
+		await plugin.onload();
+		return { app, vault, plugin };
+	}
+
+	async function logOf(plugin: PersistentFoldedStatePlugin, vault: MockVault): Promise<Record<string, unknown>[]> {
+		await plugin.diagnosticLog?.drain();
+		return (vault.adapter.files.get(LOG_PATH) ?? "")
+			.split("\n")
+			.filter((l) => l !== "")
+			.map((l) => JSON.parse(l) as Record<string, unknown>);
+	}
+
+	it("the guard's checks start after the wait: a stale native fold that lands once the text has loaded is still corrected", async () => {
+		const { app, plugin } = await boot([10, 200]);
+		const view = makeView("");
+		openFile(app, NOTE_PATH, view, TEXT_V3); // the disk has the real (reordered) text, the pane is still empty
+		await pause(60); // longer than the first guard delay: if it were timed from file-open it would be spent by now
+		expect(liveFoldedLineRanges(view)).toEqual([]);
+
+		view.dispatch({ changes: { from: 0, to: 0, insert: TEXT_V3 } });
+		for (let i = 0; i < 100 && liveFoldedLineRanges(view).length === 0; i++) await pause(10);
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+
+		// Obsidian's own restore arrives late with the stale offsets: the guard still has its 200 ms check.
+		view.dispatch({
+			effects: [
+				unfoldEffect.of({ from: view.state.doc.line(3).to, to: view.state.doc.line(4).to }),
+				foldEffect.of({ from: view.state.doc.line(1).to, to: view.state.doc.line(2).to }),
+			],
+		});
+		for (let i = 0; i < 100 && JSON.stringify(liveFoldedLineRanges(view)) !== JSON.stringify([{ startLine: 3, endLine: 4 }]); i++) await pause(10);
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+		expect(view.state.doc.toString()).toBe(TEXT_V3);
+	}, 10000);
+
+	it("a check that finds the pane showing other text does nothing to it, writes nothing, and logs one `native-guard` waiting line", async () => {
+		const { app, vault, plugin } = await boot([60, 90, 120]);
+		const view = makeView(TEXT_V3);
+		openFile(app, NOTE_PATH, view);
+		await pause(20);
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+		const setSpy = vi.spyOn(plugin.store, "set"); // the open pass's own re-match write is behind us
+
+		// The pane is reused for another note before the guard's later checks run.
+		const other = "# Another note\nbody\n## Heading\nmore body\n";
+		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: other } });
+		const folded = JSON.stringify(liveFoldedLineRanges(view));
+		view.dispatch({ effects: foldEffect.of({ from: view.state.doc.line(1).to, to: view.state.doc.line(2).to }) }); // a native fold on the new note
+		await pause(200);
+
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 1, endLine: 2 }]); // the guard left the other note's fold alone
+		expect(JSON.stringify(liveFoldedLineRanges(view))).not.toBe(folded);
+		const lines = (await logOf(plugin, vault)).filter((l) => l.pass === "native-guard");
+		expect(lines).toHaveLength(1); // once per open, however many checks skip
+		expect(lines[0]).toMatchObject({ path: NOTE_PATH, outcome: "waiting", editorLen: other.length });
+		expect(JSON.stringify(lines)).not.toContain("Another note");
+	}, 10000);
+
+	it("a pane that still shows the note's text through the whole window logs no native-guard line", async () => {
+		const { app, vault, plugin } = await boot([10, 40]);
+		const view = makeView(TEXT_V3);
+		openFile(app, NOTE_PATH, view);
+		await pause(100);
+		expect((await logOf(plugin, vault)).filter((l) => l.pass === "native-guard")).toEqual([]);
+	});
+});

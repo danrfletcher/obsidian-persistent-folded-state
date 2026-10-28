@@ -94,7 +94,15 @@ import {
 	survivorsStillDormant,
 } from "./dormant";
 import { buildBaseline } from "./baseline";
-import { diagnosticEntry, recordChanged, recordCounts, reportDiagnostic, type DiagnosticSink } from "./diagnostic-log";
+import {
+	diagnosticEntry,
+	recordChanged,
+	recordCounts,
+	reportDiagnostic,
+	type DiagnosticOutcome,
+	type DiagnosticSink,
+} from "./diagnostic-log";
+import { checkPass, type LoadWaitIo, type PassGate } from "./load-wait";
 import type { StoredAnchor } from "./types";
 
 /** G13's deferred queue, kept across updates by src/editor-watcher.ts. Positions, not line
@@ -145,6 +153,24 @@ export interface RestoreRunDeps {
 	 * line. Optional; fire and forget (the pass never waits on it, a failure in it never reaches
 	 * the pass). A superseded run, a path mismatch and a pass that changes nothing log nothing. */
 	diagnosticLog?: DiagnosticSink;
+	/** Warkworth-46 PR-3 (E1-E5, E8, E18): the shared wait/guard (src/load-wait.ts). When given,
+	 * the pass first checks that the pane shows `path` with the text `text` is, as it is on disk;
+	 * if not it leaves a wait with the gate and returns `[]` having touched nothing. Omitted by a
+	 * caller with no vault to read (a unit test): the pass then runs on `text` as it always did. */
+	loadGuard?: SettledLoadGuard;
+	/** True for a pass the guard itself released (the wait ended with real text, or with the
+	 * user's own edit): it is not asked again, or a pane the user has edited would wait for ever. */
+	guardCleared?: boolean;
+}
+
+/** What `restoreSettledChange` needs to use the shared wait/guard for one pane. */
+export interface SettledLoadGuard {
+	gate: PassGate<EditorView>;
+	/** The wait's view of the outside world for this pane and `path`. */
+	makeIo: (path: string) => LoadWaitIo;
+	/** Runs the settled pass again, with the pane's text, once the wait has ended (the caller
+	 * passes `guardCleared`). Called once however many triggers queued while it waited. */
+	rerun: (path: string, text: string) => void;
 }
 
 /** T1: delegates to `src/live-folds.ts` so this agrees with `src/baseline.ts` on the same
@@ -173,6 +199,60 @@ export function liveAnchorKeySet(store: FoldStore, path: string): ReadonlySet<st
 		if (anchor) keys.add(anchorKey(anchor));
 	}
 	return keys;
+}
+
+/** Warkworth-46 PR-3 (T1): the stored folds as they should read after a re-match, with every
+ * active anchor the match moved onto a block now carrying that block's own, current anchor.
+ *
+ * Why: `anchorKey` includes `siblingIndex` and the text, so an external edit that shifts a
+ * sibling (an agent drops or adds a line above a folded task) leaves every later stored anchor
+ * matching its block only through a fuzzy tier. The re-match folds the block, and the pass then
+ * stores the new `contentHash` — but if the old anchors were kept, the next open (hash now
+ * unchanged, so `applyStoredFoldsVerbatim` looks anchors up by exact key, with no matcher)
+ * finds none of them and folds nothing, while data.json still says every fold is there. Storing
+ * the matched block's current anchor makes that exact lookup find it again.
+ *
+ * `existing` is the fresh store read (E3: an entry the user removed meanwhile is not brought back);
+ * order is kept. An old anchor whose refreshed key is already held by another entry that is not
+ * itself being re-keyed (the user folded that block meanwhile) is dropped rather than duplicated.
+ * An anchor the match left unmoved, or that matched itself exactly, is returned untouched. Never
+ * touches `dormant` and never decides what folds: it only rewrites what is stored. */
+export function refreshMatchedFolds(
+	existing: readonly StoredAnchor[],
+	stored: readonly Anchor[],
+	matches: readonly MatchResult[],
+	candidates: readonly AnchoredBlock[],
+): Map<string, StoredAnchor> {
+	const current = new Map<string, StoredAnchor>();
+	for (const raw of existing) {
+		const anchor = parseAnchor(raw);
+		if (anchor) current.set(anchorKey(anchor), raw);
+	}
+
+	const renames = new Map<string, { key: string; anchor: Anchor }>();
+	for (let i = 0; i < stored.length; i++) {
+		const match = matches[i];
+		if (!match || match.tier === "none") continue;
+		const fresh = candidates[match.target]?.anchor;
+		if (!fresh) continue;
+		const oldKey = anchorKey(stored[i]);
+		const newKey = anchorKey(fresh);
+		if (newKey === oldKey || !current.has(oldKey)) continue; // unchanged, or removed meanwhile (E3)
+		renames.set(oldKey, { key: newKey, anchor: fresh });
+	}
+	if (renames.size === 0) return current;
+
+	const refreshed = new Map<string, StoredAnchor>();
+	for (const [key, raw] of current) {
+		const rename = renames.get(key);
+		if (rename === undefined) {
+			refreshed.set(key, raw);
+			continue;
+		}
+		const heldElsewhere = current.has(rename.key) && !renames.has(rename.key);
+		if (!heldElsewhere && !refreshed.has(rename.key)) refreshed.set(rename.key, rename.anchor as unknown as StoredAnchor);
+	}
+	return refreshed;
 }
 
 /** Converts a line-range target into a CM6 character-offset fold effect: from the end of the
@@ -251,6 +331,52 @@ function toDeferredFoldTarget(view: EditorView, anchor: Anchor | undefined, rang
 }
 
 /**
+ * Warkworth-46 PR-3: asks the shared guard (src/load-wait.ts) whether the pane shows `path` with
+ * the text `text` is. A number (the disk text's length, for the log) means go ahead; `null` means
+ * the pass must stop. Otherwise nothing has been written and this has done
+ * what the verdict says, logging one `settled` line with store counts that are the same before
+ * and after:
+ *  - `wait` / `refuse` (text empty, half there, or another note's): a wait is left with the gate,
+ *    unless this pane already has one, in which case that one keeps its clock and this pass kind's
+ *    handlers replace the earlier ones. Only the call that starts a wait logs `waiting` (or
+ *    `refused-empty` for an empty pane);
+ *  - `read-failed`: one line, nothing waits.
+ * When the wait ends with real text, or with the user's own edit (E8), `rerun` runs the pass once
+ * with the pane's text. A user edit that left the pane empty is refused, never matched against
+ * `""`. A wait that gives up, or whose note cannot be read, writes its line and nothing else.
+ */
+async function loadedForSettledPass(view: EditorView, path: string, text: string, deps: RestoreRunDeps, guard: SettledLoadGuard): Promise<number | null> {
+	const io = guard.makeIo(path);
+	const check = await checkPass("settled", path, text, io);
+	if (check.verdict.decision === "proceed") return check.diskLen;
+
+	const log = (outcome: DiagnosticOutcome, editorLen: number, diskLen: number): void => {
+		const counts = recordCounts(deps.store.get(path));
+		reportDiagnostic(deps.diagnosticLog, diagnosticEntry({ path, pass: "settled", outcome, editorLen, diskLen, before: counts, after: counts }));
+	};
+	if (check.verdict.decision === "read-failed") {
+		log("read-failed", check.editorLen, -1);
+		return null;
+	}
+	const started = guard.gate.hold("settled", view, path, io, {
+		ready: ({ diskLen, userEdited }) => {
+			// The pane as it is now, not as the wait saw it: the user may have kept typing since.
+			const liveText = view.state.doc.toString();
+			if (liveText === "" && diskLen !== 0) {
+				log("refused-empty", 0, diskLen); // the user emptied a pane that never loaded: never match against ""
+				return;
+			}
+			// A wait that ended through the user's edit says so: the pane's length differs from the disk's.
+			if (userEdited) log("applied", liveText.length, diskLen);
+			guard.rerun(path, liveText);
+		},
+		ended: ({ state, editorLen, diskLen }) => log(state, editorLen, diskLen),
+	});
+	if (started) log(check.verdict.outcome ?? "waiting", check.editorLen, check.diskLen);
+	return null;
+}
+
+/**
  * Runs one settled-non-user-change restore pass for `view` (the scope goal: "on a settled
  * non-user change it snapshots the stored anchors, asks the matcher for matches, and applies
  * them as tagged CM6 fold effects"). Returns whatever G13 deferred because the cursor sat
@@ -263,6 +389,18 @@ export async function restoreSettledChange(
 	text: string,
 	deps: RestoreRunDeps,
 ): Promise<DeferredFoldTarget[]> {
+	// Warkworth-46 PR-3 (E1-E5, E18): before anything is read from the store, the pane must show
+	// this note with the text `text` really is. A pane that does not yet (empty, half-loaded, or
+	// still showing another note) leaves a wait with the gate and nothing is matched, set aside
+	// or rewritten; the pass runs again, once, when the wait ends. This covers the no-entry
+	// baseline branch below too, so a never-seen note is never given an empty baseline.
+	let diskLen = -1; // the log's "no disk read" value, for a pass that made none
+	if (deps.loadGuard !== undefined && deps.guardCleared !== true) {
+		const checked = await loadedForSettledPass(view, path, text, deps, deps.loadGuard);
+		if (checked === null) return [];
+		diskLen = checked;
+	}
+
 	// R2 (PR-7): a settle timer captures `path` when it's first triggered (src/editor-watcher.ts),
 	// but by the time it actually fires, a rename may have already landed (real Obsidian mutates
 	// a renamed file's own TFile.path in place, so the pane's own active path reflects the rename
@@ -271,7 +409,8 @@ export async function restoreSettledChange(
 	// `path` can never fall into that branch and have `buildBaseline` create a brand-new store
 	// entry under a key nothing on disk answers to any more. The later, narrower check further
 	// down (after the possibly-slow match) still applies for the case where the rename arrives
-	// *during* that match.
+	// *during* that match. With the load guard on, a pass for a stale `path` is already stopped
+	// above (the old path cannot be read, so it is a `read-failed` line and nothing else).
 	if (deps.getActivePath(view) !== path) return [];
 
 	const snapshot = deps.store.get(path);
@@ -380,11 +519,8 @@ export async function restoreSettledChange(
 	// contentHash-only update this replaces.
 	const latest = deps.store.get(path);
 	if (latest) {
-		const activeFolds = new Map<string, StoredAnchor>();
-		for (const raw of latest.folds) {
-			const anchor = parseAnchor(raw);
-			if (anchor) activeFolds.set(anchorKey(anchor), raw);
-		}
+		// T1: matched folds are stored under their block's current anchor (see refreshMatchedFolds).
+		const activeFolds = refreshMatchedFolds(latest.folds, storedAnchors, matches, candidates);
 
 		let dormantList = dormantResult.stillDormant;
 		for (let i = 0; i < storedAnchors.length; i++) {
@@ -416,8 +552,10 @@ export async function restoreSettledChange(
 		const actedDormantIdx = new Set<number>([...dormantPlan.toFold, ...dormantPlan.deferred].map((t) => t.anchorIndex));
 		for (let i = 0; i < dormantResult.matched.length; i++) {
 			const match = dormantResult.matched[i];
+			// T1: promoted under the matched block's current anchor, as for an active match.
+			const fresh = liveCandidates[match.candidateIndex]?.anchor ?? match.anchor;
 			if (actedDormantIdx.has(i)) {
-				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				activeFolds.set(anchorKey(fresh), fresh as unknown as StoredAnchor);
 				continue;
 			}
 			const candidate = liveCandidates[match.candidateIndex];
@@ -425,7 +563,7 @@ export async function restoreSettledChange(
 				candidate !== undefined &&
 				alreadyFolded.some((r) => r.startLine === candidate.range.startLine && r.endLine === candidate.range.endLine);
 			if (alreadyLive) {
-				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				activeFolds.set(anchorKey(fresh), fresh as unknown as StoredAnchor);
 			} else {
 				dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
 			}
@@ -447,6 +585,7 @@ export async function restoreSettledChange(
 					pass: "settled",
 					outcome: "rematched",
 					editorLen: text.length,
+					diskLen,
 					before: recordCounts(snapshot),
 					after: recordCounts(deps.store.get(path)),
 				}),

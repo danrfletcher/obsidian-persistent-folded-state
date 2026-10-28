@@ -54,6 +54,7 @@ import { EMBED_CAPABILITIES } from "./embed-capabilities";
 import type { EmbedCapability, EmbedHostModeId, EmbedKind } from "./embed-capabilities";
 import { planEmbedPass } from "./embed-anchor-dormancy";
 import { HEADING_RENAME_GRACE_MS } from "./embed-dormancy";
+import { LOAD_WAIT_GIVE_UP_MS } from "./load-wait";
 import { COLLAPSED_CLASS, EMBED_SELECTOR, blockIndexForToggle, describeArrows, embedKindOf, embedLevels, resolveEmbedChain } from "./embed-fold-recorder";
 import { detectEmbedHost } from "./embed-host";
 import type { EmbedHost } from "./embed-host";
@@ -118,7 +119,18 @@ export interface EmbedFoldRestorerDeps {
 	/** Warkworth-46 PR-1 (GP6): where a pass that changes an embed's stored record logs its one
 	 * `embed` line (its `path` is the host's). Optional; fire and forget. */
 	diagnosticLog?: DiagnosticSink;
+	/** Warkworth-46 PR-3 (E19): settles whether a host whose `readHostText` gave `""` really is
+	 * empty on disk (resolves true only then; rejects when the disk cannot be read). When the host
+	 * is not empty it has not loaded: the pass changes nothing (no dormancy reconcile, no hash
+	 * rewrite), logs one `embed` `refused-empty` line, and looks at the host again later. Optional:
+	 * without it a `""` host text is taken at its word, as before. */
+	confirmEmpty?: (path: string) => Promise<boolean>;
 }
+
+/** PR-3: second looks at a host that read as empty over a non-empty file, before giving up on it
+ * (about 30 s at the default spacing, the same limit as the shared wait). Derived from that limit
+ * rather than written as a number. */
+const MAX_UNLOADED_RECHECKS = Math.ceil(LOAD_WAIT_GIVE_UP_MS / (HEADING_RENAME_GRACE_MS + 500));
 
 /** The window an element lives in (a pop-out window has its own `MutationObserver`). */
 type PopoutWindow = Window & { MutationObserver: typeof MutationObserver };
@@ -165,6 +177,9 @@ export class EmbedFoldRestorer {
 	private readonly echoStreak = new WeakMap<Element, number>();
 	/** The pending second look at a host whose reconcile held records back. */
 	private readonly rechecks = new Map<string, number>();
+	/** PR-3: how many times in a row each host was refused as not loaded. It bounds the second look
+	 * (about the shared wait's 30 s) and keeps the log to one line per streak. */
+	private readonly unloadedStreak = new Map<string, number>();
 	private renderSeq = 0;
 	private disposed = false;
 
@@ -344,6 +359,32 @@ export class EmbedFoldRestorer {
 		return done;
 	}
 
+	/** True when the host (read as `""`) is not empty on disk, or the disk cannot be read: logs one
+	 * `embed` line (`refused-empty` or `read-failed`) and changes nothing. */
+	private async hostNotLoaded(hostPath: string): Promise<boolean> {
+		const confirm = this.deps.confirmEmpty;
+		if (confirm === undefined) return false;
+		let outcome: "refused-empty" | "read-failed";
+		try {
+			if (await confirm(hostPath)) {
+				this.unloadedStreak.delete(hostPath);
+				return false;
+			}
+			outcome = "refused-empty";
+		} catch {
+			outcome = "read-failed";
+		}
+		const streak = (this.unloadedStreak.get(hostPath) ?? 0) + 1;
+		this.unloadedStreak.set(hostPath, streak);
+		if (streak > 1) return true; // already logged for this streak
+		const counts = { folds: 0, dormant: 0 };
+		reportDiagnostic(
+			this.deps.diagnosticLog,
+			diagnosticEntry({ path: hostPath, pass: "embed", outcome, editorLen: 0, diskLen: outcome === "refused-empty" ? 0 : -1, before: counts, after: counts }),
+		);
+		return true;
+	}
+
 	/** A reconcile held heading-linked records back: once the wait is over the host is reconciled
 	 * again, which needs a fresh pass because nothing else re-renders its embeds. */
 	private scheduleRecheck(hostPath: string): void {
@@ -393,6 +434,13 @@ export class EmbedFoldRestorer {
 				hostText = this.deps.readHostText(host);
 				position = this.deps.positionOf?.(host, outermost) ?? null;
 			} catch {
+				return;
+			}
+			// PR-3 (E19): a host that reads as "" while its file is not empty has not loaded. Its
+			// embeds are not "absent", so nothing is reconciled, matched or rewritten; the host is
+			// looked at again once it has had time to load.
+			if (hostText === "" && this.deps.confirmEmpty !== undefined && (await this.hostNotLoaded(host.file.path))) {
+				if ((this.unloadedStreak.get(host.file.path) ?? 0) < MAX_UNLOADED_RECHECKS) this.scheduleRecheck(host.file.path);
 				return;
 			}
 			// PR-7: a retargeted or broken embed's record goes dormant, and one that is back is

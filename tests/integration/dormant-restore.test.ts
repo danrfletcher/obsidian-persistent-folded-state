@@ -15,6 +15,7 @@ import { createEditorWatcher } from "../../src/editor-watcher";
 import { OWN_FOLD_ANNOTATION } from "../../src/fold-recorder";
 import { buildAnchors, anchorKey, type Anchor, type AnchoredBlock } from "../../src/anchors";
 import type { FileFoldRecord } from "../../src/types";
+import { makeGuardRig, type GuardRig } from "../guard-rig";
 
 const NOTE_PATH = "Projects/Quarry/Tasks.md";
 
@@ -356,4 +357,116 @@ describe("dormant folds (G6)", () => {
 			expect(anchorKey(after!.folds[0] as unknown as Anchor)).toBe(anchorKey(alpha));
 		},
 	);
+});
+
+describe("dormant folds behind the load guard (PR-3: E6, E7, E8, GP5)", () => {
+	const SECTION_COUNT = 10;
+	const sectionsText = (names: string[]): string => ["Intro", "", ...names.flatMap((n) => [`## ${n}`, `body of ${n} GUARD-MARKER`, ""])].join("\n");
+	const NAMES = Array.from({ length: SECTION_COUNT }, (_, i) => `Section ${String.fromCharCode(97 + i)} ${["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"][i]}`);
+	const ORIGINAL = sectionsText(NAMES);
+
+	function foldsFor(text: string, names: string[]): Record<string, unknown>[] {
+		return names.map((n) => findOneBlock(buildAnchors(text), (a) => a.kind === "heading" && a.text === n.toLowerCase()).anchor as unknown as Record<string, unknown>);
+	}
+
+	function guardedView(rig: GuardRig, store: FoldStore, now: () => number, doc: string): EditorView {
+		const watcher = createEditorWatcher({ store, now, ...rig.watcherDeps });
+		const state = EditorState.create({
+			doc,
+			selection: { anchor: 0 },
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		return new EditorView({ state, parent: document.body });
+	}
+
+	const replaceAll = (view: EditorView, text: string, userEvent = "set"): void =>
+		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, annotations: Transaction.userEvent.of(userEvent) });
+
+	afterEach(() => {
+		document.body.replaceChildren();
+	});
+
+	it("E7 / GP5: a large external rewrite that removes most folded blocks sets every unmatched fold aside with one shared dormantSince and the new hash; the guard only waits for the text, not for a threshold", async () => {
+		const rig = makeGuardRig();
+		const keep = NAMES.slice(0, 2);
+		const rewritten = sectionsText(keep);
+		rig.vault.setContent(NOTE_PATH, rewritten);
+		const clock = 123_456;
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: hashText(ORIGINAL), folds: foldsFor(ORIGINAL, NAMES), dormant: [] } }, () => clock);
+		const view = guardedView(rig, store, () => clock, ORIGINAL);
+
+		replaceAll(view, rewritten);
+		await settle();
+
+		const after = store.get(NOTE_PATH)!;
+		expect(after.contentHash).toBe(hashText(rewritten));
+		expect(after.folds).toHaveLength(2);
+		expect(after.dormant).toHaveLength(8); // 8 of 10 (more than half) set aside: no threshold
+		expect(new Set(after.dormant.map((d) => (d as unknown as { dormantSince: number }).dormantSince))).toEqual(new Set([clock]));
+		expect(liveFoldedLineRanges(view)).toHaveLength(2);
+		const lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["settled", "rematched"]]);
+		expect(lines[0]).toMatchObject({ foldsBefore: 10, foldsAfter: 2, dormantBefore: 0, dormantAfter: 8 });
+		expect(await rig.raw()).not.toContain("GUARD-MARKER");
+	});
+
+	it("E6: a note that really is empty on disk: editor and disk agree, so the pass proceeds as a real change - folds go dormant, hash is hashText(\"\")", async () => {
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, "");
+		const clock = 5_000;
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: hashText(ORIGINAL), folds: foldsFor(ORIGINAL, NAMES.slice(0, 3)), dormant: [] } }, () => clock);
+		const view = guardedView(rig, store, () => clock, ORIGINAL);
+
+		replaceAll(view, "");
+		await settle();
+
+		const after = store.get(NOTE_PATH)!;
+		expect(after.contentHash).toBe(hashText(""));
+		expect(after.folds).toEqual([]);
+		expect(after.dormant).toHaveLength(3);
+		expect(new Set(after.dormant.map((d) => (d as unknown as { dormantSince: number }).dormantSince))).toEqual(new Set([clock]));
+		const lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["settled", "rematched"]]);
+		expect(lines[0]).toMatchObject({ editorLen: 0, diskLen: 0 });
+	});
+
+	it("the same empty pane over a file that is NOT empty moves nothing to dormant (the contrast to E6)", async () => {
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, ORIGINAL);
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: hashText(ORIGINAL), folds: foldsFor(ORIGINAL, NAMES.slice(0, 3)), dormant: [] } }, () => 0);
+		const view = guardedView(rig, store, () => 0, ORIGINAL);
+		const before = JSON.stringify(store.get(NOTE_PATH));
+
+		replaceAll(view, "");
+		await settle();
+		expect(JSON.stringify(store.get(NOTE_PATH))).toBe(before);
+		expect(store.get(NOTE_PATH)?.dormant).toEqual([]);
+		rig.gate.cancelAll();
+	});
+
+	it("E8: Dan types while a settled wait is pending: his edit ends the wait, nothing is set aside because of the wait, and the log says the wait ended through an edit", async () => {
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, ORIGINAL); // the disk holds the note; the pane never gets it
+		const store = await makeStore({ [NOTE_PATH]: { contentHash: hashText(ORIGINAL), folds: foldsFor(ORIGINAL, NAMES.slice(0, 3)), dormant: [] } }, () => 0);
+		const view = guardedView(rig, store, () => 0, ORIGINAL);
+
+		replaceAll(view, ""); // a reload that left the pane empty
+		await settle();
+		expect(rig.gate.isHolding(view)).toBe(true);
+		expect(store.get(NOTE_PATH)?.dormant).toEqual([]);
+
+		// He types: a user-annotated transaction (input.type) at the end of the pane's text.
+		replaceAll(view, ORIGINAL + "typed", "input.type");
+		await settle();
+
+		expect(rig.gate.isHolding(view)).toBe(false);
+		const after = store.get(NOTE_PATH)!;
+		expect(after.dormant).toEqual([]); // the folds still match the text he is typing into
+		expect(after.folds).toHaveLength(3);
+		const lines = await rig.lines();
+		const outcomes = lines.map((l) => l.outcome);
+		expect(outcomes[0]).toBe("refused-empty");
+		expect(outcomes).toContain("applied"); // "the wait ended through an edit"
+		expect(await rig.raw()).not.toContain("typed");
+	});
 });

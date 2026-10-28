@@ -258,6 +258,11 @@ export class MemoryAdapter {
 		const text = this.files.get(path) ?? this.noteText(path);
 		return text === undefined ? Promise.reject(new Error(`ENOENT: ${path}`)) : Promise.resolve(text);
 	}
+	/** Warkworth-46 PR-3: the real adapter's `stat`: `{ size }` in bytes for a file, null for none. */
+	stat(path: string): Promise<{ size: number } | null> {
+		const text = this.files.get(path) ?? this.noteText(path);
+		return Promise.resolve(text === undefined ? null : { size: new TextEncoder().encode(text).length });
+	}
 	write(path: string, data: string): Promise<void> {
 		this.calls.push({ method: "write", path });
 		return this.mutate(() => void this.files.set(path, data));

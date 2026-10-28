@@ -19,7 +19,7 @@
  */
 import type { EditorView } from "@codemirror/view";
 import { diagnosticEntry, recordCounts, reportDiagnostic, type DiagnosticOutcome } from "./diagnostic-log";
-import type { LoadWaitIo, LoadWaitRegistry } from "./load-wait";
+import { runSerialised, type LoadWaitIo, type LoadWaitRegistry } from "./load-wait";
 import { restoreOnOpen, type OpenRestoreDeps } from "./open-restore";
 
 export interface OpenWaitDeps extends OpenRestoreDeps {
@@ -58,7 +58,9 @@ export async function restoreOnOpenWhenLoaded(view: EditorView, path: string, de
 
 	switch (result.state) {
 		case "ready":
-			await restoreOnOpen(view, path, result.editorText, { ...deps, diskLen: result.diskText?.length });
+			// Warkworth-46 PR-3: one pass at a time per pane. A settled pass released by the same
+			// text landing waits for this one, so the two never write the store together.
+			await runSerialised(view, () => restoreOnOpen(view, path, result.editorText, { ...deps, diskLen: result.diskText?.length }));
 			return;
 		case "gave-up":
 			log("gave-up", result.editorText.length, result.diskText?.length ?? -1);

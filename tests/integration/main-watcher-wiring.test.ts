@@ -16,7 +16,7 @@ import { App, type PluginManifest } from "obsidian";
 import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding } from "@codemirror/language";
-import { editorInfoField } from "../mocks/obsidian";
+import { editorInfoField, Vault as MockVault } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin, { SETTLED_NON_USER_CHANGE_EVENT } from "../../src/main";
 
 const manifest: PluginManifest = {
@@ -141,6 +141,9 @@ describe("R3: plugin.events exposes the settled-non-user-change event for real",
 			// settled non-user change through that reconfigured pane must land in the plugin's
 			// *current* store, not the one the stale pre-disable extension closed over.
 			vi.useFakeTimers();
+			// PR-3: the settled pass now waits for the pane to hold what is on disk. The note on
+			// disk is what the external write left, i.e. the text the pane is about to show.
+			(app.vault as unknown as MockVault).setContent("Tasks.md", "<!-- external write after re-enable -->\n# Heading\nbody");
 			const view = new EditorView({
 				state: EditorState.create({
 					doc: "# Heading\nbody",

@@ -34,7 +34,22 @@
  * A cancelled wait clears its timers and listeners and never reports anything else. The restore
  * passes that come later (settled change, first-open baseline, native-restore guard) use the same
  * registry and the same `LoadWaitIo`; nothing here is specific to the open pass.
+ *
+ * Warkworth-46 PR-3 adds the other passes' side, in this same module (there is no second guard):
+ * - `guardPass` / `checkPass`: the one decision rule (proceed / wait / refuse / read-failed) every
+ *   guarded pass applies to the pane it is about to restore, table-tested in
+ *   tests/unit/load-wait.test.ts.
+ * - `PassGate`: a pass that must wait (settled change, first-open baseline) leaves its handlers
+ *   with the gate, keyed by the pane's `EditorView` in a `WeakMap`, and the gate runs them when the
+ *   wait ends with real text. Because the state is keyed by the view and not held by the
+ *   `ViewPlugin` instance, a pane whose text arrives through `EditorView.setState` (which
+ *   recreates every `ViewPlugin` instance, E2) is still found: the new instance asks the gate to
+ *   look again at once.
+ * - `runSerialised`: one restore pass at a time per pane, so the open pass and a settled pass
+ *   released by the same text landing never write the store at the same moment.
  */
+
+import type { DiagnosticOutcome } from "./diagnostic-log";
 
 /** A wait gives up this long after it starts (Q8). */
 export const LOAD_WAIT_GIVE_UP_MS = 30_000;
@@ -65,6 +80,72 @@ export function isEditorLoaded(input: LoadedInput): boolean {
 	if (input.userEdited) return true;
 	if (input.paneFilePath !== input.passPath) return false;
 	return normaliseLineEndings(input.editorText) === normaliseLineEndings(input.diskText);
+}
+
+/** The restore passes that ask the guard (PR-2 and PR-3): the log's `pass` codes, minus `load-cleanup`. */
+export type GuardPass = "open" | "settled" | "baseline" | "native-guard" | "embed";
+
+/** What a pass does with the pane it was asked about. `refuse` is `wait` for a pane that is empty
+ * while the note is not: the pass is refused outright and logged as `refused-empty`. */
+export type GuardDecision = "proceed" | "wait" | "refuse" | "read-failed";
+
+export interface GuardInput extends Omit<LoadedInput, "diskText"> {
+	/** The note's text on disk, or null when the read failed. */
+	diskText: string | null;
+}
+
+export interface GuardVerdict {
+	pass: GuardPass;
+	decision: GuardDecision;
+	/** The log's outcome code for a pass that does not proceed; null for `proceed`. */
+	outcome: DiagnosticOutcome | null;
+}
+
+/**
+ * The one rule every guarded pass follows (settled, baseline, native-guard, embed, and the open
+ * pass through `LoadWait`), in this order:
+ *  1. the user has edited the pane: proceed on the pane's own text (E8);
+ *  2. the disk read failed: read-failed, nothing changes (E12);
+ *  3. the pane shows another file: wait (E5);
+ *  4. editor and disk agree after line-ending normalisation: proceed (an empty note agrees with an
+ *     empty editor, so it is a real change, E6);
+ *  5. the editor is empty and the note is not: refuse (E1, E3);
+ *  6. otherwise the text is half there: wait (E4).
+ * Nothing in the rule depends on `pass`; it is in the verdict so the caller logs the right line.
+ */
+export function guardPass(pass: GuardPass, input: GuardInput): GuardVerdict {
+	const verdict = (decision: GuardDecision, outcome: DiagnosticOutcome | null): GuardVerdict => ({ pass, decision, outcome });
+	if (input.userEdited) return verdict("proceed", null);
+	if (input.diskText === null) return verdict("read-failed", "read-failed");
+	if (isEditorLoaded({ ...input, diskText: input.diskText })) return verdict("proceed", null);
+	if (input.paneFilePath === input.passPath && normaliseLineEndings(input.editorText) === "") return verdict("refuse", "refused-empty");
+	return verdict("wait", "waiting");
+}
+
+/** A guard check: the verdict, and the two lengths the log line reports (-1 for a read that failed). */
+export interface GuardCheck {
+	verdict: GuardVerdict;
+	editorLen: number;
+	diskLen: number;
+}
+
+/** Reads the note from disk (`io.readDisk`, never a cache) and applies `guardPass` to `editorText`.
+ * Never throws: a read that rejects, or throws, is a `read-failed` verdict. */
+export async function checkPass(pass: GuardPass, path: string, editorText: string, io: LoadWaitIo): Promise<GuardCheck> {
+	let diskText: string | null = null;
+	try {
+		diskText = await io.readDisk(path);
+	} catch {
+		diskText = null;
+	}
+	let paneFilePath: string | null = null;
+	try {
+		paneFilePath = io.paneFilePath();
+	} catch {
+		paneFilePath = null;
+	}
+	const verdict = guardPass(pass, { paneFilePath, passPath: path, editorText, diskText, userEdited: false });
+	return { verdict, editorLen: editorText.length, diskLen: diskText?.length ?? -1 };
 }
 
 export type LoadWaitState = "idle" | "waiting" | "ready" | "gave-up" | "read-failed" | "cancelled";
@@ -150,6 +231,11 @@ export class LoadWait {
 	cancel(): void {
 		if (this.state !== "idle" && this.state !== "waiting") return;
 		this.finish({ state: "cancelled" });
+	}
+
+	/** Looks at the pane again now. For a route that gives no change event (`EditorView.setState`). */
+	recheck(): void {
+		this.check();
 	}
 
 	private readDisk(): void {
@@ -289,4 +375,117 @@ export class LoadWaitRegistry<K extends object> {
 	get size(): number {
 		return this.waits.size;
 	}
+}
+
+/** What a pass that had to wait leaves with the `PassGate`. */
+export interface HoldHandlers {
+	/** The wait ended with the pane holding the note's real text, or with the user's edit (then
+	 * `userEdited` is true and `editorText` is the pane's own text). Called once. */
+	ready(info: { editorText: string; diskLen: number; userEdited: boolean }): void;
+	/** The wait ended without real text (30 s, or the note could not be read). Nothing was changed. */
+	ended(info: { state: "gave-up" | "read-failed"; editorLen: number; diskLen: number }): void;
+}
+
+interface Hold {
+	path: string;
+	wait: LoadWait;
+	/** One handler set per pass kind, in the order the passes first asked. A later ask by the same
+	 * kind replaces the earlier one, so the last settled text wins and the pass runs once. */
+	handlers: Map<GuardPass, HoldHandlers>;
+}
+
+/**
+ * The pending waits of the settled-change and first-open-baseline passes (PR-3). One wait per pane,
+ * shared by whichever passes are waiting on it, and keyed by the pane's own object (the
+ * `EditorView`) in a `WeakMap`, never held by a `ViewPlugin` instance: `EditorView.setState`
+ * recreates every instance without a transaction, and the wait must outlive that (E2).
+ *
+ * It is deliberately separate from the open pass's `LoadWaitRegistry` (src/main.ts): starting a
+ * wait for a pane cancels that pane's earlier one, and a settled pass must not cancel an open pass.
+ */
+export class PassGate<K extends object> {
+	private readonly waits = new LoadWaitRegistry<K>();
+	private readonly holds = new WeakMap<K, Hold>();
+
+	/**
+	 * Leaves `handlers` to run when `key`'s pane holds `path`'s real text. If the pane already has a
+	 * wait for that path, no second one starts (its 30 s clock keeps running) and the pass kind's
+	 * handlers are replaced. Returns true when this call started a new wait.
+	 */
+	hold(pass: GuardPass, key: K, path: string, io: LoadWaitIo, handlers: HoldHandlers): boolean {
+		const existing = this.holds.get(key);
+		if (existing !== undefined && existing.path === path && existing.wait.state === "waiting") {
+			existing.handlers.set(pass, handlers);
+			return false;
+		}
+		const hold: Hold = { path, wait: undefined as unknown as LoadWait, handlers: new Map([[pass, handlers]]) };
+		this.holds.set(key, hold);
+		hold.wait = this.waits.start(key, path, io);
+		void hold.wait.done.then((result) => this.settle(key, hold, result));
+		return true;
+	}
+
+	/** True while `key`'s pane has a wait that has not ended. */
+	isHolding(key: K): boolean {
+		return this.holds.get(key)?.wait.state === "waiting";
+	}
+
+	/** Looks at `key`'s pending wait again now, if it has one (a new `ViewPlugin` instance after
+	 * `setState`, or any later update to the pane). A no-op for a pane with no wait. */
+	recheck(key: K): void {
+		this.holds.get(key)?.wait.recheck();
+	}
+
+	/** Cancels `key`'s pending wait. Its handlers run nothing and write no log line. */
+	cancel(key: K): void {
+		this.waits.cancel(key);
+	}
+
+	/** Cancels every pending wait (the plugin unloading). */
+	cancelAll(): void {
+		this.waits.cancelAll();
+	}
+
+	private settle(key: K, hold: Hold, result: LoadWaitResult): void {
+		if (this.holds.get(key) === hold) this.holds.delete(key);
+		const run = (fn: () => void): void => {
+			try {
+				fn();
+			} catch (err) {
+				console.error("persistent-folded-state: a restore pass waiting for the note failed", err);
+			}
+		};
+		for (const handlers of hold.handlers.values()) {
+			if (result.state === "ready") {
+				run(() => handlers.ready({ editorText: result.editorText, diskLen: result.diskText?.length ?? -1, userEdited: result.userEdited }));
+			} else if (result.state === "gave-up") {
+				run(() => handlers.ended({ state: "gave-up", editorLen: result.editorText.length, diskLen: result.diskText?.length ?? -1 }));
+			} else if (result.state === "read-failed") {
+				run(() => handlers.ended({ state: "read-failed", editorLen: result.editorText.length, diskLen: -1 }));
+			}
+			// cancelled: nothing runs, nothing is logged.
+		}
+	}
+}
+
+const paneQueues = new WeakMap<object, Promise<void>>();
+
+/**
+ * Runs `task` after every task already queued for `key`'s pane has finished, and resolves with its
+ * result. A restore pass reads the store, awaits the matcher and writes a delta back; two passes
+ * for one pane running at once (the open pass and a settled pass that the same text landing
+ * released) would each write from a snapshot the other had already changed. A task that rejects
+ * does not stop the ones queued behind it.
+ */
+export function runSerialised<T>(key: object, task: () => Promise<T>): Promise<T> {
+	const previous = paneQueues.get(key) ?? Promise.resolve();
+	const run = previous.then(() => task());
+	paneQueues.set(
+		key,
+		run.then(
+			() => undefined,
+			() => undefined,
+		),
+	);
+	return run;
 }

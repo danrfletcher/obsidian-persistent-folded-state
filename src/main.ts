@@ -122,7 +122,7 @@ import type { DiagnosticSink } from "./diagnostic-log";
 import { PersistentFoldedStateSettingTab } from "./settings-tab";
 import { createEditorWatcher } from "./editor-watcher";
 import { restoreOnOpenWhenLoaded } from "./open-wait";
-import { LoadWaitRegistry } from "./load-wait";
+import { LoadWaitRegistry, PassGate, normaliseLineEndings } from "./load-wait";
 import { createLoadWaitIo } from "./load-wait-host";
 import { EmbedFoldRecorder } from "./embed-fold-recorder";
 import { EmbedFoldRestorer } from "./embed-fold-restorer";
@@ -154,6 +154,9 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	/** Warkworth-46 PR-2: one live wait per pane for the editor to hold the note's real text before
 	 * the open pass runs. Every pending wait is cancelled in `onunload()`. */
 	private readonly loadWaits = new LoadWaitRegistry<EditorView>();
+	/** PR-3: the waits of the settled-change and first-open-baseline passes, apart from `loadWaits`
+	 * (starting one for a pane cancels that pane's earlier one, and these must not cancel an open pass). */
+	private readonly passGate = new PassGate<EditorView>();
 	/** Warkworth-46 PR-1: the diagnostic log writer. Created in `onload()`, drained in `onunload()`. */
 	diagnosticLog: DiagnosticLogWriter | null = null;
 
@@ -211,6 +214,10 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 				onSettledNonUserChange: (path, text) => this.events.trigger(SETTLED_NON_USER_CHANGE_EVENT, path, text),
 				disposed: this.editorWatcherDisposed,
 				diagnosticLog: diagnosticSink,
+				loadGuard: {
+					gate: this.passGate,
+					makeIo: (view) => createLoadWaitIo({ app: this.app, view }),
+				},
 			})
 		);
 		// T2: forces every already-open pane onto the extension just registered above (and
@@ -238,6 +245,14 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		const readNote = async (path: string): Promise<string | null> => {
 			const file = this.app.vault.getFileByPath(path);
 			return file === null ? null : await this.app.vault.cachedRead(file);
+		};
+		// Warkworth-46 PR-3 (E19): a note that `readNote` gave as "" is empty only if the disk says so
+		// too: `adapter.read` is "" and the stat size is 0. Rejects when the disk cannot be read.
+		const confirmEmpty = async (path: string): Promise<boolean> => {
+			const adapter = this.app.vault.adapter;
+			if (normaliseLineEndings(await adapter.read(path)) !== "") return false;
+			const stat = await adapter.stat(path);
+			return stat !== null && stat.size === 0;
 		};
 		const resolveLink = (linktext: string, sourcePath: string): string | null =>
 			this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath)?.path ?? null;
@@ -271,7 +286,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 
 		// PR-7 (G6, E6): a retargeted or broken embed's stored state goes dormant for 10 minutes,
 		// then is forgotten. Read-only toward the vault; never called from a rename handler.
-		const dormancy = new EmbedDormancyTracker({ store: this.store, readNote, resolveLink });
+		const dormancy = new EmbedDormancyTracker({ store: this.store, readNote, resolveLink, confirmEmpty, diagnosticLog: diagnosticSink });
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file: TFile | null) => {
 				if (!file) return;
@@ -293,6 +308,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 			whenRecorded: () => recorder.whenIdle(),
 			dormancy,
 			diagnosticLog: diagnosticSink,
+			confirmEmpty,
 		});
 		this.embedRestorer = restorer;
 		restorer.attach(document);
@@ -375,6 +391,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		// Warkworth-46 PR-2: a wait still pending runs no pass, writes no log line and leaves no
 		// timer or listener behind.
 		this.loadWaits.cancelAll();
+		this.passGate.cancelAll();
 		// E9: no embed listener or observer outlives the plugin, and nothing queued is recorded.
 		this.embedRecorder?.dispose();
 		this.embedRecorder = null;
