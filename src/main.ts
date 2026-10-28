@@ -161,20 +161,22 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	diagnosticLog: DiagnosticLogWriter | null = null;
 
 	async onload(): Promise<void> {
-		this.store = new FoldStore({
-			loadData: () => this.loadData(),
-			saveData: (data) => this.saveData(data),
-		});
-		await this.store.load();
-
 		// Warkworth-46 PR-1: the log lives in this plugin's own folder. `manifest.dir` is optional
 		// in Obsidian's typings; the same folder is rebuilt from the config folder when absent.
+		// PR-4: made before the store loads, so the load-time cleanup can log its line.
 		const logWriter = new DiagnosticLogWriter(
 			this.app.vault.adapter,
 			this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
 		);
 		this.diagnosticLog = logWriter;
 		const diagnosticSink: DiagnosticSink = (entry) => logWriter.log(entry);
+
+		this.store = new FoldStore({
+			loadData: () => this.loadData(),
+			saveData: (data) => this.saveData(data),
+			diagnosticLog: diagnosticSink,
+		});
+		await this.store.load();
 
 		// PR-8 (G17): notices a heading renamed inside Obsidian, so the embeds that link to it
 		// follow it instead of looking retargeted. Reads the metadata cache only.

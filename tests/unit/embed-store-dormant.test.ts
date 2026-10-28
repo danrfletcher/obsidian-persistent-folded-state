@@ -14,6 +14,9 @@ import type { EmbedFoldRecord, StoredAnchor } from "../../src/types";
 const T0 = 5_000_000;
 const WINDOW = MAX_DORMANT_AGE_MS;
 const ANCHOR = { kind: "task", indent: 0, text: "lesson 8", siblingIndex: 0, parentChain: [] } as unknown as StoredAnchor;
+// A different anchor from ANCHOR: a dormant copy of an anchor that is also in `folds` is a
+// duplicate, and load() removes it (warkworth-46 E14), so a set-aside entry here is a distinct one.
+const SET_ASIDE = { kind: "task", indent: 0, text: "lesson 9", siblingIndex: 1, parentChain: [] } as unknown as StoredAnchor;
 // A note with no dormant entry of its own, so moving the clock never changes it through the
 // (older) note-level expiry: what these tests watch is that the embed step leaves it alone.
 const FILES = {
@@ -56,7 +59,7 @@ describe("load() forgets embed state that has been dormant for 10 minutes", () =
 	});
 
 	it.each(AGES)("a per-anchor dormant entry (G14) inside a live embed, $age ms old: kept is $kept", async ({ age, kept }) => {
-		const entry = { ...ANCHOR, dormantSince: T0 - age } as unknown as StoredAnchor;
+		const entry = { ...SET_ASIDE, dormantSince: T0 - age } as unknown as StoredAnchor;
 		const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormant: [entry] })] });
 		const store = await d.open();
 		expect(store.embedRecords()[0].dormant).toEqual(kept ? [entry] : []);
@@ -130,7 +133,7 @@ describe("load() writes out what it forgot, without waiting for an unrelated wri
 
 	it("a per-anchor dormant entry that aged out is written out the same way, the embed's folds kept", async () => {
 		await withTimers(async () => {
-			const entry = { ...ANCHOR, dormantSince: T0 - WINDOW } as unknown as StoredAnchor;
+			const entry = { ...SET_ASIDE, dormantSince: T0 - WINDOW } as unknown as StoredAnchor;
 			const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormant: [entry] })] });
 			await d.open();
 			await vi.advanceTimersByTimeAsync(150);
@@ -168,7 +171,7 @@ describe("flush() forgets embed state that aged out while the store was open", (
 	});
 
 	it("prunes a per-anchor dormant entry that aged out, leaving the embed's folds", async () => {
-		const entry = { ...ANCHOR, dormantSince: T0 } as unknown as StoredAnchor;
+		const entry = { ...SET_ASIDE, dormantSince: T0 } as unknown as StoredAnchor;
 		const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormant: [entry] })] });
 		const store = await d.open();
 		d.clock.now = T0 + WINDOW;
@@ -236,7 +239,7 @@ describe("reconcileEmbedDormancy: the one dormancy step in the store (G6, E6, E1
 	};
 
 	it("first seen absent or broken: stamped at now, folds, dormant list and hash left exactly as they were", async () => {
-		const original = rec(0, { dormant: [{ ...ANCHOR, dormantSince: T0 - 10 } as unknown as StoredAnchor] });
+		const original = rec(0, { dormant: [{ ...SET_ASIDE, dormantSince: T0 - 10 } as unknown as StoredAnchor] });
 		const { store } = await make([original]);
 		expect(store.reconcileEmbedDormancy("Host.md", () => "absent")).toEqual({ stamped: 1, revived: 0, forgotten: 0 });
 		expect(store.embedRecords()).toEqual([{ ...original, dormantSince: T0 }]);
@@ -312,5 +315,103 @@ describe("reconcileEmbedDormancy: the one dormancy step in the store (G6, E6, E1
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+/**
+ * Warkworth-46 PR-4 (E14): an embed record with an anchor in both `folds` and `dormant` is cleaned at
+ * load, the same way a note's is. The whole-embed `dormantSince` stamp is left as it is, and the
+ * T16 write-back of what load forgot still fires once, not twice.
+ */
+describe("load() cleans an anchor held in both lists of an embed record (E14)", () => {
+	const dormantCopy = (anchor: StoredAnchor, since: number) => ({ ...anchor, dormantSince: since }) as unknown as StoredAnchor;
+
+	it("keeps the anchor in folds, drops the dormant copy, and writes once at once", async () => {
+		const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormant: [dormantCopy(ANCHOR, T0 - 5)] })] });
+		const store = await d.open();
+		expect(store.embedRecords()[0].folds).toEqual([ANCHOR]);
+		expect(store.embedRecords()[0].dormant).toEqual([]);
+		expect(d.saveData).toHaveBeenCalledTimes(1);
+		expect(d.read().embeds?.[0].dormant).toEqual([]);
+	});
+
+	it("a dormant-only anchor in the same record keeps its dormantSince and place", async () => {
+		const keep = dormantCopy(SET_ASIDE, T0 - 777);
+		const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormant: [keep, dormantCopy(ANCHOR, T0 - 5)] })] });
+		const store = await d.open();
+		expect(store.embedRecords()[0].dormant).toEqual([keep]);
+	});
+
+	it("a duplicate whose dormant copy is past the window is still removed and the fold stays", async () => {
+		const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormant: [dormantCopy(ANCHOR, T0 - WINDOW - 1)] })] });
+		const store = await d.open();
+		expect(store.embedRecords()[0].folds).toEqual([ANCHOR]);
+		expect(store.embedRecords()[0].dormant).toEqual([]);
+		expect(d.saveData).toHaveBeenCalledTimes(1);
+	});
+
+	it("the whole-embed dormantSince stamp is kept exactly as it was", async () => {
+		const stamp = T0 - 12_345;
+		const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormantSince: stamp, dormant: [dormantCopy(ANCHOR, T0 - 5)] })] });
+		const store = await d.open();
+		expect(store.embedRecords()[0].dormantSince).toBe(stamp);
+		expect(store.embedRecords()[0].dormant).toEqual([]);
+		expect(store.embedRecords()[0].contentHash).toBe("h0");
+	});
+
+	it("clean embed data causes no write", async () => {
+		vi.useFakeTimers();
+		try {
+			const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormant: [dormantCopy(SET_ASIDE, T0 - 5)] })] });
+			await d.open();
+			await vi.advanceTimersByTimeAsync(5000);
+			expect(d.saveData).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("T16 still fires once: a cleaned record beside a record forgotten at load is one write, not two", async () => {
+		vi.useFakeTimers();
+		try {
+			const d = disk({
+				version: STORE_VERSION,
+				files: FILES,
+				embeds: [rec(0, { dormant: [dormantCopy(ANCHOR, T0 - 5)] }), rec(1, { dormantSince: T0 - WINDOW })],
+			});
+			const store = await d.open();
+			await vi.advanceTimersByTimeAsync(5000);
+			expect(store.embedSize).toBe(1);
+			expect(d.saveData).toHaveBeenCalledTimes(1);
+			expect(d.read().embeds).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("T16 alone (nothing cleaned) is still the one debounced write", async () => {
+		vi.useFakeTimers();
+		try {
+			const d = disk({ version: STORE_VERSION, files: FILES, embeds: [rec(0, { dormantSince: T0 - WINDOW })] });
+			await d.open();
+			expect(d.saveData).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(5000);
+			expect(d.saveData).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("notes and embeds cleaned in the same load are one write, and neither section's other entries move", async () => {
+		const noteDormant = { ...ANCHOR, dormantSince: T0 - 5 };
+		const d = disk({
+			version: STORE_VERSION,
+			files: { "Host.md": { contentHash: "n1", folds: [ANCHOR], dormant: [noteDormant, { ...SET_ASIDE, dormantSince: T0 - 9 }] } },
+			embeds: [rec(0, { dormant: [dormantCopy(ANCHOR, T0 - 5)] })],
+		});
+		const store = await d.open();
+		expect(d.saveData).toHaveBeenCalledTimes(1);
+		expect(store.get("Host.md")?.dormant).toEqual([{ ...SET_ASIDE, dormantSince: T0 - 9 }]);
+		expect(store.embedRecords()[0].dormant).toEqual([]);
 	});
 });

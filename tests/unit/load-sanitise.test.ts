@@ -429,3 +429,48 @@ describe("FoldStore.load: embeds with corrupt or missing files (E8)", () => {
 		expect(store.embedSize).toBe(0);
 	});
 });
+
+/** Warkworth-46 PR-4 (E14): the duplicate cleanup never throws out of `load()` / `onload`, however
+ * broken the data it runs over. */
+describe("FoldStore.load with duplicates: corrupt, absent or rejecting loadData() never throws (E14)", () => {
+	const DUP = { ...GOOD_ANCHOR, dormantSince: Date.now() };
+	const duplicated = { version: STORE_VERSION, files: { "Note.md": { contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [DUP] } } };
+
+	const loaders: { label: string; loadData: () => Promise<unknown> }[] = [
+		{ label: "absent (null)", loadData: async () => null },
+		{ label: "undefined", loadData: async () => undefined },
+		{ label: "rejecting", loadData: async () => Promise.reject(new Error("disk read failed")) },
+		{ label: "a string", loadData: async () => "{not json" },
+		{ label: "an array", loadData: async () => [duplicated] },
+		{ label: "wrong version", loadData: async () => ({ ...duplicated, version: 999 }) },
+		{ label: "files is an array", loadData: async () => ({ version: STORE_VERSION, files: [DUP] }) },
+		{ label: "folds is not an array, dormant has the anchor", loadData: async () => ({ version: STORE_VERSION, files: { "N.md": { contentHash: "a", folds: "x", dormant: [DUP] } } }) },
+		{ label: "dormant is not an array", loadData: async () => ({ version: STORE_VERSION, files: { "N.md": { contentHash: "a", folds: [GOOD_ANCHOR], dormant: "x" } } }) },
+		{ label: "folds and dormant full of junk beside a real duplicate", loadData: async () => ({ version: STORE_VERSION, files: { "N.md": { contentHash: "a", folds: [null, 1, "x", GOOD_ANCHOR], dormant: [null, [], DUP, { kind: 3 }] } } }) },
+		{ label: "an embeds section with a duplicate and junk records", loadData: async () => ({ version: STORE_VERSION, files: {}, embeds: [null, 5, { host: "H.md", target: "T.md", subpath: "", occurrence: 0, contentHash: "h", folds: [GOOD_ANCHOR], dormant: [DUP, null] }] }) },
+	];
+
+	for (const { label, loadData } of loaders) {
+		it(`${label}: load() resolves`, async () => {
+			const store = new FoldStore({ loadData, saveData: vi.fn(async () => undefined) });
+			await expect(store.load()).resolves.toBeUndefined();
+		});
+	}
+
+	it("a duplicate with a rejecting saveData and a throwing diagnostic sink still completes the load", async () => {
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+		try {
+			const store = new FoldStore({
+				loadData: async () => duplicated,
+				saveData: async () => Promise.reject(new Error("disk full")),
+				diagnosticLog: () => {
+					throw new Error("log failed");
+				},
+			});
+			await expect(store.load()).resolves.toBeUndefined();
+			expect(store.get("Note.md")?.dormant).toEqual([]);
+		} finally {
+			consoleError.mockRestore();
+		}
+	});
+});
