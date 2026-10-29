@@ -1,58 +1,80 @@
 # Persistent Folded State
 
-An Obsidian plugin that preserves a note's block and task fold states (which headings, lists and
-tasks are collapsed or expanded) across the kind of external file modification that would
-normally reset them: an AI agent editing the file, a sync tool, a git pull, or anything else that
-touches the file outside Obsidian's own editor.
+An Obsidian plugin that keeps a note's folds (which headings, lists and tasks are collapsed or
+expanded) across the things that normally reset them: an AI agent editing the file, a sync tool, a
+`git pull`, any other program that writes the file outside Obsidian, and quitting and relaunching
+the app.
 
-## Status: PR-5
+It requires Obsidian 1.13.0 or later. It is not marked desktop-only, but it has not been tested on
+a phone or tablet.
 
-Restore is wired in: on a settled external edit, the plugin snapshots the stored anchors for
-that note, matches them against the new text (PR-4's matcher), and dispatches tagged CM6 fold
-effects for whatever matched — in every open pane, one settle timer and one restore pass per
-pane, all reading and writing the one shared `FoldStore`.
+## What it does
 
-- **`src/fold-restorer.ts`** — the CM6-level restore pass: snapshots stored anchors at settle
-  time, matches with a real (not no-op) yielding scheduler, dispatches tagged fold effects, and
-  refreshes the note's stored content hash afterwards.
-- **`src/restore-plan.ts`** — the pure planning step from (the matcher's own decision, live
-  folded ranges, cursor position, which anchors the store still holds) to (ranges to fold now,
-  ranges deferred until the cursor leaves them).
-- **`src/describe-fold.ts`** — now builds a real `Anchor` (PR-3's `buildAnchors`) instead of
-  PR-2's line-local guess; a PR-2-era raw-text record is discarded on load rather than matched.
-- **`src/editor-watcher.ts`** — wires the restore pass into the settle timer and re-checks
-  deferred (cursor-inside) targets on every later update.
+- **Remembers your folds.** When you fold or unfold a block in a note, the plugin records which
+  block it was, not just which line number.
+- **Restores them after an outside edit.** When a note changes while it is open, or changed on disk
+  while it was closed, the plugin matches the folds it stored against the new text and folds the
+  blocks that match. It matches on the block's text first, then its position under its parent, then
+  on similar text, so a lesson that was reworded or moved a few lines still comes back folded.
+- **Waits for the note to load.** On open, restore waits until the pane shows the note's real text
+  before it touches any fold, so an empty pane never wipes a stored fold.
+- **Keeps folds it could not place for 10 minutes.** A fold that matches nothing yet is kept as
+  dormant and retried each time the note reloads. It is forgotten after 10 minutes.
+- **Adopts what you already have.** The first time a note is opened, the folds Obsidian already
+  shows are recorded as they are. Nothing is folded or unfolded.
+- **Follows renames and deletes.** Renaming or moving a note or folder in Obsidian carries its
+  stored folds along. Deleting one removes them. A rename made outside Obsidian is cleaned up the
+  next time the plugin loads.
+- **Works inside embeds.** Folds you make by clicking inside an embedded block or note
+  (`![[Note#Heading]]`, `![[Note#^block]]`) are stored against the host note and restored when the
+  embed renders, in Live Preview and Reading view.
 
-Earlier PRs: PR-1 built the persistence layer (`src/fold-store.ts`) and a minimal UI (the
-"Forget stored folds for this note" command, the settings tab's "Forget all stored folds"
-button). PR-2 added the editor watcher, fold recording and the settle timer. PR-3 added the pure
-anchor builder (`src/anchors.ts`, `src/normalize.ts`). PR-4 added the pure matcher
-(`src/matcher.ts`, `src/similarity.ts`).
+## Commands
 
-Not in this PR: the dormant-fold retry window and first-open baseline adoption (PR-6), restore
-on reopen/restart/rename/delete (PR-7).
+| Command | What it does |
+|---|---|
+| Forget stored folds for this note | Clears the active note's stored folds and those of the embeds in it. Nothing changes on screen. |
+| Copy diagnostic log | Copies the plugin's diagnostic log to the clipboard, ready to paste into a note or a bug report. |
 
-## Embed folds: known limits
+## Settings
+
+One control: **Forget all stored folds** clears every note's and every embed's stored folds on this
+device, after a confirmation. It cannot be undone.
+
+## Diagnostic log
+
+The plugin keeps a short log in its own folder (`diagnostic-log.jsonl`, newest 1,000 lines) so a
+"my folds randomly opened" report can be traced to the exact pass that caused it. Each line holds a
+timestamp, the note's path, counts and two short codes for which pass ran and what it did. It never
+holds note text, headings or fold text, and there is no setting to turn it off.
+
+## Known limits
 
 - A fold arrow inside an embed that the plugin cannot pair with a line of the embedded text (its
   rendered text differs too much from the source line, for example) is left exactly as Obsidian
-  shows it. A fold Dan makes on it is not recorded, and the stored folds never undo it, so when a
-  fold of that kind is on screen the embed can differ from the stored set ("the stored set wins"
-  is not strict for it). The plugin does not guess which line such an arrow belongs to.
-- When an embed runs out of the per-host comparison budget while its stored folds are matched to
-  a changed source, the folds that were placed are applied, and the ones that could not be placed
-  are left out; nothing is unfolded.
+  shows it. A fold you make on it is not recorded, and the stored folds never undo it, so when a
+  fold of that kind is on screen the embed can differ from the stored set.
+- When an embed runs out of the per-host comparison budget while its stored folds are matched to a
+  changed source, the folds that were placed are applied and the ones that could not be placed are
+  left out. Nothing is unfolded.
 - A link to a heading (`![[Note#Heading]]`) whose embed has stored folds waits 10 seconds after it
-  stops matching the host's text before its folds go dormant, so a heading Dan renames in Obsidian
-  (which rewrites the link) moves the folds to the new heading instead of starting the 10-minute
-  clock on the old one. The wait is measured while the note is open; a link edited by hand starts
-  its dormant period about 10 seconds later than a block or whole-note link does.
+  stops matching the host's text before its folds go dormant, so a heading you rename in Obsidian
+  (which rewrites the link) moves the folds to the new heading. A link edited by hand starts its
+  dormant period about 10 seconds later than a block or whole-note link does.
+- The matcher handles up to 500 stored folds per note.
 
 ## Fold state is per device
 
 Fold state is stored in this plugin's own `data.json`, which (like every Obsidian plugin's
-`data.json`) is local to the vault on this device and is not synced by Obsidian Sync's settings
-sync, nor expected to be portable across devices on its own.
+`data.json`) is local to the vault on this device. Obsidian Sync's settings sync does not carry it,
+and it is not meant to be portable across devices on its own.
+
+## Install
+
+Search for **Persistent Folded State** under Settings, then Community plugins, and enable it. To
+install by hand instead, download `main.js`, `manifest.json` and `styles.css` from the
+[latest release](https://github.com/danrfletcher/obsidian-persistent-folded-state/releases/latest)
+into `<vault>/.obsidian/plugins/persistent-folded-state/`.
 
 ## Development
 
@@ -63,3 +85,6 @@ npm run build   # typecheck + production build -> main.js
 npm run lint    # eslint src
 npm test        # vitest
 ```
+
+The `docs/` folder holds notes from probing real Obsidian behaviour (reload shape, embeds).
+Released under the MIT licence.
