@@ -1,6 +1,6 @@
 {
 	"name": "persistent-folded-state",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Preserve block and task fold states in an open note across external file modifications (AI agents, sync, git pulls).",
 	"main": "main.js",
 	"scripts": {
