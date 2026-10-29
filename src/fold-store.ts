@@ -38,10 +38,16 @@
  * PR-4 (recording): a nested embed's identity also carries the chain of embeds that contain it
  * (`EmbedIdentity.outer`, see src/types.ts), validated on load and folded into the in-memory key.
  * A flat embed is stored exactly as before.
+ *
+ * Warkworth-46 PR-4 (E14): `load()` removes from each note's and each embed's `dormant` list every
+ * anchor that is also in its `folds` list (src/dedupe-store.ts), logs one `load-cleanup` line per
+ * cleaned record, and writes the cleaned data back at once; clean data writes nothing.
  */
 import type { EmbedFoldRecord, EmbedIdentity, EmbedLinkId, FileFoldRecord, StoreData } from "./types";
 import { parseAnchor } from "./anchors";
 import { expireDormant, parseDormantAnchor } from "./dormant";
+import { dedupeFoldsDormant } from "./dedupe-store";
+import { diagnosticEntry, recordCounts, reportDiagnostic, type DiagnosticSink, type RecordCounts } from "./diagnostic-log";
 import { expireEmbedRecords, isValidDormantSince, nextEmbedDormancy } from "./embed-dormant";
 import type { EmbedPresence } from "./embed-dormant";
 import { deleteFiles, pruneOrphanFiles, renameFiles } from "./vault-lifecycle";
@@ -63,6 +69,9 @@ export interface FoldStoreOptions {
 	/** PR-6 (G6): clock used to prune expired dormant anchors at load and at flush. Defaults to
 	 * `Date.now`; overridable so a test can drive dormant expiry with a fake clock. */
 	now?: () => number;
+	/** Warkworth-46 PR-4 (E14): where `load()` reports a record it cleaned (one `load-cleanup` /
+	 * `cleaned` line, counts and path only). Optional; a sink that throws never stops the load. */
+	diagnosticLog?: DiagnosticSink;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -259,8 +268,10 @@ export class FoldStore {
 	private readonly saveDataFn: (data: unknown) => Promise<void>;
 	private readonly flushDelayMs: number;
 	private readonly nowFn: () => number;
+	private readonly diagnosticLog: DiagnosticSink | undefined;
 
 	constructor(options: FoldStoreOptions) {
+		this.diagnosticLog = options.diagnosticLog;
 		this.loadDataFn = options.loadData;
 		this.saveDataFn = options.saveData;
 		this.flushDelayMs = options.flushDelayMs ?? 150;
@@ -286,19 +297,35 @@ export class FoldStore {
 		}
 		const sanitized = sanitizeStoreData(raw);
 		const now = this.nowFn();
+		// Warkworth-46 PR-4 (E14): what this load cleaned, for the log line and the write-back.
+		const cleaned: { path: string; before: RecordCounts; after: RecordCounts }[] = [];
 		const files = new Map<string, FileFoldRecord>();
 		for (const [path, record] of Object.entries(sanitized.files)) {
+			// E14: an anchor in both lists is active; the set-aside copy goes, whatever its age.
+			// Done before expiry so a stale copy is still recognised (and the clean written back).
+			const deduped = dedupeFoldsDormant(record.folds, record.dormant);
 			// G6/E7: "forgotten ... at plugin load" — a dormant anchor aged out while the
 			// plugin was disabled (or Obsidian was shut) never comes back as a candidate to
 			// retry; a long gap between loads is exactly what's supposed to expire it.
-			files.set(path, { ...record, dormant: expireDormant(record.dormant, now) });
+			const next = { ...record, dormant: expireDormant(deduped.dormant, now) };
+			files.set(path, next);
+			if (deduped.removed > 0) cleaned.push({ path, before: recordCounts(record), after: recordCounts(next) });
 		}
 		this.files = files;
 		// PR-7 (G6, E9): an embed state that stayed dormant for the whole window while the plugin
 		// was disabled (or Obsidian was shut) is forgotten here, by the wall clock; one still
 		// inside the window keeps its `dormantSince`, so the 10 minutes carry on across a relaunch.
 		const loadedEmbeds = sanitized.embeds ?? [];
-		const keptEmbeds = expireEmbedRecords(loadedEmbeds, now);
+		// E14: the same cleanup for each embed's own lists. A record with no overlap is passed on
+		// as the very same object, and the record's whole-embed `dormantSince` is never touched.
+		const embedCleaned = new Map<string, { host: string; before: RecordCounts }>();
+		const dedupedEmbeds = loadedEmbeds.map((record) => {
+			const deduped = dedupeFoldsDormant(record.folds, record.dormant);
+			if (deduped.removed === 0) return record;
+			embedCleaned.set(embedMapKey(record), { host: record.host, before: recordCounts(record) });
+			return { ...record, dormant: deduped.dormant };
+		});
+		const keptEmbeds = expireEmbedRecords(dedupedEmbeds, now);
 		this.embeds = new Map(keptEmbeds.map((record) => [embedMapKey(record), record]));
 		this.embedsRevision++;
 		this.dirty = false;
@@ -308,6 +335,27 @@ export class FoldStore {
 		// pruned) at load is written out by the ordinary debounce, so the file matches memory.
 		if (keptEmbeds.length !== loadedEmbeds.length || keptEmbeds.some((record, i) => record !== loadedEmbeds[i])) {
 			this.scheduleDebouncedFlush();
+		}
+		for (const record of keptEmbeds) {
+			const info = embedCleaned.get(embedMapKey(record));
+			if (info !== undefined) cleaned.push({ path: info.host, before: info.before, after: recordCounts(record) });
+		}
+		if (cleaned.length === 0) return;
+		// E14: the cleaned data is written back at once, not left to the debounce (which this
+		// cancels, so a T16 write-back for the same load is the same single write). One log line
+		// per cleaned record: paths and counts only (F4). Neither the log nor a failed write may
+		// stop the load.
+		for (const entry of cleaned) {
+			reportDiagnostic(
+				this.diagnosticLog,
+				diagnosticEntry({ path: entry.path, pass: "load-cleanup", outcome: "cleaned", editorLen: -1, before: entry.before, after: entry.after }),
+			);
+		}
+		this.dirty = true;
+		try {
+			await this.flush();
+		} catch (err) {
+			console.error("persistent-folded-state: flush failed", err);
 		}
 	}
 

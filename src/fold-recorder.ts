@@ -61,7 +61,10 @@ export const OWN_FOLD_ANNOTATION = Annotation.define<true>();
  * list, keyed by `anchorKey` — see the file comment (R4) for why that, rather than rewriting the
  * whole list from CM6's live fold set, is what keeps this to only the user's own change. A
  * stored entry that isn't a well-formed `Anchor` (a PR-2-era raw-text record) has no key to
- * carry over and is dropped here, the same as the store's own load-time sanitiser already does. */
+ * carry over and is dropped here, the same as the store's own load-time sanitiser already does.
+ *
+ * Warkworth-46 PR-4 (E15): a recorded fold also removes its anchor's key from `dormant` (so one
+ * anchor is never in both lists), and the stored `contentHash` carries over unchanged. */
 export function recordFoldEffects(store: FoldStore, path: string, tr: Transaction): void {
 	if (tr.annotation(OWN_FOLD_ANNOTATION)) return;
 
@@ -75,21 +78,37 @@ export function recordFoldEffects(store: FoldStore, path: string, tr: Transactio
 		if (anchor) folds.set(anchorKey(anchor), raw);
 	}
 
+	// E15: a fold makes its anchor active, so any set-aside copy of it goes. Collected over every
+	// fold effect in the transaction, including one that a later unfold in the same transaction
+	// undoes: the anchor is then in neither list, which is what CM6's own fold set shows too.
+	const revived = new Set<string>();
 	for (const effect of tr.effects) {
 		if (effect.is(foldEffect)) {
 			const anchor = describeFold(tr.state, effect.value);
-			folds.set(anchorKey(anchor), anchor as unknown as StoredAnchor);
+			const key = anchorKey(anchor);
+			folds.set(key, anchor as unknown as StoredAnchor);
+			revived.add(key);
 		} else if (effect.is(unfoldEffect)) {
 			const anchor = describeFold(tr.state, effect.value);
 			folds.delete(anchorKey(anchor));
 		}
 	}
 
-	// Each recorded fold or unfold also stores the note's current content hash, so a later PR
-	// (PR-7) can tell whether the file changed while Obsidian was closed.
+	// An unfold leaves `dormant` alone. An entry that is not a readable anchor has no key to
+	// compare, so it is carried over as it is.
+	const dormant = (existing?.dormant ?? []).filter((raw) => {
+		const parsed = parseAnchor(raw);
+		return parsed === null || !revived.has(anchorKey(parsed));
+	});
+
+	// E15: the recorder never rewrites an existing `contentHash`. That hash says which text the
+	// stored anchors were last matched against, and only the restore path (which has waited for
+	// the editor to hold the file's real text) may change it. A recorded fold made while the
+	// editor is still loading, or an untagged native restore, would otherwise stamp the hash of
+	// whatever the editor holds right now. Only a note with no record yet gets one, at creation.
 	store.set(path, {
-		contentHash: hashText(tr.state.doc.toString()),
+		contentHash: existing?.contentHash ?? hashText(tr.state.doc.toString()),
 		folds: Array.from(folds.values()),
-		dormant: existing?.dormant ?? [],
+		dormant,
 	});
 }

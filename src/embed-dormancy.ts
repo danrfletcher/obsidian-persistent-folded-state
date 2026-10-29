@@ -33,6 +33,7 @@
  */
 import { findEmbeds } from "./embed-key";
 import { isHeadingSubpath } from "./embed-lifecycle";
+import { diagnosticEntry, reportDiagnostic, type DiagnosticSink } from "./diagnostic-log";
 import { sliceEmbed } from "./embed-slice";
 import type { EmbedPresence } from "./embed-dormant";
 import type { EmbedFoldRecord } from "./types";
@@ -54,6 +55,20 @@ export interface EmbedDormancyDeps {
 	/** How long a heading-linked record seen absent or broken is left unstamped. Defaults to
 	 * `HEADING_RENAME_GRACE_MS`; a test sets 0 to turn the wait off. */
 	headingGraceMs?: number;
+	/** Warkworth-46 PR-3 (E19): settles whether a note that was read as `""` really is empty on disk
+	 * (`vault.adapter.read` is `""` and the stat size is 0). Resolves true only then; rejects when
+	 * the disk cannot be read. Optional: without it a `""` read is taken at its word, as before. */
+	confirmEmpty?: (path: string) => Promise<boolean>;
+	/** Warkworth-46 PR-3: where a refused empty read, or a failed confirming read, logs its one
+	 * `embed` line. Optional; fire and forget. */
+	diagnosticLog?: DiagnosticSink;
+}
+
+/** What `classifyEmbedRecord` reports when it declines to judge a record. */
+export interface EmbedReadRefusal {
+	outcome: "refused-empty" | "read-failed";
+	/** The note whose read was refused. */
+	path: string;
 }
 
 /** How long a record with a heading link, seen absent or broken, waits for a heading rename to
@@ -84,9 +99,10 @@ function recordKey(record: EmbedFoldRecord): string {
 export async function classifyEmbedRecord(
 	record: EmbedFoldRecord,
 	hostText: string,
-	deps: Pick<EmbedDormancyDeps, "readNote" | "resolveLink">,
+	deps: Pick<EmbedDormancyDeps, "readNote" | "resolveLink" | "confirmEmpty">,
 	reads: Map<string, Promise<string | null>> = new Map(),
-): Promise<EmbedPresence> {
+	refusals?: EmbedReadRefusal[],
+): Promise<EmbedPresence | undefined> {
 	const read = (path: string): Promise<string | null> => {
 		let hit = reads.get(path);
 		if (hit === undefined) {
@@ -106,6 +122,21 @@ export async function classifyEmbedRecord(
 		if (!present) return "absent";
 		const targetText = await read(link.target);
 		if (targetText === null) return "broken";
+		// Warkworth-46 PR-3 (E19): a note that reads as "" while its file is not empty is a note
+		// that has not loaded, not a broken embed. The record is not judged at all (`undefined`,
+		// "not assessed"), so nothing is stamped dormant on the strength of it. A note that is
+		// empty on disk too (E6) goes on to `sliceEmbed("")`, `broken`, as it always did.
+		if (targetText === "" && deps.confirmEmpty !== undefined) {
+			try {
+				if (!(await deps.confirmEmpty(link.target))) {
+					refusals?.push({ outcome: "refused-empty", path: link.target });
+					return undefined;
+				}
+			} catch {
+				refusals?.push({ outcome: "read-failed", path: link.target });
+				return undefined;
+			}
+		}
 		const slice = sliceEmbed(targetText, link.subpath);
 		if (slice === null) return "broken";
 		text = slice.text;
@@ -140,14 +171,19 @@ export class EmbedDormancyTracker {
 	async reconcileHost(hostPath: string, hostText: string): Promise<{ deferred: number }> {
 		const records = this.deps.store.embedRecordsForHost(hostPath);
 		if (records.length === 0) return { deferred: 0 };
+		// Warkworth-46 PR-3 (E19): a host read as "" while its file is not empty has not loaded; its
+		// embeds are not "absent", and nothing is reconciled on the strength of it.
+		if (hostText === "" && (await this.hostNotLoaded(hostPath, records))) return { deferred: 0 };
 		const presence = new Map<string, EmbedPresence | undefined>();
 		const reads = new Map<string, Promise<string | null>>();
+		const refusals: EmbedReadRefusal[] = [];
 		try {
-			for (const record of records) presence.set(recordKey(record), await classifyEmbedRecord(record, hostText, this.deps, reads));
+			for (const record of records) presence.set(recordKey(record), await classifyEmbedRecord(record, hostText, this.deps, reads, refusals));
 		} catch (err) {
 			console.error("persistent-folded-state: embed dormancy check failed", err);
 			return { deferred: 0 };
 		}
+		this.logRefusals(hostPath, hostText.length, records, refusals);
 		const deferred = this.holdHeadingRecords(hostPath, records, presence);
 		// A record created while the notes were being read was not assessed: it is left alone.
 		this.deps.store.reconcileEmbedDormancy(hostPath, (record) => presence.get(recordKey(record)));
@@ -171,6 +207,36 @@ export class EmbedDormancyTracker {
 			if (deferred > 0) this.scheduleOpenRecheck(hostPath);
 		} catch (err) {
 			console.error("persistent-folded-state: embed dormancy on open failed", err);
+		}
+	}
+
+	/** True when a host that read as `""` is not empty on disk (or cannot be confirmed to be): logs
+	 * the one `embed` line for it. False when there is no way to check, or the host is empty. */
+	private async hostNotLoaded(hostPath: string, records: EmbedFoldRecord[]): Promise<boolean> {
+		const confirm = this.deps.confirmEmpty;
+		if (confirm === undefined) return false;
+		try {
+			if (await confirm(hostPath)) return false;
+			this.logRefusals(hostPath, 0, records, [{ outcome: "refused-empty", path: hostPath }]);
+		} catch {
+			this.logRefusals(hostPath, 0, records, [{ outcome: "read-failed", path: hostPath }]);
+		}
+		return true;
+	}
+
+	/** One `embed` line per outcome, with the host's record counts (the same before and after: a
+	 * refusal changes nothing) and no note text. */
+	private logRefusals(hostPath: string, editorLen: number, records: EmbedFoldRecord[], refusals: EmbedReadRefusal[]): void {
+		const counts = { folds: 0, dormant: 0 };
+		for (const record of records) {
+			counts.folds += record.folds.length;
+			counts.dormant += record.dormant.length;
+		}
+		for (const outcome of new Set(refusals.map((r) => r.outcome))) {
+			reportDiagnostic(
+				this.deps.diagnosticLog,
+				diagnosticEntry({ path: hostPath, pass: "embed", outcome, editorLen, diskLen: outcome === "refused-empty" ? 0 : -1, before: counts, after: counts }),
+			);
 		}
 	}
 

@@ -126,10 +126,12 @@ import {
 	type DeferredFoldTarget,
 } from "./fold-restorer";
 import { buildBaseline } from "./baseline";
+import { checkPass, runSerialised, type LoadWaitIo, type PassGate } from "./load-wait";
 import { groupCandidatesByStartLine, liveFoldedLineRanges, resolveCandidateForLiveRange } from "./live-folds";
 import { anchorKey, buildAnchors, parseAnchor } from "./anchors";
 import { MAX_FOLDS, type MatcherOptions } from "./matcher";
 import type { FoldStore } from "./fold-store";
+import { diagnosticEntry, recordCounts, reportDiagnostic, type DiagnosticOutcome, type DiagnosticSink } from "./diagnostic-log";
 import type { StoredAnchor } from "./types";
 
 export interface EditorWatcherDeps {
@@ -162,6 +164,16 @@ export interface EditorWatcherDeps {
 	 * from any one `ViewPlugin` instance's own `destroyed` flag, which also goes true on an
 	 * ordinary single-pane CM6 reconfigure (T20) that must NOT suppress this recheck. */
 	disposed?: { current: boolean };
+	/** Warkworth-46 PR-1 (GP6): passed through to `restoreSettledChange`, which logs a `settled`
+	 * line whenever its pass changes stored data. Optional. */
+	diagnosticLog?: DiagnosticSink;
+	/** Warkworth-46 PR-3: the shared wait/guard (src/load-wait.ts) for the settled-change pass and
+	 * the first-open baseline. `gate` holds the passes that had to wait, keyed by the pane's
+	 * `EditorView`; `makeIo` builds a wait's view of the outside world for a pane (the pane's
+	 * file path is always read from the pane's own `editorInfoField`, whatever `makeIo` says).
+	 * Omitted by a caller with no vault to read (a unit test): both passes then run on the
+	 * pane's text at once, as they did before. */
+	loadGuard?: { gate: PassGate<EditorView>; makeIo: (view: EditorView, path: string) => LoadWaitIo };
 }
 
 function activeMarkdownPath(view: EditorView): string | null {
@@ -175,6 +187,21 @@ function activeMarkdownPath(view: EditorView): string | null {
  * since each `ViewPlugin` instance below carries its own per-view settle timer and deferred-fold
  * queue. */
 export function createEditorWatcher(deps: EditorWatcherDeps) {
+	/** PR-3 (E2): the live `ViewPlugin` instance of each pane. `EditorView.setState` replaces the
+	 * instance without a transaction; a wait left by the old one hands its result to the new one. */
+	const instances = new WeakMap<EditorView, EditorWatcherPlugin>();
+	/** PR-3: the text a settled pass that a wait released has just been run for, per pane. The
+	 * settle timer of the very change that ended the wait would otherwise run the same pass a
+	 * second time; it finds its text here and stands down once. */
+	const releasedFor = new WeakMap<EditorView, string>();
+
+	/** The wait's view of the outside world for `view`: whatever `makeIo` builds, except the pane's
+	 * file path, which this file reads from the pane's own state like every other check here. */
+	function ioFor(view: EditorView, path: string): LoadWaitIo {
+		const io = deps.loadGuard!.makeIo(view, path);
+		return { ...io, paneFilePath: () => activeMarkdownPath(view) };
+	}
+
 	class EditorWatcherPlugin implements PluginValue {
 		private readonly debouncer: SettleDebouncer<{ path: string; text: string }>;
 		private readonly view: EditorView;
@@ -197,44 +224,120 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 
 		constructor(view: EditorView) {
 			this.view = view;
+			instances.set(view, this);
 			this.debouncer = new SettleDebouncer(
 				({ path, text }) => {
 					deps.onSettledNonUserChange?.(path, text);
+					if (releasedFor.get(this.view) === text) {
+						releasedFor.delete(this.view); // the wait's release already ran this pass for this text
+						return;
+					}
 					this.runRestore(path, text);
 				},
 				deps.flushDelayMs ?? 150,
 				deps.window ?? window
 			);
 
+			// PR-3 (E2): text that arrives through `EditorView.setState` gives no transaction, so
+			// a wait this pane already has (left by the instance this one replaced) is looked at
+			// again now instead of at its next slow recheck.
+			deps.loadGuard?.gate.recheck(view);
+
 			// E5/G15: a brand-new pane for a Markdown file the store has never seen — adopt
-			// Obsidian's current fold state as the baseline, synchronously, before any
-			// transaction runs. See the file comment for why this is only one of the two
-			// places this same "no entry" case is handled.
+			// Obsidian's current fold state as the baseline before any transaction runs. See the
+			// file comment for why this is only one of the two places this same "no entry" case
+			// is handled. PR-3 (E18): with the load guard on, the baseline is adopted only once
+			// the pane holds the note's real text (it is adopted at once only when the pane
+			// already does, after one disk read), never from an empty or half-loaded document.
 			try {
 				const path = activeMarkdownPath(view);
 				if (path && !deps.store.get(path)) {
-					const text = view.state.doc.toString();
-					const baseline = buildBaseline(view.state, text);
-					deps.store.set(path, {
-						contentHash: baseline.contentHash,
-						folds: baseline.anchors as unknown as StoredAnchor[],
-						dormant: [],
-					});
-					// T20: when this ViewPlugin instance is created by Obsidian reconfiguring
-					// an *already-open* pane's CM6 extensions (the re-enable-over-an-open-pane
-					// path src/main.ts's T2 fix exists to exercise) rather than by a brand-new
-					// EditorView's own initial construction, a live fold that was genuinely
-					// already on screen at the moment of enabling has been observed missing
-					// from this synchronous read against real Obsidian (not reproducible
-					// against jsdom/CM6 directly, where a reconfigure's own fold state is
-					// already consistent by the time this constructor runs — see the T20
-					// issue). A short grace-period re-check, reading the view's live state
-					// again shortly afterwards and merging in (never removing) any live fold
-					// this first read didn't capture, guards against that without changing
-					// anything about the ordinary, already-reliable brand-new-pane path (there
-					// is nothing left to merge there).
-					this.scheduleFirstOpenGraceRecheck(path, text);
+					if (deps.loadGuard) void this.adoptBaselineWhenLoaded(path);
+					else this.adoptBaseline(path);
 				}
+			} catch (err) {
+				console.error("persistent-folded-state: first-open baseline failed", err);
+			}
+		}
+
+		/** Stores `path`'s first-open baseline from the pane as it is now, unless the store has
+		 * an entry for it by now or the pane has moved to another file. Dispatches nothing. */
+		private adoptBaseline(path: string): void {
+			const view = this.view;
+			if (deps.disposed?.current || deps.store.get(path) || activeMarkdownPath(view) !== path) return;
+			const text = view.state.doc.toString();
+			const baseline = buildBaseline(view.state, text);
+			deps.store.set(path, {
+				contentHash: baseline.contentHash,
+				folds: baseline.anchors as unknown as StoredAnchor[],
+				dormant: [],
+			});
+			// T20: when this ViewPlugin instance is created by Obsidian reconfiguring
+			// an *already-open* pane's CM6 extensions (the re-enable-over-an-open-pane
+			// path src/main.ts's T2 fix exists to exercise) rather than by a brand-new
+			// EditorView's own initial construction, a live fold that was genuinely
+			// already on screen at the moment of enabling has been observed missing
+			// from this synchronous read against real Obsidian (not reproducible
+			// against jsdom/CM6 directly, where a reconfigure's own fold state is
+			// already consistent by the time this constructor runs — see the T20
+			// issue). A short grace-period re-check, reading the view's live state
+			// again shortly afterwards and merging in (never removing) any live fold
+			// this first read didn't capture, guards against that without changing
+			// anything about the ordinary, already-reliable brand-new-pane path (there
+			// is nothing left to merge there). PR-3: only scheduled for a baseline taken from
+			// real text; an empty document has nothing to merge against.
+			if (text !== "") this.scheduleFirstOpenGraceRecheck(path, text);
+		}
+
+		/** PR-3 (E18): the guarded first-open baseline. Asks the shared guard whether the pane
+		 * holds `path`'s real text; adopts the baseline if so, otherwise leaves a wait that adopts
+		 * it when the text lands. Logs `pass: "baseline"` for a wait, a refusal, a give-up and a
+		 * failed read, and `applied` for a baseline adopted after a wait. Never throws. */
+		private async adoptBaselineWhenLoaded(path: string): Promise<void> {
+			const view = this.view;
+			const guard = deps.loadGuard;
+			if (!guard) return;
+			const log = (outcome: DiagnosticOutcome, editorLen: number, diskLen: number): void => {
+				const counts = recordCounts(deps.store.get(path));
+				reportDiagnostic(deps.diagnosticLog, diagnosticEntry({ path, pass: "baseline", outcome, editorLen, diskLen, before: counts, after: counts }));
+			};
+			try {
+				const io = ioFor(view, path);
+				const textAtCheck = view.state.doc.toString();
+				const check = await checkPass("baseline", path, textAtCheck, io);
+				const live = instances.get(view);
+				if (!live || deps.disposed?.current || deps.store.get(path) || activeMarkdownPath(view) !== path) return; // someone else won
+				// The text can change while the disk is read. A pane that changed under the check is
+				// not adopted from a verdict about text it no longer has: it waits like any other.
+				if (check.verdict.decision === "proceed" && view.state.doc.toString() === textAtCheck) {
+					live.adoptBaseline(path);
+					return;
+				}
+				if (check.verdict.decision === "read-failed") {
+					log("read-failed", check.editorLen, -1);
+					return;
+				}
+				const started = guard.gate.hold("baseline", view, path, io, {
+					ready: ({ diskLen }) => {
+						// The pane as it is now, not as the wait saw it: the user may have kept typing since.
+						const liveText = view.state.doc.toString();
+						if (liveText === "" && diskLen !== 0) {
+							log("refused-empty", 0, diskLen); // never a baseline from a pane the user emptied before it loaded
+							return;
+						}
+						const before = deps.store.get(path);
+						instances.get(view)?.adoptBaseline(path);
+						if (!before && deps.store.get(path)) {
+							const counts = recordCounts(deps.store.get(path));
+							reportDiagnostic(
+								deps.diagnosticLog,
+								diagnosticEntry({ path, pass: "baseline", outcome: "applied", editorLen: liveText.length, diskLen, before: recordCounts(undefined), after: counts }),
+							);
+						}
+					},
+					ended: ({ state, editorLen, diskLen }) => log(state, editorLen, diskLen),
+				});
+				if (started) log(check.verdict.outcome ?? "waiting", check.editorLen, check.diskLen);
 			} catch (err) {
 				console.error("persistent-folded-state: first-open baseline failed", err);
 			}
@@ -250,6 +353,9 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 		private scheduleFirstOpenGraceRecheck(path: string, textAtAdoption: string): void {
 			const win = deps.window ?? window;
 			const view = this.view;
+			// PR-3 (E18): never against an empty `textAtAdoption`. A baseline taken from an unloaded
+			// pane is not adopted at all (see `adoptBaselineWhenLoaded`); this is the second line.
+			if (textAtAdoption === "") return;
 			win.setTimeout(() => {
 				// R14: the whole Obsidian plugin may have unloaded since this timer was
 				// scheduled — checked first, ahead of any other liveness check. This is
@@ -315,17 +421,35 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 			}, deps.firstOpenGraceMs ?? 150);
 		}
 
-		private runRestore(path: string, text: string): void {
+		private runRestore(path: string, text: string, guardCleared = false): void {
 			const startGeneration = this.generation;
-			restoreSettledChange(this.view, path, text, {
-				store: deps.store,
-				matcherOptions: deps.matcherOptions,
-				window: deps.window ?? window,
-				getActivePath: activeMarkdownPath,
-				isSuperseded: () => this.generation !== startGeneration,
-				getChangesSinceSnapshot: () => this.changesSinceSnapshot ?? ChangeSet.empty(this.view.state.doc.length),
-				now: deps.now,
-			})
+			const view = this.view;
+			const guard = deps.loadGuard;
+			// PR-3: one restore pass at a time per pane (with the open pass too), so a settled pass
+			// released by the same text landing never writes the store while the open pass does.
+			runSerialised(view, () =>
+				restoreSettledChange(view, path, text, {
+					store: deps.store,
+					matcherOptions: deps.matcherOptions,
+					window: deps.window ?? window,
+					getActivePath: activeMarkdownPath,
+					isSuperseded: () => this.generation !== startGeneration,
+					getChangesSinceSnapshot: () => this.changesSinceSnapshot ?? ChangeSet.empty(this.view.state.doc.length),
+					now: deps.now,
+					diagnosticLog: deps.diagnosticLog,
+					guardCleared,
+					loadGuard: guard && {
+						gate: guard.gate,
+						makeIo: (p) => ioFor(view, p),
+						// E2: the instance that waited may have been replaced by `setState`; the live
+						// one runs the released pass, with the pane's text as it is when the wait ends.
+						rerun: (p, t) => {
+							releasedFor.set(view, t);
+							instances.get(view)?.runRestore(p, t, true);
+						},
+					},
+				}),
+			)
 				.then((deferred) => {
 					if (this.destroyed) return;
 					this.pendingDeferred = deferred;
@@ -372,7 +496,10 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 						// from *before* this settle don't leak into the next run's mapping.
 						this.generation++;
 						this.changesSinceSnapshot = ChangeSet.empty(tr.state.doc.length);
-						this.debouncer.trigger({ path, text: tr.state.doc.toString() });
+						const settledText = tr.state.doc.toString();
+						// A different text from the one a wait's release ran for: that marker is stale.
+						if (releasedFor.get(update.view) !== settledText) releasedFor.delete(update.view);
+						this.debouncer.trigger({ path, text: settledText });
 					} else if (tr.docChanged && this.changesSinceSnapshot) {
 						this.changesSinceSnapshot = this.changesSinceSnapshot.compose(tr.changes);
 					}

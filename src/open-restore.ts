@@ -8,6 +8,11 @@
  * construction regardless of why (including, concretely, every test harness in this repo that
  * builds a view directly against an already-seeded store). "A file actually became the active
  * one" is the narrower, Obsidian-level signal this feature needs; `file-open` is that signal.
+ * Warkworth-46 PR-2: `file-open` does not call this directly any more. A fresh pane's document is
+ * still empty when it fires, so `restoreOnOpenWhenLoaded` (src/open-wait.ts) waits until the pane
+ * shows this note's real text (src/load-wait.ts) and only then calls this with that text. The
+ * decision made here is unchanged, and `scheduleNativeRestoreGuard` below starts from inside it, so the guard
+ * now starts only after the wait ends.
  * The pane this runs against may be brand new, or may be the same pane CM6 happens to reuse for
  * a different file — either way, the entry the store already has for `path` (as opposed to no
  * entry at all, which stays `src/editor-watcher.ts`'s E5/G15 job) is what's being reconciled.
@@ -73,7 +78,7 @@ import { matchAnchors, type MatcherOptions, type MatchResult } from "./matcher";
 import { planRestore } from "./restore-plan";
 import { OWN_FOLD_ANNOTATION } from "./fold-recorder";
 import { hashText, type FoldStore } from "./fold-store";
-import { liveAnchorKeySet } from "./fold-restorer";
+import { liveAnchorKeySet, refreshMatchedFolds } from "./fold-restorer";
 import { needsRematchOnOpen, reconcileNativeRestore } from "./vault-lifecycle";
 import {
 	addDormant,
@@ -82,6 +87,8 @@ import {
 	splitDormantResults,
 	survivorsStillDormant,
 } from "./dormant";
+import { diagnosticEntry, recordCounts, reportDiagnostic, type DiagnosticSink } from "./diagnostic-log";
+import { normaliseLineEndings } from "./load-wait";
 import type { StoredAnchor } from "./types";
 
 export interface OpenRestoreDeps {
@@ -120,6 +127,14 @@ export interface OpenRestoreDeps {
 	 * for real) — the real schedule `scheduleNativeRestoreGuard` checks on, replacing
 	 * `NATIVE_RESTORE_GUARD_DELAYS_MS`'s own default when supplied. */
 	guardDelaysMs?: readonly number[];
+	/** Warkworth-46 PR-1 (GP6): where this pass logs its one diagnostic line. Optional; omitted
+	 * by every caller that does not collect the log. Fire and forget: the pass never waits on it
+	 * and a failure in it never reaches the pass. */
+	diagnosticLog?: DiagnosticSink;
+	/** Warkworth-46 PR-2: the length of the note's text on disk when the wait compared it with the
+	 * editor (src/load-wait.ts), for the log line only. Omitted by a caller that made no disk read;
+	 * the line then says -1. */
+	diskLen?: number;
 }
 
 function isFoldable(range: LineRange): boolean {
@@ -280,6 +295,42 @@ function cleanupSpuriousNativeFolds(
 	}
 }
 
+/** Warkworth-46 PR-3 (T1): puts back the stored anchor of a block this guard has just refolded
+ * because native restore had unfolded it. `src/fold-recorder.ts` records every untagged unfold as
+ * the user's own, so when native restore unfolds a block whose stored anchor is the block's
+ * current one (which a re-match now guarantees), the anchor is removed from `folds`. The guard
+ * is the one that knows that unfold was not the user's (a target it refolds is, by its own
+ * rules, one the user did not undo), so it restores the entry. A target whose anchor is still
+ * stored is left alone and nothing is written for it. */
+function restoreRefoldedAnchors(
+	store: FoldStore,
+	path: string,
+	candidates: readonly AnchoredBlock[],
+	refolded: readonly LineRange[],
+): void {
+	if (refolded.length === 0) return;
+	const latest = store.get(path);
+	if (!latest) return;
+
+	const folds = new Map<string, StoredAnchor>();
+	for (const raw of latest.folds) {
+		const anchor = parseAnchor(raw);
+		if (anchor) folds.set(anchorKey(anchor), raw);
+	}
+	let changed = false;
+	for (const range of refolded) {
+		const candidate = candidates.find((c) => sameRange(c.range, range));
+		if (!candidate) continue;
+		const key = anchorKey(candidate.anchor);
+		if (folds.has(key)) continue;
+		folds.set(key, candidate.anchor as unknown as StoredAnchor);
+		changed = true;
+	}
+	if (changed) {
+		store.set(path, { contentHash: latest.contentHash, folds: Array.from(folds.values()), dormant: latest.dormant });
+	}
+}
+
 function rangeKey(r: LineRange): string {
 	return `${r.startLine}:${r.endLine}`;
 }
@@ -309,7 +360,12 @@ function rangeKey(r: LineRange): string {
  * `foldTargets` that was live goes missing *in the same check a brand-new unprotected fold shows
  * up* — the one combination CM6 gives this guard any way to tell apart from an isolated user
  * fold/unfold of something it never matched (see this function's own file comment for why that
- * correlation, and not a wider "keep checking forever" rule, is the signal used). */
+ * correlation, and not a wider "keep checking forever" rule, is the signal used).
+ *
+ * Warkworth-46 PR-3: this is only ever started by `restoreOnOpen`, which the open pass runs after
+ * the shared wait (src/load-wait.ts) has ended with the pane holding the note's real text, so
+ * `delaysMs` is timed from the end of that wait, not from `file-open`. Every check then skips if the
+ * pane it resolves to shows other text (`onTextMismatch` tells the caller, which logs it once). */
 function scheduleNativeRestoreGuard(
 	view: EditorView,
 	expectedText: string,
@@ -323,6 +379,7 @@ function scheduleNativeRestoreGuard(
 	resolveView?: (path: string) => EditorView | null,
 	onLayoutReady?: (cb: () => void) => void,
 	delaysMs: readonly number[] = NATIVE_RESTORE_GUARD_DELAYS_MS,
+	onTextMismatch?: (editorLen: number) => void,
 ): void {
 	// Fold side: seeded with every target the preceding dispatch already left live on `view`
 	// itself (the usual case) — a target that later drops out of "live" after having been seen
@@ -345,7 +402,15 @@ function scheduleNativeRestoreGuard(
 		// this function's own file comment (T8) for why.
 		const live = resolveView?.(path) ?? view;
 		if (!live.dom.isConnected) return; // the pane was destroyed since this open
-		if (live.state.doc.toString() !== expectedText) return; // moved on (edit, or a different file)
+		// Warkworth-46 PR-3: compared after line-ending normalisation, the one rule every guarded
+		// pass uses (src/load-wait.ts). A pane showing other text (an edit, a different file, a
+		// half-loaded document) is skipped whole: nothing is folded or unfolded and `store.set`
+		// is never reached.
+		const liveText = live.state.doc.toString();
+		if (normaliseLineEndings(liveText) !== normaliseLineEndings(expectedText)) {
+			onTextMismatch?.(liveText.length);
+			return;
+		}
 		if (live !== lastView) {
 			lastView = live;
 			everLive.clear();
@@ -411,6 +476,10 @@ function scheduleNativeRestoreGuard(
 		}
 
 		dispatchFoldAndUnfold(live, toFold, toUnfold);
+		// T1: only on the churn correction, where a target that was live has just been unfolded
+		// by native restore and recorded as a user unfold; an ordinary first-time fold of a
+		// target already has its anchor stored, so nothing is written for it.
+		if (nativeChurn) restoreRefoldedAnchors(store, path, candidates, toFold);
 		if (toUnfold.length > 0) cleanupSpuriousNativeFolds(store, path, candidates, toUnfold);
 	};
 	for (const delay of delaysMs) {
@@ -459,8 +528,29 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 	if (!record) return; // defensive: callers only invoke this when an entry already exists
 
 	const currentHash = hashText(text);
+	// Warkworth-46 PR-1: the counts the log reports are read from the store before and after the
+	// pass (never the arrays themselves), and the line is written once the pass has finished.
+	const before = recordCounts(record);
+	const logPass = (outcome: "applied" | "rematched"): void =>
+		reportDiagnostic(
+			deps.diagnosticLog,
+			diagnosticEntry({ path, pass: "open", outcome, editorLen: text.length, diskLen: deps.diskLen, before, after: recordCounts(deps.store.get(path)) }),
+		);
+	// PR-3: one `native-guard` `waiting` line per open, the first time a check finds the pane
+	// showing other text. Counts are read at that moment; nothing is changed by the line.
+	let nativeGuardSkipLogged = false;
+	const logNativeGuardSkip = (editorLen: number): void => {
+		if (nativeGuardSkipLogged) return;
+		nativeGuardSkipLogged = true;
+		const counts = recordCounts(deps.store.get(path));
+		reportDiagnostic(
+			deps.diagnosticLog,
+			diagnosticEntry({ path, pass: "native-guard", outcome: "waiting", editorLen, diskLen: deps.diskLen, before: counts, after: counts }),
+		);
+	};
 	if (!needsRematchOnOpen(record.contentHash, currentHash)) {
 		applyStoredFoldsVerbatim(view, record.folds);
+		logPass("applied");
 		return;
 	}
 
@@ -496,8 +586,10 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 			deps.window ?? window,
 			deps.resolveView,
 			deps.onLayoutReady,
-			deps.guardDelaysMs
+			deps.guardDelaysMs,
+			logNativeGuardSkip,
 		);
+		logPass("rematched");
 		return;
 	}
 
@@ -585,17 +677,16 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 		win,
 		deps.resolveView,
 		deps.onLayoutReady,
-		deps.guardDelaysMs
+		deps.guardDelaysMs,
+		logNativeGuardSkip,
 	);
 
 	// Bookkeeping delta against a fresh store read (E3) — same discipline as restoreSettledChange.
 	const latest = deps.store.get(path);
 	if (latest) {
-		const activeFolds = new Map<string, StoredAnchor>();
-		for (const raw of latest.folds) {
-			const anchor = parseAnchor(raw);
-			if (anchor) activeFolds.set(anchorKey(anchor), raw);
-		}
+		// Warkworth-46 PR-3 (T1): matched folds are stored under their block's current anchor, so
+		// the next open (hash now unchanged, exact-key lookup) finds them again.
+		const activeFolds = refreshMatchedFolds(latest.folds, storedAnchors, matches, candidates);
 
 		let dormantList = stillDormant;
 		for (let i = 0; i < storedAnchors.length; i++) {
@@ -609,14 +700,15 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 		const actedDormantIdx = new Set<number>([...dormantPlan.toFold, ...dormantPlan.deferred].map((t) => t.anchorIndex));
 		for (let i = 0; i < dormantMatched.length; i++) {
 			const match = dormantMatched[i];
+			const fresh = candidates[match.candidateIndex]?.anchor ?? match.anchor;
 			if (actedDormantIdx.has(i)) {
-				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				activeFolds.set(anchorKey(fresh), fresh as unknown as StoredAnchor);
 				continue;
 			}
 			const candidate = candidates[match.candidateIndex];
 			const alreadyLive = candidate !== undefined && nativeFolded.some((r) => sameRange(r, candidate.range));
 			if (alreadyLive) {
-				activeFolds.set(anchorKey(match.anchor), match.anchor as unknown as StoredAnchor);
+				activeFolds.set(anchorKey(fresh), fresh as unknown as StoredAnchor);
 			} else {
 				dormantList = [...dormantList, match.anchor as unknown as StoredAnchor];
 			}
@@ -628,4 +720,5 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 			dormant: dormantList,
 		});
 	}
+	logPass("rematched");
 }

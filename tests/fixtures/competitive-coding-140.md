@@ -1,0 +1,424 @@
+# Competitive Coding Fundamentals
+
+Lesson tasks. Each lesson folds over its two child tasks.
+
+- [ ] Lesson 1: arrays part 1
+  - [ ] Read the notes for lesson 1
+  - [ ] Solve the practice set for lesson 1
+- [ ] Lesson 2: hashing part 1
+  - [ ] Read the notes for lesson 2
+  - [ ] Solve the practice set for lesson 2
+- [ ] Lesson 3: two pointers part 1
+  - [ ] Read the notes for lesson 3
+  - [ ] Solve the practice set for lesson 3
+- [ ] Lesson 4: sliding window part 1
+  - [ ] Read the notes for lesson 4
+  - [ ] Solve the practice set for lesson 4
+- [ ] Lesson 5: stacks part 1
+  - [ ] Read the notes for lesson 5
+  - [ ] Solve the practice set for lesson 5
+- [ ] Lesson 6: queues part 1
+  - [ ] Read the notes for lesson 6
+  - [ ] Solve the practice set for lesson 6
+- [ ] Lesson 7: linked lists part 1
+  - [ ] Read the notes for lesson 7
+  - [ ] Solve the practice set for lesson 7
+- [ ] Lesson 8: binary search part 1
+  - [ ] Read the notes for lesson 8
+  - [ ] Solve the practice set for lesson 8
+- [ ] Lesson 9: trees part 1
+  - [ ] Read the notes for lesson 9
+  - [ ] Solve the practice set for lesson 9
+- [ ] Lesson 10: heaps part 1
+  - [ ] Read the notes for lesson 10
+  - [ ] Solve the practice set for lesson 10
+- [ ] Lesson 11: graphs part 1
+  - [ ] Read the notes for lesson 11
+  - [ ] Solve the practice set for lesson 11
+- [ ] Lesson 12: dynamic programming part 1
+  - [ ] Read the notes for lesson 12
+  - [ ] Solve the practice set for lesson 12
+- [ ] Lesson 13: greedy part 1
+  - [ ] Read the notes for lesson 13
+  - [ ] Solve the practice set for lesson 13
+- [ ] Lesson 14: backtracking part 1
+  - [ ] Read the notes for lesson 14
+  - [ ] Solve the practice set for lesson 14
+- [ ] Lesson 15: tries part 1
+  - [ ] Read the notes for lesson 15
+  - [ ] Solve the practice set for lesson 15
+- [ ] Lesson 16: bit tricks part 1
+  - [ ] Read the notes for lesson 16
+  - [ ] Solve the practice set for lesson 16
+- [ ] Lesson 17: intervals part 1
+  - [ ] Read the notes for lesson 17
+  - [ ] Solve the practice set for lesson 17
+- [ ] Lesson 18: math part 1
+  - [ ] Read the notes for lesson 18
+  - [ ] Solve the practice set for lesson 18
+- [ ] Lesson 19: strings part 1
+  - [ ] Read the notes for lesson 19
+  - [ ] Solve the practice set for lesson 19
+- [ ] Lesson 20: sorting part 1
+  - [ ] Read the notes for lesson 20
+  - [ ] Solve the practice set for lesson 20
+- [ ] Lesson 21: arrays part 2
+  - [ ] Read the notes for lesson 21
+  - [ ] Solve the practice set for lesson 21
+- [ ] Lesson 22: hashing part 2
+  - [ ] Read the notes for lesson 22
+  - [ ] Solve the practice set for lesson 22
+- [ ] Lesson 23: two pointers part 2
+  - [ ] Read the notes for lesson 23
+  - [ ] Solve the practice set for lesson 23
+- [ ] Lesson 24: sliding window part 2
+  - [ ] Read the notes for lesson 24
+  - [ ] Solve the practice set for lesson 24
+- [ ] Lesson 25: stacks part 2
+  - [ ] Read the notes for lesson 25
+  - [ ] Solve the practice set for lesson 25
+- [ ] Lesson 26: queues part 2
+  - [ ] Read the notes for lesson 26
+  - [ ] Solve the practice set for lesson 26
+- [ ] Lesson 27: linked lists part 2
+  - [ ] Read the notes for lesson 27
+  - [ ] Solve the practice set for lesson 27
+- [ ] Lesson 28: binary search part 2
+  - [ ] Read the notes for lesson 28
+  - [ ] Solve the practice set for lesson 28
+- [ ] Lesson 29: trees part 2
+  - [ ] Read the notes for lesson 29
+  - [ ] Solve the practice set for lesson 29
+- [ ] Lesson 30: heaps part 2
+  - [ ] Read the notes for lesson 30
+  - [ ] Solve the practice set for lesson 30
+- [ ] Lesson 31: graphs part 2
+  - [ ] Read the notes for lesson 31
+  - [ ] Solve the practice set for lesson 31
+- [ ] Lesson 32: dynamic programming part 2
+  - [ ] Read the notes for lesson 32
+  - [ ] Solve the practice set for lesson 32
+- [ ] Lesson 33: greedy part 2
+  - [ ] Read the notes for lesson 33
+  - [ ] Solve the practice set for lesson 33
+- [ ] Lesson 34: backtracking part 2
+  - [ ] Read the notes for lesson 34
+  - [ ] Solve the practice set for lesson 34
+- [ ] Lesson 35: tries part 2
+  - [ ] Read the notes for lesson 35
+  - [ ] Solve the practice set for lesson 35
+- [ ] Lesson 36: bit tricks part 2
+  - [ ] Read the notes for lesson 36
+  - [ ] Solve the practice set for lesson 36
+- [ ] Lesson 37: intervals part 2
+  - [ ] Read the notes for lesson 37
+  - [ ] Solve the practice set for lesson 37
+- [ ] Lesson 38: math part 2
+  - [ ] Read the notes for lesson 38
+  - [ ] Solve the practice set for lesson 38
+- [ ] Lesson 39: strings part 2
+  - [ ] Read the notes for lesson 39
+  - [ ] Solve the practice set for lesson 39
+- [ ] Lesson 40: sorting part 2
+  - [ ] Read the notes for lesson 40
+  - [ ] Solve the practice set for lesson 40
+- [ ] Lesson 41: arrays part 3
+  - [ ] Read the notes for lesson 41
+  - [ ] Solve the practice set for lesson 41
+- [ ] Lesson 42: hashing part 3
+  - [ ] Read the notes for lesson 42
+  - [ ] Solve the practice set for lesson 42
+- [ ] Lesson 43: two pointers part 3
+  - [ ] Read the notes for lesson 43
+  - [ ] Solve the practice set for lesson 43
+- [ ] Lesson 44: sliding window part 3
+  - [ ] Read the notes for lesson 44
+  - [ ] Solve the practice set for lesson 44
+- [ ] Lesson 45: stacks part 3
+  - [ ] Read the notes for lesson 45
+  - [ ] Solve the practice set for lesson 45
+- [ ] Lesson 46: queues part 3
+  - [ ] Read the notes for lesson 46
+  - [ ] Solve the practice set for lesson 46
+- [ ] Lesson 47: linked lists part 3
+  - [ ] Read the notes for lesson 47
+  - [ ] Solve the practice set for lesson 47
+- [ ] Lesson 48: binary search part 3
+  - [ ] Read the notes for lesson 48
+  - [ ] Solve the practice set for lesson 48
+- [ ] Lesson 49: trees part 3
+  - [ ] Read the notes for lesson 49
+  - [ ] Solve the practice set for lesson 49
+- [ ] Lesson 50: heaps part 3
+  - [ ] Read the notes for lesson 50
+  - [ ] Solve the practice set for lesson 50
+- [ ] Lesson 51: graphs part 3
+  - [ ] Read the notes for lesson 51
+  - [ ] Solve the practice set for lesson 51
+- [ ] Lesson 52: dynamic programming part 3
+  - [ ] Read the notes for lesson 52
+  - [ ] Solve the practice set for lesson 52
+- [ ] Lesson 53: greedy part 3
+  - [ ] Read the notes for lesson 53
+  - [ ] Solve the practice set for lesson 53
+- [ ] Lesson 54: backtracking part 3
+  - [ ] Read the notes for lesson 54
+  - [ ] Solve the practice set for lesson 54
+- [ ] Lesson 55: tries part 3
+  - [ ] Read the notes for lesson 55
+  - [ ] Solve the practice set for lesson 55
+- [ ] Lesson 56: bit tricks part 3
+  - [ ] Read the notes for lesson 56
+  - [ ] Solve the practice set for lesson 56
+- [ ] Lesson 57: intervals part 3
+  - [ ] Read the notes for lesson 57
+  - [ ] Solve the practice set for lesson 57
+- [ ] Lesson 58: math part 3
+  - [ ] Read the notes for lesson 58
+  - [ ] Solve the practice set for lesson 58
+- [ ] Lesson 59: strings part 3
+  - [ ] Read the notes for lesson 59
+  - [ ] Solve the practice set for lesson 59
+- [ ] Lesson 60: sorting part 3
+  - [ ] Read the notes for lesson 60
+  - [ ] Solve the practice set for lesson 60
+- [ ] Lesson 61: arrays part 4
+  - [ ] Read the notes for lesson 61
+  - [ ] Solve the practice set for lesson 61
+- [ ] Lesson 62: hashing part 4
+  - [ ] Read the notes for lesson 62
+  - [ ] Solve the practice set for lesson 62
+- [ ] Lesson 63: two pointers part 4
+  - [ ] Read the notes for lesson 63
+  - [ ] Solve the practice set for lesson 63
+- [ ] Lesson 64: sliding window part 4
+  - [ ] Read the notes for lesson 64
+  - [ ] Solve the practice set for lesson 64
+- [ ] Lesson 65: stacks part 4
+  - [ ] Read the notes for lesson 65
+  - [ ] Solve the practice set for lesson 65
+- [ ] Lesson 66: queues part 4
+  - [ ] Read the notes for lesson 66
+  - [ ] Solve the practice set for lesson 66
+- [ ] Lesson 67: linked lists part 4
+  - [ ] Read the notes for lesson 67
+  - [ ] Solve the practice set for lesson 67
+- [ ] Lesson 68: binary search part 4
+  - [ ] Read the notes for lesson 68
+  - [ ] Solve the practice set for lesson 68
+- [ ] Lesson 69: trees part 4
+  - [ ] Read the notes for lesson 69
+  - [ ] Solve the practice set for lesson 69
+- [ ] Lesson 70: heaps part 4
+  - [ ] Read the notes for lesson 70
+  - [ ] Solve the practice set for lesson 70
+- [ ] Lesson 71: graphs part 4
+  - [ ] Read the notes for lesson 71
+  - [ ] Solve the practice set for lesson 71
+- [ ] Lesson 72: dynamic programming part 4
+  - [ ] Read the notes for lesson 72
+  - [ ] Solve the practice set for lesson 72
+- [ ] Lesson 73: greedy part 4
+  - [ ] Read the notes for lesson 73
+  - [ ] Solve the practice set for lesson 73
+- [ ] Lesson 74: backtracking part 4
+  - [ ] Read the notes for lesson 74
+  - [ ] Solve the practice set for lesson 74
+- [ ] Lesson 75: tries part 4
+  - [ ] Read the notes for lesson 75
+  - [ ] Solve the practice set for lesson 75
+- [ ] Lesson 76: bit tricks part 4
+  - [ ] Read the notes for lesson 76
+  - [ ] Solve the practice set for lesson 76
+- [ ] Lesson 77: intervals part 4
+  - [ ] Read the notes for lesson 77
+  - [ ] Solve the practice set for lesson 77
+- [ ] Lesson 78: math part 4
+  - [ ] Read the notes for lesson 78
+  - [ ] Solve the practice set for lesson 78
+- [ ] Lesson 79: strings part 4
+  - [ ] Read the notes for lesson 79
+  - [ ] Solve the practice set for lesson 79
+- [ ] Lesson 80: sorting part 4
+  - [ ] Read the notes for lesson 80
+  - [ ] Solve the practice set for lesson 80
+- [ ] Lesson 81: arrays part 5
+  - [ ] Read the notes for lesson 81
+  - [ ] Solve the practice set for lesson 81
+- [ ] Lesson 82: hashing part 5
+  - [ ] Read the notes for lesson 82
+  - [ ] Solve the practice set for lesson 82
+- [ ] Lesson 83: two pointers part 5
+  - [ ] Read the notes for lesson 83
+  - [ ] Solve the practice set for lesson 83
+- [ ] Lesson 84: sliding window part 5
+  - [ ] Read the notes for lesson 84
+  - [ ] Solve the practice set for lesson 84
+- [ ] Lesson 85: stacks part 5
+  - [ ] Read the notes for lesson 85
+  - [ ] Solve the practice set for lesson 85
+- [ ] Lesson 86: queues part 5
+  - [ ] Read the notes for lesson 86
+  - [ ] Solve the practice set for lesson 86
+- [ ] Lesson 87: linked lists part 5
+  - [ ] Read the notes for lesson 87
+  - [ ] Solve the practice set for lesson 87
+- [ ] Lesson 88: binary search part 5
+  - [ ] Read the notes for lesson 88
+  - [ ] Solve the practice set for lesson 88
+- [ ] Lesson 89: trees part 5
+  - [ ] Read the notes for lesson 89
+  - [ ] Solve the practice set for lesson 89
+- [ ] Lesson 90: heaps part 5
+  - [ ] Read the notes for lesson 90
+  - [ ] Solve the practice set for lesson 90
+- [ ] Lesson 91: graphs part 5
+  - [ ] Read the notes for lesson 91
+  - [ ] Solve the practice set for lesson 91
+- [ ] Lesson 92: dynamic programming part 5
+  - [ ] Read the notes for lesson 92
+  - [ ] Solve the practice set for lesson 92
+- [ ] Lesson 93: greedy part 5
+  - [ ] Read the notes for lesson 93
+  - [ ] Solve the practice set for lesson 93
+- [ ] Lesson 94: backtracking part 5
+  - [ ] Read the notes for lesson 94
+  - [ ] Solve the practice set for lesson 94
+- [ ] Lesson 95: tries part 5
+  - [ ] Read the notes for lesson 95
+  - [ ] Solve the practice set for lesson 95
+- [ ] Lesson 96: bit tricks part 5
+  - [ ] Read the notes for lesson 96
+  - [ ] Solve the practice set for lesson 96
+- [ ] Lesson 97: intervals part 5
+  - [ ] Read the notes for lesson 97
+  - [ ] Solve the practice set for lesson 97
+- [ ] Lesson 98: math part 5
+  - [ ] Read the notes for lesson 98
+  - [ ] Solve the practice set for lesson 98
+- [ ] Lesson 99: strings part 5
+  - [ ] Read the notes for lesson 99
+  - [ ] Solve the practice set for lesson 99
+- [ ] Lesson 100: sorting part 5
+  - [ ] Read the notes for lesson 100
+  - [ ] Solve the practice set for lesson 100
+- [ ] Lesson 101: arrays part 6
+  - [ ] Read the notes for lesson 101
+  - [ ] Solve the practice set for lesson 101
+- [ ] Lesson 102: hashing part 6
+  - [ ] Read the notes for lesson 102
+  - [ ] Solve the practice set for lesson 102
+- [ ] Lesson 103: two pointers part 6
+  - [ ] Read the notes for lesson 103
+  - [ ] Solve the practice set for lesson 103
+- [ ] Lesson 104: sliding window part 6
+  - [ ] Read the notes for lesson 104
+  - [ ] Solve the practice set for lesson 104
+- [ ] Lesson 105: stacks part 6
+  - [ ] Read the notes for lesson 105
+  - [ ] Solve the practice set for lesson 105
+- [ ] Lesson 106: queues part 6
+  - [ ] Read the notes for lesson 106
+  - [ ] Solve the practice set for lesson 106
+- [ ] Lesson 107: linked lists part 6
+  - [ ] Read the notes for lesson 107
+  - [ ] Solve the practice set for lesson 107
+- [ ] Lesson 108: binary search part 6
+  - [ ] Read the notes for lesson 108
+  - [ ] Solve the practice set for lesson 108
+- [ ] Lesson 109: trees part 6
+  - [ ] Read the notes for lesson 109
+  - [ ] Solve the practice set for lesson 109
+- [ ] Lesson 110: heaps part 6
+  - [ ] Read the notes for lesson 110
+  - [ ] Solve the practice set for lesson 110
+- [ ] Lesson 111: graphs part 6
+  - [ ] Read the notes for lesson 111
+  - [ ] Solve the practice set for lesson 111
+- [ ] Lesson 112: dynamic programming part 6
+  - [ ] Read the notes for lesson 112
+  - [ ] Solve the practice set for lesson 112
+- [ ] Lesson 113: greedy part 6
+  - [ ] Read the notes for lesson 113
+  - [ ] Solve the practice set for lesson 113
+- [ ] Lesson 114: backtracking part 6
+  - [ ] Read the notes for lesson 114
+  - [ ] Solve the practice set for lesson 114
+- [ ] Lesson 115: tries part 6
+  - [ ] Read the notes for lesson 115
+  - [ ] Solve the practice set for lesson 115
+- [ ] Lesson 116: bit tricks part 6
+  - [ ] Read the notes for lesson 116
+  - [ ] Solve the practice set for lesson 116
+- [ ] Lesson 117: intervals part 6
+  - [ ] Read the notes for lesson 117
+  - [ ] Solve the practice set for lesson 117
+- [ ] Lesson 118: math part 6
+  - [ ] Read the notes for lesson 118
+  - [ ] Solve the practice set for lesson 118
+- [ ] Lesson 119: strings part 6
+  - [ ] Read the notes for lesson 119
+  - [ ] Solve the practice set for lesson 119
+- [ ] Lesson 120: sorting part 6
+  - [ ] Read the notes for lesson 120
+  - [ ] Solve the practice set for lesson 120
+- [ ] Lesson 121: arrays part 7
+  - [ ] Read the notes for lesson 121
+  - [ ] Solve the practice set for lesson 121
+- [ ] Lesson 122: hashing part 7
+  - [ ] Read the notes for lesson 122
+  - [ ] Solve the practice set for lesson 122
+- [ ] Lesson 123: two pointers part 7
+  - [ ] Read the notes for lesson 123
+  - [ ] Solve the practice set for lesson 123
+- [ ] Lesson 124: sliding window part 7
+  - [ ] Read the notes for lesson 124
+  - [ ] Solve the practice set for lesson 124
+- [ ] Lesson 125: stacks part 7
+  - [ ] Read the notes for lesson 125
+  - [ ] Solve the practice set for lesson 125
+- [ ] Lesson 126: queues part 7
+  - [ ] Read the notes for lesson 126
+  - [ ] Solve the practice set for lesson 126
+- [ ] Lesson 127: linked lists part 7
+  - [ ] Read the notes for lesson 127
+  - [ ] Solve the practice set for lesson 127
+- [ ] Lesson 128: binary search part 7
+  - [ ] Read the notes for lesson 128
+  - [ ] Solve the practice set for lesson 128
+- [ ] Lesson 129: trees part 7
+  - [ ] Read the notes for lesson 129
+  - [ ] Solve the practice set for lesson 129
+- [ ] Lesson 130: heaps part 7
+  - [ ] Read the notes for lesson 130
+  - [ ] Solve the practice set for lesson 130
+- [ ] Lesson 131: graphs part 7
+  - [ ] Read the notes for lesson 131
+  - [ ] Solve the practice set for lesson 131
+- [ ] Lesson 132: dynamic programming part 7
+  - [ ] Read the notes for lesson 132
+  - [ ] Solve the practice set for lesson 132
+- [ ] Lesson 133: greedy part 7
+  - [ ] Read the notes for lesson 133
+  - [ ] Solve the practice set for lesson 133
+- [ ] Lesson 134: backtracking part 7
+  - [ ] Read the notes for lesson 134
+  - [ ] Solve the practice set for lesson 134
+- [ ] Lesson 135: tries part 7
+  - [ ] Read the notes for lesson 135
+  - [ ] Solve the practice set for lesson 135
+- [ ] Lesson 136: bit tricks part 7
+  - [ ] Read the notes for lesson 136
+  - [ ] Solve the practice set for lesson 136
+- [ ] Lesson 137: intervals part 7
+  - [ ] Read the notes for lesson 137
+  - [ ] Solve the practice set for lesson 137
+- [ ] Lesson 138: math part 7
+  - [ ] Read the notes for lesson 138
+  - [ ] Solve the practice set for lesson 138
+- [ ] Lesson 139: strings part 7
+  - [ ] Read the notes for lesson 139
+  - [ ] Solve the practice set for lesson 139
+- [ ] Lesson 140: sorting part 7
+  - [ ] Read the notes for lesson 140
+  - [ ] Solve the practice set for lesson 140

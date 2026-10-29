@@ -502,3 +502,59 @@ describe("embedLevels and describeArrows over a real DOM", () => {
 		container.remove();
 	});
 });
+
+describe("applyEmbedFold and the embed's dormant list (warkworth-46 E15)", () => {
+	const setAside = (anchor: StoredAnchorLike, since: number) => ({ ...anchor, dormantSince: since });
+	const withDormant = (folds: StoredAnchorLike[], dormant: Record<string, unknown>[]): EmbedFoldRecord => ({
+		host: "Host.md",
+		target: "Lessons.md",
+		subpath: "",
+		occurrence: 0,
+		contentHash: "h1",
+		folds,
+		dormant,
+	});
+
+	it("a fold removes that anchor's key from dormant and keeps it once in folds", () => {
+		const existing = withDormant([LESSON_1], [setAside(LESSON_2, 500)]);
+		const next = applyEmbedFold(existing, IDENTITY, "h1", LESSON_2, true);
+		expect(next?.dormant).toEqual([]);
+		expect(next?.folds).toEqual([LESSON_1, LESSON_2]);
+	});
+
+	it("only the folded key leaves dormant; another set-aside anchor keeps its dormantSince and place", () => {
+		const existing = withDormant([], [setAside(LESSON_3, 700), setAside(LESSON_2, 500), setAside(COUNT, 900)]);
+		const next = applyEmbedFold(existing, IDENTITY, "h1", LESSON_2, true);
+		expect(next?.dormant).toEqual([
+			{ kind: "task", indent: 0, text: "lesson 3: graphs", siblingIndex: 2, parentChain: [], dormantSince: 700 },
+			{ kind: "task", indent: 2, text: "count word frequency", siblingIndex: 0, parentChain: [{ kind: "task", text: "lesson 2: maps" }], dormantSince: 900 },
+		]);
+	});
+
+	it("a fold of an anchor already in folds whose dormant copy is still there is a change, not null", () => {
+		const existing = withDormant([LESSON_1], [setAside(LESSON_1, 500)]);
+		const next = applyEmbedFold(existing, IDENTITY, "h1", LESSON_1, true);
+		expect(next).not.toBeNull();
+		expect(next?.dormant).toEqual([]);
+		expect(next?.folds).toEqual([LESSON_1]);
+	});
+
+	it("an unfold leaves dormant exactly as it was", () => {
+		const existing = withDormant([LESSON_1, LESSON_2], [setAside(LESSON_2, 500), setAside(LESSON_3, 700)]);
+		const next = applyEmbedFold(existing, IDENTITY, "h1", LESSON_2, false);
+		expect(next?.folds).toEqual([LESSON_1]);
+		expect(next?.dormant).toEqual([setAside(LESSON_2, 500), setAside(LESSON_3, 700)]);
+	});
+
+	it("the no-change case still returns null when nothing changed in either list", () => {
+		const existing = withDormant([LESSON_1], [setAside(LESSON_3, 700)]);
+		expect(applyEmbedFold(existing, IDENTITY, "h1", LESSON_1, true)).toBeNull();
+		expect(applyEmbedFold(existing, IDENTITY, "h1", LESSON_2, false)).toBeNull();
+	});
+
+	it("a dormant entry that is not a readable anchor is carried over, not dropped and not thrown on", () => {
+		const existing = withDormant([], [{ junk: true }, setAside(LESSON_2, 500)]);
+		const next = applyEmbedFold(existing, IDENTITY, "h1", LESSON_2, true);
+		expect(next?.dormant).toEqual([{ junk: true }]);
+	});
+});

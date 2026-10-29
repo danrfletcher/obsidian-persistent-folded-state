@@ -98,15 +98,32 @@
  * also calls `pruneOrphanEmbeds`. A heading renamed inside Obsidian is noticed from the metadata
  * cache (`EmbedHeadingRenameTracker`, src/embed-heading-rename.ts), which only reads it. Nothing
  * here writes to a note, and none of it goes through the dormancy tracker.
+ *
+ * Warkworth-46 PR-1 (GP6, F4, F6): an always-on diagnostic log. `DiagnosticLogWriter`
+ * (src/diagnostic-log-writer.ts) appends one JSON line per logged restore pass to
+ * `diagnostic-log.jsonl` in this plugin's own folder, through the vault adapter, and the one new
+ * command, "Copy diagnostic log", copies it. `restoreOnOpen`, `restoreSettledChange` (through the
+ * editor watcher) and the embed restorer each get the writer's `log` as an optional sink; none
+ * waits on it. No setting turns it off and no other UI is added.
+ *
+ * Warkworth-46 PR-2 (E1, E4, E5, E10-E13, E17): the `file-open` handler below no longer reads the
+ * pane's text itself (it is still empty at that moment on a fresh pane). `restoreOnOpenWhenLoaded`
+ * (src/open-wait.ts) starts a per-pane wait (src/load-wait.ts, src/load-wait-host.ts) and calls
+ * `restoreOnOpen` only once the pane shows the right note with its real text. `loadWaits` holds
+ * those waits; `onunload()` cancels them all.
  */
 import { Events, Plugin } from "obsidian";
 import type { TFile } from "obsidian";
 import type { EditorView } from "@codemirror/view";
 import { FoldStore } from "./fold-store";
-import { registerForgetNoteFoldsCommand } from "./commands";
+import { registerCopyDiagnosticLogCommand, registerForgetNoteFoldsCommand } from "./commands";
+import { DiagnosticLogWriter } from "./diagnostic-log-writer";
+import type { DiagnosticSink } from "./diagnostic-log";
 import { PersistentFoldedStateSettingTab } from "./settings-tab";
 import { createEditorWatcher } from "./editor-watcher";
-import { restoreOnOpen } from "./open-restore";
+import { restoreOnOpenWhenLoaded } from "./open-wait";
+import { LoadWaitRegistry, PassGate, normaliseLineEndings } from "./load-wait";
+import { createLoadWaitIo } from "./load-wait-host";
 import { EmbedFoldRecorder } from "./embed-fold-recorder";
 import { EmbedFoldRestorer } from "./embed-fold-restorer";
 import { EmbedDormancyTracker } from "./embed-dormancy";
@@ -134,11 +151,30 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	private embedRestorer: EmbedFoldRestorer | null = null;
 	/** PR-7: the dormancy tracker, kept so `onunload()` can cancel its pending second looks. */
 	private dormancy: EmbedDormancyTracker | null = null;
+	/** Warkworth-46 PR-2: one live wait per pane for the editor to hold the note's real text before
+	 * the open pass runs. Every pending wait is cancelled in `onunload()`. */
+	private readonly loadWaits = new LoadWaitRegistry<EditorView>();
+	/** PR-3: the waits of the settled-change and first-open-baseline passes, apart from `loadWaits`
+	 * (starting one for a pane cancels that pane's earlier one, and these must not cancel an open pass). */
+	private readonly passGate = new PassGate<EditorView>();
+	/** Warkworth-46 PR-1: the diagnostic log writer. Created in `onload()`, drained in `onunload()`. */
+	diagnosticLog: DiagnosticLogWriter | null = null;
 
 	async onload(): Promise<void> {
+		// Warkworth-46 PR-1: the log lives in this plugin's own folder. `manifest.dir` is optional
+		// in Obsidian's typings; the same folder is rebuilt from the config folder when absent.
+		// PR-4: made before the store loads, so the load-time cleanup can log its line.
+		const logWriter = new DiagnosticLogWriter(
+			this.app.vault.adapter,
+			this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+		);
+		this.diagnosticLog = logWriter;
+		const diagnosticSink: DiagnosticSink = (entry) => logWriter.log(entry);
+
 		this.store = new FoldStore({
 			loadData: () => this.loadData(),
 			saveData: (data) => this.saveData(data),
+			diagnosticLog: diagnosticSink,
 		});
 		await this.store.load();
 
@@ -172,12 +208,18 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		});
 
 		registerForgetNoteFoldsCommand(this);
+		registerCopyDiagnosticLogCommand(this, logWriter);
 		this.addSettingTab(new PersistentFoldedStateSettingTab(this.app, this));
 		this.registerEditorExtension(
 			createEditorWatcher({
 				store: this.store,
 				onSettledNonUserChange: (path, text) => this.events.trigger(SETTLED_NON_USER_CHANGE_EVENT, path, text),
 				disposed: this.editorWatcherDisposed,
+				diagnosticLog: diagnosticSink,
+				loadGuard: {
+					gate: this.passGate,
+					makeIo: (view) => createLoadWaitIo({ app: this.app, view }),
+				},
 			})
 		);
 		// T2: forces every already-open pane onto the extension just registered above (and
@@ -205,6 +247,14 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		const readNote = async (path: string): Promise<string | null> => {
 			const file = this.app.vault.getFileByPath(path);
 			return file === null ? null : await this.app.vault.cachedRead(file);
+		};
+		// Warkworth-46 PR-3 (E19): a note that `readNote` gave as "" is empty only if the disk says so
+		// too: `adapter.read` is "" and the stat size is 0. Rejects when the disk cannot be read.
+		const confirmEmpty = async (path: string): Promise<boolean> => {
+			const adapter = this.app.vault.adapter;
+			if (normaliseLineEndings(await adapter.read(path)) !== "") return false;
+			const stat = await adapter.stat(path);
+			return stat !== null && stat.size === 0;
 		};
 		const resolveLink = (linktext: string, sourcePath: string): string | null =>
 			this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath)?.path ?? null;
@@ -238,7 +288,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 
 		// PR-7 (G6, E6): a retargeted or broken embed's stored state goes dormant for 10 minutes,
 		// then is forgotten. Read-only toward the vault; never called from a rename handler.
-		const dormancy = new EmbedDormancyTracker({ store: this.store, readNote, resolveLink });
+		const dormancy = new EmbedDormancyTracker({ store: this.store, readNote, resolveLink, confirmEmpty, diagnosticLog: diagnosticSink });
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file: TFile | null) => {
 				if (!file) return;
@@ -259,6 +309,8 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 			positionOf,
 			whenRecorded: () => recorder.whenIdle(),
 			dormancy,
+			diagnosticLog: diagnosticSink,
+			confirmEmpty,
 		});
 		this.embedRestorer = restorer;
 		restorer.attach(document);
@@ -307,9 +359,12 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 					if (!info || info.file?.path !== file.path) return;
 					const cm = (info.editor as unknown as { cm?: EditorView } | undefined)?.cm;
 					if (!cm) return;
-					const text = cm.state.doc.toString();
-					restoreOnOpen(cm, file.path, text, {
+					// Warkworth-46 PR-2: the pane's document is still empty when file-open fires, so
+					// its text is not read here. The pass runs once the wait sees the real text.
+					restoreOnOpenWhenLoaded(cm, file.path, {
 						store: this.store,
+						registry: this.loadWaits,
+						makeIo: (view) => createLoadWaitIo({ app: this.app, view }),
 						// T8: resolved fresh on every scheduleNativeRestoreGuard check, not
 						// just once here — see src/open-restore.ts's OpenRestoreDeps comment
 						// for why a view captured only at file-open time was found, live,
@@ -321,6 +376,7 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 						},
 						onLayoutReady: (cb) => this.app.workspace.onLayoutReady(cb),
 						guardDelaysMs: this.guardDelaysMs,
+						diagnosticLog: diagnosticSink,
 					}).catch((err: unknown) => {
 						console.error("persistent-folded-state: open restore failed", err);
 					});
@@ -334,6 +390,10 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 	onunload(): void {
 		// R14: must run before `flushAtOnce()` can do anything async — see the file comment.
 		this.editorWatcherDisposed.current = true;
+		// Warkworth-46 PR-2: a wait still pending runs no pass, writes no log line and leaves no
+		// timer or listener behind.
+		this.loadWaits.cancelAll();
+		this.passGate.cancelAll();
 		// E9: no embed listener or observer outlives the plugin, and nothing queued is recorded.
 		this.embedRecorder?.dispose();
 		this.embedRecorder = null;
@@ -341,6 +401,10 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		this.embedRestorer = null;
 		this.dormancy?.dispose();
 		this.dormancy = null;
+		// Warkworth-46 PR-1: lines already queued are still written (drain never rejects); a
+		// re-enabled plugin builds a new writer that keeps appending to the same file.
+		void this.diagnosticLog?.drain();
+		this.diagnosticLog = null;
 		this.flushAtOnce();
 	}
 

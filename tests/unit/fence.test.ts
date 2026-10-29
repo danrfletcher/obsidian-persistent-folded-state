@@ -24,6 +24,17 @@ function listFiles(dir: string): string[] {
 const srcFiles = listFiles(SRC).filter((f) => f.endsWith(".ts"));
 const srcText = srcFiles.map((f) => readFileSync(f, "utf8")).join("\n");
 
+// Warkworth-46 PR-1 (F3, F6): the diagnostic log adds exactly one command ("Copy diagnostic log",
+// in src/commands.ts beside the forget command) and exactly one adapter write site (the log
+// writer). Each pin below is narrowed to allow just those; anything else still fails.
+const LOG_WRITER = join(SRC, "diagnostic-log-writer.ts");
+const srcTextOutsideLogWriter = srcFiles
+	.filter((f) => f !== LOG_WRITER)
+	.map((f) => readFileSync(f, "utf8"))
+	.join("\n");
+const COMMANDS_FILE = join(SRC, "commands.ts");
+const addCommandSites = (text: string): number => (text.match(/\.addCommand\s*\(/g) ?? []).length;
+
 const FORBIDDEN: { label: string; pattern: RegExp }[] = [
 	{ label: "fetch(", pattern: /\bfetch\s*\(/ },
 	{ label: "XMLHttpRequest", pattern: /\bXMLHttpRequest\b/ },
@@ -54,9 +65,9 @@ describe("fence: no extra UI surface beyond this PR's command/button/modal (F7)"
 		expect(srcText).not.toMatch(pattern);
 	});
 
-	it("registers exactly one command (one addCommand call site)", () => {
-		const matches = srcText.match(/\.addCommand\s*\(/g) ?? [];
-		expect(matches).toHaveLength(1);
+	it("registers exactly two commands (two addCommand call sites, both in src/commands.ts)", () => {
+		expect(addCommandSites(srcText)).toBe(2);
+		expect(addCommandSites(readFileSync(COMMANDS_FILE, "utf8"))).toBe(2);
 	});
 
 	it("defines exactly one Modal subclass (the forget-all confirmation)", () => {
@@ -75,19 +86,26 @@ describe("fence: no extra UI surface beyond this PR's command/button/modal (F7)"
 // module reached for, by any src file (including ones added later in this stack).
 const NO_NEW_FILES_OR_NETWORK: { label: string; pattern: RegExp }[] = [
 	{ label: "node:fs import", pattern: /from\s+[\"'](node:)?fs(\/promises)?[\"']/ },
-	{ label: "adapter write/mkdir/append/remove/rename", pattern: /\badapter\.(write|writeBinary|append|appendBinary|mkdir|rmdir|remove|rename|copy)\w*\s*\(/ },
+	// Warkworth-46 PR-1: checked against src/ without the log writer (the only allowed site),
+	// see `ADAPTER_WRITE` and its tests below.
 	{ label: "vault.createFolder/createBinary/copy/rename/delete/trash", pattern: /\bvault\.(createFolder|createBinary|copy|rename|delete|trash)\s*\(/ },
 	{ label: "fileManager.renameFile/trashFile/processFrontMatter", pattern: /\bfileManager\.(renameFile|trashFile|processFrontMatter)\s*\(/ },
 	{ label: "localStorage", pattern: /\blocalStorage\b/ },
 ];
+
+const ADAPTER_WRITE = /\badapter\.(write|writeBinary|append|appendBinary|mkdir|rmdir|remove|rename|copy|trash\w*)\s*\(/;
 
 describe("fence: embed state adds no new file, folder, note or network surface (F4/F9)", () => {
 	it.each(NO_NEW_FILES_OR_NETWORK)("src/ does not use $label", ({ pattern }) => {
 		expect(srcText).not.toMatch(pattern);
 	});
 
-	it("the command list stays exactly one registration, with no ribbon, status bar or view", () => {
-		expect(srcText.match(/\.addCommand\s*\(/g) ?? []).toHaveLength(1);
+	it("src/ does not use an adapter write/mkdir/append/remove/rename/copy/trash outside the diagnostic log writer", () => {
+		expect(srcTextOutsideLogWriter).not.toMatch(ADAPTER_WRITE);
+	});
+
+	it("the command list stays exactly two registrations, with no ribbon, status bar or view", () => {
+		expect(addCommandSites(srcText)).toBe(2);
 		expect(srcText).not.toMatch(/\b(addRibbonIcon|addStatusBarItem|registerView)\s*\(/);
 	});
 });
@@ -145,11 +163,59 @@ describe("fence: PR-5 embed restore adds no UI surface and acts only on workspac
 		expect(restorer.indexOf("detectEmbedHost(")).toBeLessThan(restorer.indexOf("indicator.click("));
 	});
 
-	it("src/ still has one command and one settings tab, and the restorer is created and disposed in main.ts", () => {
+	it("src/ still has two commands and one settings tab, and the restorer is created and disposed in main.ts", () => {
 		const main = readFileSync(join(SRC, "main.ts"), "utf8");
-		expect(srcText.match(/\.addCommand\s*\(/g) ?? []).toHaveLength(1);
+		expect(addCommandSites(srcText)).toBe(2);
 		expect(srcText.match(/\.addSettingTab\s*\(/g) ?? []).toHaveLength(1);
 		expect(main).toMatch(/new EmbedFoldRestorer\(/);
 		expect(main).toMatch(/this\.embedRestorer\?\.dispose\(\)/);
+	});
+});
+
+// Warkworth-46 PR-1 (F3, F4, F5): the diagnostic log writes one file, in the plugin's own folder.
+describe("fence: the diagnostic log writer is the only adapter write site and writes one file (F3)", () => {
+	const code = readFileSync(LOG_WRITER, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+	it("src/diagnostic-log-writer.ts is the only file in src/ with an adapter write call", () => {
+		const writers = srcFiles.filter((f) => ADAPTER_WRITE.test(readFileSync(f, "utf8"))).map((f) => f.slice(SRC.length + 1));
+		expect(writers).toEqual(["diagnostic-log-writer.ts"]);
+	});
+
+	it("it calls only exists, read, write and append on the adapter, and always on this.path", () => {
+		const calls = [...code.matchAll(/\badapter\.(\w+)\(([^,)]*)/g)];
+		expect(calls.length).toBeGreaterThan(0);
+		for (const [, method, firstArg] of calls) {
+			expect(["exists", "read", "write", "append"]).toContain(method);
+			expect(firstArg.trim()).toBe("this.path");
+		}
+	});
+
+	it("this.path is built from the plugin folder it is given plus the diagnostic-log.jsonl constant, and nothing else", () => {
+		const assignments = [...code.matchAll(/this\.path\s*=\s*([^;]+);/g)].map((m) => m[1].trim());
+		expect(assignments).toEqual(["`${pluginDir}/${DIAGNOSTIC_LOG_FILE}`"]);
+		expect(code).toMatch(/export const DIAGNOSTIC_LOG_FILE = "diagnostic-log\.jsonl";/);
+	});
+
+	it("main.ts gives it manifest.dir (the plugin's own folder), not a vault path", () => {
+		const main = readFileSync(join(SRC, "main.ts"), "utf8");
+		expect(main).toMatch(/new DiagnosticLogWriter\(\s*this\.app\.vault\.adapter,\s*this\.manifest\.dir \?\?/);
+	});
+});
+
+describe("fence: the diagnostic log adds no dependency, setting or UI (F4, F5, F6)", () => {
+	it("package.json has no runtime dependencies", () => {
+		const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
+		expect(Object.keys(pkg.dependencies ?? {})).toEqual([]);
+	});
+
+	it("the settings tab is not touched: it does not mention the log", () => {
+		expect(readFileSync(join(SRC, "settings-tab.ts"), "utf8")).not.toMatch(/diagnostic/i);
+	});
+
+	it("the log modules import nothing but each other", () => {
+		for (const name of ["diagnostic-log.ts", "diagnostic-log-writer.ts"]) {
+			const imports = [...readFileSync(join(SRC, name), "utf8").matchAll(/from\s+"([^"]+)"/g)].map((m) => m[1]);
+			for (const spec of imports) expect(spec, name).toBe("./diagnostic-log");
+		}
 	});
 });

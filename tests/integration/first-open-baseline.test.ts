@@ -5,12 +5,14 @@
  * (src/editor-watcher.ts) sees them before any transaction happens at all.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldEffect } from "@codemirror/language";
 import { editorInfoField } from "../mocks/obsidian";
+import { makeGuardRig, type GuardRig } from "../guard-rig";
 import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
+import { restoreSettledChange } from "../../src/fold-restorer";
 import { buildAnchors, anchorKey, type Anchor } from "../../src/anchors";
 
 const NOTE_PATH = "Projects/Quarry/Tasks.md";
@@ -351,5 +353,200 @@ describe("first-open baseline (E5/G15)", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("first-open baseline behind the load guard (PR-3, E18)", () => {
+	const MARKER_TEXT = "## Tuesday\n- [ ] BASELINE-GUARD-MARKER draft\n  - [ ] Sub task\n";
+
+	afterEach(() => {
+		document.body.replaceChildren();
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	/** A `window` whose timers are real but recorded, so a test can tell whether a timer was scheduled. */
+	function recordingWindow(): { win: Window; scheduled: number[] } {
+		const scheduled: number[] = [];
+		const win = {
+			setTimeout: (fn: () => void, ms?: number) => {
+				scheduled.push(ms ?? 0);
+				return window.setTimeout(fn, ms);
+			},
+			clearTimeout: (handle?: number) => window.clearTimeout(handle),
+		} as unknown as Window;
+		return { win, scheduled };
+	}
+
+	function guardedView(rig: GuardRig, store: FoldStore, doc: string, win: Window, firstOpenGraceMs = 150): EditorView {
+		const watcher = createEditorWatcher({ store, ...rig.watcherDeps, window: win, firstOpenGraceMs });
+		const state = EditorState.create({
+			doc,
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		return new EditorView({ state, parent: document.body });
+	}
+
+	const GRACE_MS = 777; // distinctive, so it can be told from every other timer in the watcher
+
+	it("E18: an empty editor over a non-empty file adopts no baseline, stores nothing, schedules no grace recheck; the real text then gets one", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, MARKER_TEXT);
+		const store = await makeStore();
+		const setSpy = vi.spyOn(store, "set");
+		const { win, scheduled } = recordingWindow();
+		const view = guardedView(rig, store, "", win, GRACE_MS);
+
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(store.get(NOTE_PATH)).toBeUndefined(); // no hashText("") entry
+		expect(scheduled).not.toContain(GRACE_MS);
+		expect(rig.gate.isHolding(view)).toBe(true);
+		let lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["baseline", "refused-empty"]]);
+		expect(lines[0]).toMatchObject({ path: NOTE_PATH, editorLen: 0, diskLen: MARKER_TEXT.length, foldsBefore: 0, foldsAfter: 0 });
+
+		// The real text lands.
+		view.dispatch({ changes: { from: 0, to: 0, insert: MARKER_TEXT }, annotations: Transaction.userEvent.of("set") });
+		await vi.advanceTimersByTimeAsync(0);
+		expect(store.get(NOTE_PATH)).toEqual({ contentHash: hashText(MARKER_TEXT), folds: [], dormant: [] });
+		expect(scheduled).toContain(GRACE_MS); // scheduled only after a real-text baseline
+		lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([
+			["baseline", "refused-empty"],
+			["baseline", "applied"],
+		]);
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(MARKER_TEXT)); // the settled pass that follows finds nothing to change
+		view.destroy();
+	});
+
+	it("E18: text that does not match the disk (a half-loaded pane) adopts no baseline either", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, MARKER_TEXT);
+		const store = await makeStore();
+		const setSpy = vi.spyOn(store, "set");
+		const { win, scheduled } = recordingWindow();
+		const view = guardedView(rig, store, MARKER_TEXT.slice(0, 15), win, GRACE_MS);
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(scheduled).not.toContain(GRACE_MS);
+		expect((await rig.lines()).map((l) => [l.pass, l.outcome])).toEqual([["baseline", "waiting"]]);
+		view.destroy();
+	});
+
+	it("a pane that already holds the disk text gets its baseline after the one disk read, and the grace recheck is scheduled", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, MARKER_TEXT);
+		const store = await makeStore();
+		const { win, scheduled } = recordingWindow();
+		const view = guardedView(rig, store, MARKER_TEXT, win, GRACE_MS);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(store.get(NOTE_PATH)).toEqual({ contentHash: hashText(MARKER_TEXT), folds: [], dormant: [] });
+		expect(scheduled).toContain(GRACE_MS);
+		expect(await rig.lines()).toEqual([]); // nothing waited, so nothing to log
+		view.destroy();
+	});
+
+	it("E6: a file that really is empty gets a baseline from the empty editor (a real change), with no grace recheck to run", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, "");
+		const store = await makeStore();
+		const { win, scheduled } = recordingWindow();
+		const view = guardedView(rig, store, "", win, GRACE_MS);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(store.get(NOTE_PATH)).toEqual({ contentHash: hashText(""), folds: [], dormant: [] });
+		expect(scheduled).not.toContain(GRACE_MS); // an empty text has nothing to merge against
+		view.destroy();
+	});
+
+	it("E18 (no-entry branch of restoreSettledChange): an empty pane over a non-empty file creates no entry; once the text is real, whichever pass runs first wins and the other is a no-op", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, MARKER_TEXT);
+		const store = await makeStore();
+		const setSpy = vi.spyOn(store, "set");
+		const { win } = recordingWindow();
+		const view = guardedView(rig, store, "", win);
+		await vi.advanceTimersByTimeAsync(0);
+
+		// The settled pass is asked about the empty text directly: no `buildBaseline`, no entry.
+		const result = await restoreSettledChange(view, NOTE_PATH, "", {
+			store,
+			getActivePath: () => NOTE_PATH,
+			loadGuard: { gate: rig.gate, makeIo: () => rig.watcherDeps.loadGuard!.makeIo(view, NOTE_PATH), rerun: () => {} },
+		});
+		expect(result).toEqual([]);
+		expect(setSpy).not.toHaveBeenCalled();
+
+		view.dispatch({ changes: { from: 0, to: 0, insert: MARKER_TEXT }, annotations: Transaction.userEvent.of("set") });
+		await vi.advanceTimersByTimeAsync(2000);
+		const stored = store.get(NOTE_PATH);
+		expect(stored?.contentHash).toBe(hashText(MARKER_TEXT));
+		expect(stored?.dormant).toEqual([]);
+		// Every write was for the real text.
+		for (const call of setSpy.mock.calls) expect((call[1] as { contentHash: string }).contentHash).toBe(hashText(MARKER_TEXT));
+		view.destroy();
+	});
+
+	it("E8: the user typing into a pane that never loaded ends the baseline wait; an emptied pane is still refused", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, MARKER_TEXT);
+		const store = await makeStore();
+		const { win } = recordingWindow();
+		const view = guardedView(rig, store, "", win);
+		await vi.advanceTimersByTimeAsync(0);
+		view.dispatch({ changes: { from: 0, to: 0, insert: "x" }, annotations: Transaction.userEvent.of("input.type") });
+		await vi.advanceTimersByTimeAsync(0);
+		expect(store.get(NOTE_PATH)).toEqual({ contentHash: hashText("x"), folds: [], dormant: [] }); // from then on the pane's own text is used
+		view.destroy();
+
+		const rig2 = makeGuardRig();
+		rig2.vault.setContent(NOTE_PATH, MARKER_TEXT);
+		const store2 = await makeStore();
+		const view2 = guardedView(rig2, store2, "", win);
+		await vi.advanceTimersByTimeAsync(0);
+		view2.dispatch({ changes: { from: 0, to: 0, insert: "x" }, annotations: Transaction.userEvent.of("input.type") });
+		view2.dispatch({ changes: { from: 0, to: 1, insert: "" }, annotations: Transaction.userEvent.of("delete.backward") });
+		await vi.advanceTimersByTimeAsync(0);
+		expect(store2.get(NOTE_PATH)).toBeUndefined(); // never a baseline from ""
+		expect((await rig2.lines()).map((l) => l.outcome)).toContain("refused-empty");
+		view2.destroy();
+	});
+
+	it("E12: a disk read that fails adopts no baseline and writes one read-failed line", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, MARKER_TEXT);
+		rig.vault.failReadsOf(NOTE_PATH);
+		const store = await makeStore();
+		const setSpy = vi.spyOn(store, "set");
+		const { win } = recordingWindow();
+		const view = guardedView(rig, store, MARKER_TEXT, win);
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect((await rig.lines()).map((l) => [l.pass, l.outcome])).toEqual([["baseline", "read-failed"]]);
+		view.destroy();
+	});
+
+	it("the log holds no note text", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, MARKER_TEXT);
+		const store = await makeStore();
+		const { win } = recordingWindow();
+		const view = guardedView(rig, store, "", win);
+		await vi.advanceTimersByTimeAsync(0);
+		view.dispatch({ changes: { from: 0, to: 0, insert: MARKER_TEXT }, annotations: Transaction.userEvent.of("set") });
+		await vi.advanceTimersByTimeAsync(2000);
+		const raw = await rig.raw();
+		expect(raw).not.toBe("");
+		for (const secret of ["BASELINE-GUARD-MARKER", "Tuesday", "Sub task", "draft"]) expect(raw).not.toContain(secret);
+		view.destroy();
 	});
 });

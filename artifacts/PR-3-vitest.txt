@@ -1,0 +1,5 @@
+> npm test (vitest run), PR-3
+ Test Files  84 passed (84)
+      Tests  2377 passed (2377)
+   Start at  16:19:56
+   Duration  16.32s (tests 69%, environment 28%, import 2%, transform 1%)

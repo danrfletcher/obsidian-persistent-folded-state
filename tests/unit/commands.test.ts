@@ -2,7 +2,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App, type Command, type PluginManifest } from "obsidian";
 import { Editor as MockEditor, MarkdownView as MockMarkdownView, OtherView, TFile as MockTFile, Workspace as MockWorkspace } from "../mocks/obsidian";
 import PersistentFoldedStatePlugin from "../../src/main";
-import { FORGET_NOTE_FOLDS_COMMAND_ID, registerForgetNoteFoldsCommand } from "../../src/commands";
+import {
+	COPY_DIAGNOSTIC_LOG_COMMAND_ID,
+	FORGET_NOTE_FOLDS_COMMAND_ID,
+	registerCopyDiagnosticLogCommand,
+	registerForgetNoteFoldsCommand,
+} from "../../src/commands";
+import { DiagnosticLogWriter } from "../../src/diagnostic-log-writer";
+import { MemoryAdapter } from "../mocks/obsidian";
 import { collectNotices } from "../helpers";
 import type { EmbedFoldRecord } from "../../src/types";
 
@@ -318,5 +325,146 @@ describe("forget-note-folds command: hosted embeds (G15)", () => {
 
 		expect(() => check(command, false)).not.toThrow();
 		expect(plugin.store.get("Host A.md")).toBeUndefined();
+	});
+});
+
+// --- "Copy diagnostic log" (warkworth-46 PR-1, GP6) ---------------------------------------------
+
+describe("copy-diagnostic-log command", () => {
+	const DIR = ".obsidian/plugins/persistent-folded-state";
+	const LOG_PATH = `${DIR}/diagnostic-log.jsonl`;
+	const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+
+	function setup(writeText: () => Promise<void> | void = () => undefined) {
+		const writeTextMock = vi.fn<(text: string) => Promise<void> | void>(writeText);
+		Object.defineProperty(navigator, "clipboard", { value: { writeText: writeTextMock }, configurable: true });
+		const adapter = new MemoryAdapter();
+		const writer = new DiagnosticLogWriter(adapter, DIR, { now: () => new Date("2026-10-28T10:00:00.000Z") });
+		const plugin = makePlugin();
+		let command: Command | undefined;
+		plugin.addCommand = (c: Command) => {
+			command = c;
+			return c;
+		};
+		registerCopyDiagnosticLogCommand(plugin, writer);
+		if (!command) throw new Error("command was not registered");
+		return { adapter, writer, command, writeTextMock };
+	}
+
+	/** Runs the command the way Obsidian does and waits for its async body. */
+	async function run(command: Command, writer: DiagnosticLogWriter): Promise<string[]> {
+		const notices = collectNotices();
+		command.callback?.();
+		await writer.drain();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		notices.stop();
+		return notices.messages;
+	}
+
+	afterEach(() => {
+		if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+		else delete (navigator as unknown as { clipboard?: unknown }).clipboard;
+	});
+
+	it("has the right id and name, and is a plain callback available without an open note", () => {
+		const { command } = setup();
+		expect(command.id).toBe(COPY_DIAGNOSTIC_LOG_COMMAND_ID);
+		expect(command.id).toBe("copy-diagnostic-log");
+		expect(command.name).toBe("Copy diagnostic log");
+		expect(command.checkCallback).toBeUndefined();
+		expect(command.editorCallback).toBeUndefined();
+	});
+
+	it("copies the whole file through navigator.clipboard.writeText and shows a Notice", async () => {
+		const { adapter, writer, command, writeTextMock } = setup();
+		const text = '{"line":1}\n{"line":2}\ncorrupt, kept as is\n';
+		adapter.files.set(LOG_PATH, text);
+
+		const messages = await run(command, writer);
+
+		expect(writeTextMock).toHaveBeenCalledTimes(1);
+		expect(writeTextMock).toHaveBeenCalledWith(text);
+		expect(messages).toEqual(["Copied the diagnostic log (3 lines)."]);
+	});
+
+	it("copies lines queued a moment ago too: it waits for the writer's queue", async () => {
+		const { writer, command, writeTextMock } = setup();
+		writer.log({
+			path: "Notes/Tasks.md",
+			pass: "open",
+			editorLen: 10,
+			diskLen: -1,
+			foldsBefore: 1,
+			dormantBefore: 0,
+			foldsAfter: 1,
+			dormantAfter: 0,
+			outcome: "applied",
+		});
+
+		const messages = await run(command, writer);
+
+		const copied = writeTextMock.mock.calls[0][0] as string;
+		expect(copied.trim().split("\n")).toHaveLength(1);
+		expect(JSON.parse(copied)).toMatchObject({ path: "Notes/Tasks.md", pass: "open", outcome: "applied" });
+		expect(messages).toEqual(["Copied the diagnostic log (1 line)."]);
+	});
+
+	it("a missing file shows the empty-log Notice and copies nothing", async () => {
+		const { writer, command, writeTextMock } = setup();
+		const messages = await run(command, writer);
+		expect(messages).toEqual(["The diagnostic log is empty. Nothing was copied."]);
+		expect(writeTextMock).not.toHaveBeenCalled();
+	});
+
+	it("an empty file shows the empty-log Notice and copies nothing", async () => {
+		const { adapter, writer, command, writeTextMock } = setup();
+		adapter.files.set(LOG_PATH, "");
+		const messages = await run(command, writer);
+		expect(messages).toEqual(["The diagnostic log is empty. Nothing was copied."]);
+		expect(writeTextMock).not.toHaveBeenCalled();
+	});
+
+	it("a rejecting clipboard shows a Notice and does not throw", async () => {
+		const { adapter, writer, command, writeTextMock } = setup(() => Promise.reject(new Error("denied")));
+		adapter.files.set(LOG_PATH, '{"a":1}\n');
+		const unhandled = vi.fn();
+		process.on("unhandledRejection", unhandled);
+		try {
+			const messages = await run(command, writer);
+			expect(writeTextMock).toHaveBeenCalledTimes(1);
+			expect(messages).toEqual(["Could not copy the diagnostic log to the clipboard."]);
+			expect(unhandled).not.toHaveBeenCalled();
+		} finally {
+			process.off("unhandledRejection", unhandled);
+		}
+	});
+
+	it("a clipboard that throws synchronously also ends in a Notice", async () => {
+		const { adapter, writer, command } = setup(() => {
+			throw new Error("no clipboard");
+		});
+		adapter.files.set(LOG_PATH, '{"a":1}\n');
+		expect(await run(command, writer)).toEqual(["Could not copy the diagnostic log to the clipboard."]);
+	});
+
+	it("a file that cannot be read shows a Notice and copies nothing", async () => {
+		const { adapter, writer, command, writeTextMock } = setup();
+		adapter.files.set(LOG_PATH, '{"a":1}\n');
+		adapter.readFailWith = new Error("EACCES");
+		expect(await run(command, writer)).toEqual(["Could not read the diagnostic log."]);
+		expect(writeTextMock).not.toHaveBeenCalled();
+	});
+
+	it("onload registers it through the plugin, after the forget command", async () => {
+		const plugin = makePlugin();
+		await plugin.onload();
+		expect(plugin.diagnosticLog).not.toBeNull();
+		expect((plugin as unknown as { getCommands(): Command[] }).getCommands().map((c) => c.id)).toEqual([
+			FORGET_NOTE_FOLDS_COMMAND_ID,
+			COPY_DIAGNOSTIC_LOG_COMMAND_ID,
+		]);
+		plugin.onunload();
+		expect(plugin.diagnosticLog).toBeNull();
 	});
 });

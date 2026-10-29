@@ -95,3 +95,150 @@ describe("FoldStore.flush: expired dormant entries are pruned (G6: 'or when the 
 		expect(store.get("Note.md")?.dormant).toEqual([]); // the in-memory map itself was pruned too
 	});
 });
+
+/**
+ * Warkworth-46 PR-4 (E14): `load()` removes an anchor from `dormant` when it is also in `folds`,
+ * and writes the cleaned data back at once (one `saveData`, no debounce wait). Fake
+ * `loadData`/`saveData` and an injected clock throughout; the real FoldStore.
+ */
+describe("FoldStore.load: an anchor in both folds and dormant is cleaned (E14)", () => {
+	const OTHER_ANCHOR = { kind: "heading", indent: 0, text: "wednesday", siblingIndex: 1, parentChain: [] };
+	const NOW = 5_000_000;
+
+	function open(files: Record<string, unknown>, now = NOW) {
+		const saveData = vi.fn(async (_data: unknown) => undefined);
+		const store = new FoldStore({ loadData: async () => ({ version: STORE_VERSION, files }), saveData, now: () => now });
+		return { store, saveData };
+	}
+
+	it("keeps the anchor in folds, drops the dormant copy, and writes once at once (no timer advanced)", async () => {
+		const { store, saveData } = open({
+			"Note.md": { contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [{ ...GOOD_ANCHOR, dormantSince: NOW - 10 }] },
+		});
+		await store.load();
+
+		expect(store.get("Note.md")).toEqual({ contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [] });
+		expect(saveData).toHaveBeenCalledTimes(1);
+		expect(saveData).toHaveBeenCalledWith({
+			version: STORE_VERSION,
+			files: { "Note.md": { contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [] } },
+		});
+	});
+
+	it("clean data (no overlap anywhere) causes no write, now or after the debounce window", async () => {
+		vi.useFakeTimers();
+		try {
+			const { store, saveData } = open({
+				"Note.md": { contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [{ ...OTHER_ANCHOR, dormantSince: NOW - 10 }] },
+			});
+			await store.load();
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(saveData).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("a duplicate whose dormant copy is already past 10 minutes: still kept in folds, and still written back", async () => {
+		const { store, saveData } = open({
+			"Note.md": { contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [{ ...GOOD_ANCHOR, dormantSince: NOW - MAX_DORMANT_AGE_MS - 1 }] },
+		});
+		await store.load();
+		expect(store.get("Note.md")).toEqual({ contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [] });
+		expect(saveData).toHaveBeenCalledTimes(1);
+	});
+
+	it("partial overlap: only the duplicated key leaves dormant; the others keep their own dormantSince and order", async () => {
+		const third = { kind: "heading", indent: 0, text: "thursday", siblingIndex: 2, parentChain: [] };
+		const { store } = open({
+			"Note.md": {
+				contentHash: "abc",
+				folds: [GOOD_ANCHOR],
+				dormant: [
+					{ ...third, dormantSince: NOW - 300 },
+					{ ...GOOD_ANCHOR, dormantSince: NOW - 200 },
+					{ ...OTHER_ANCHOR, dormantSince: NOW - 100 },
+				],
+			},
+		});
+		await store.load();
+		expect(store.get("Note.md")?.dormant).toEqual([
+			{ kind: "heading", indent: 0, text: "thursday", siblingIndex: 2, parentChain: [], dormantSince: NOW - 300 },
+			{ kind: "heading", indent: 0, text: "wednesday", siblingIndex: 1, parentChain: [], dormantSince: NOW - 100 },
+		]);
+	});
+
+	it("G6 expiry still runs after the cleanup: an unrelated dormant entry past the window goes, a fresh one stays", async () => {
+		const { store, saveData } = open({
+			"Note.md": {
+				contentHash: "abc",
+				folds: [GOOD_ANCHOR],
+				dormant: [
+					{ ...GOOD_ANCHOR, dormantSince: NOW - 5 },
+					{ ...OTHER_ANCHOR, dormantSince: NOW - MAX_DORMANT_AGE_MS },
+					{ kind: "heading", indent: 0, text: "friday", siblingIndex: 3, parentChain: [], dormantSince: NOW - MAX_DORMANT_AGE_MS + 1 },
+				],
+			},
+		});
+		await store.load();
+		expect(store.get("Note.md")?.folds).toEqual([GOOD_ANCHOR]);
+		expect(store.get("Note.md")?.dormant).toEqual([
+			{ kind: "heading", indent: 0, text: "friday", siblingIndex: 3, parentChain: [], dormantSince: NOW - MAX_DORMANT_AGE_MS + 1 },
+		]);
+		expect(saveData).toHaveBeenCalledTimes(1);
+	});
+
+	it("real-vault shape: 136 anchors in both lists load as 136 folds and 0 dormant, contentHash unchanged", async () => {
+		const anchors = Array.from({ length: 136 }, (_, i) => ({ kind: "task", indent: 0, text: `lesson ${i}`, siblingIndex: i, parentChain: [] }));
+		const { store, saveData } = open({
+			"Agentic.md": { contentHash: "a4ac843e9e1f1f96", folds: anchors, dormant: anchors.map((a) => ({ ...a, dormantSince: 1000 })) },
+		});
+		await store.load();
+		const record = store.get("Agentic.md");
+		expect(record?.folds).toHaveLength(136);
+		expect(record?.dormant).toHaveLength(0);
+		expect(record?.contentHash).toBe("a4ac843e9e1f1f96");
+		expect(saveData).toHaveBeenCalledTimes(1);
+	});
+
+	it("several cleaned notes still cost one write; an untouched neighbour is unchanged", async () => {
+		const { store, saveData } = open({
+			"A.md": { contentHash: "a", folds: [GOOD_ANCHOR], dormant: [{ ...GOOD_ANCHOR, dormantSince: NOW }] },
+			"B.md": { contentHash: "b", folds: [GOOD_ANCHOR], dormant: [{ ...GOOD_ANCHOR, dormantSince: NOW }] },
+			"C.md": { contentHash: "c", folds: [], dormant: [{ ...OTHER_ANCHOR, dormantSince: NOW }] },
+		});
+		await store.load();
+		expect(saveData).toHaveBeenCalledTimes(1);
+		expect(store.get("C.md")).toEqual({ contentHash: "c", folds: [], dormant: [{ ...OTHER_ANCHOR, dormantSince: NOW }] });
+	});
+
+	it("a malformed dormant entry is dropped by the sanitiser first and is no duplicate; no write for it", async () => {
+		const { store, saveData } = open({
+			"Note.md": { contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [{ ...GOOD_ANCHOR }, null, "x"] }, // no dormantSince
+		});
+		await store.load();
+		expect(store.get("Note.md")).toEqual({ contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [] });
+		expect(saveData).not.toHaveBeenCalled();
+	});
+
+	it("a failing write-back never throws out of load(), and the store stays dirty so a later flush retries", async () => {
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+		try {
+			const saveData = vi.fn<(data: unknown) => Promise<void>>(async () => {
+				throw new Error("disk full");
+			});
+			const store = new FoldStore({
+				loadData: async () => ({ version: STORE_VERSION, files: { "Note.md": { contentHash: "abc", folds: [GOOD_ANCHOR], dormant: [{ ...GOOD_ANCHOR, dormantSince: NOW }] } } }),
+				saveData,
+				now: () => NOW,
+			});
+			await expect(store.load()).resolves.toBeUndefined();
+			expect(store.get("Note.md")?.dormant).toEqual([]);
+			saveData.mockImplementation(async () => undefined);
+			await store.flush();
+			expect(saveData).toHaveBeenCalledTimes(2);
+		} finally {
+			consoleError.mockRestore();
+		}
+	});
+});
