@@ -14,6 +14,7 @@ import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
 import { restoreSettledChange } from "../../src/fold-restorer";
 import { buildAnchors, anchorKey, type Anchor } from "../../src/anchors";
+import type { DiagnosticEntry } from "../../src/diagnostic-log";
 
 const NOTE_PATH = "Projects/Quarry/Tasks.md";
 const TEXT = "## Tuesday\n- [ ] Draft proposal\n  - [ ] Sub task\n- [ ] Send invoices\n";
@@ -356,6 +357,89 @@ describe("first-open baseline (E5/G15)", () => {
 	});
 });
 
+describe("first-open baseline writes are logged (PR-1 R1)", () => {
+	afterEach(() => {
+		document.body.replaceChildren();
+		vi.restoreAllMocks();
+	});
+
+	it("the watcher's own baseline (no load guard) logs one `baseline` / `applied` line with the counts it stored", async () => {
+		const blocks = buildAnchors(TEXT);
+		const tuesday = blocks.find((b) => b.anchor.kind === "heading" && b.anchor.text === "tuesday")!;
+		const range = { from: lineEnd(TEXT, tuesday.range.startLine), to: lineEnd(TEXT, tuesday.range.endLine) };
+		const store = await makeStore();
+		const seen: DiagnosticEntry[] = [];
+		const watcher = createEditorWatcher({ store, window, diagnosticLog: (entry) => seen.push(entry) });
+		const state = EditorState.create({
+			doc: TEXT,
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		}).update({ effects: [foldEffect.of(range)] }).state;
+		const view = new EditorView({ state, parent: document.body });
+
+		expect(seen).toEqual([
+			{ path: NOTE_PATH, pass: "baseline", editorLen: TEXT.length, diskLen: -1, foldsBefore: 0, dormantBefore: 0, foldsAfter: 1, dormantAfter: 0, outcome: "applied" },
+		]);
+		// A second pane for the same note adopts nothing and logs nothing.
+		new EditorView({ state, parent: document.body });
+		expect(seen).toHaveLength(1);
+		view.destroy();
+	});
+
+	it("an empty-editor baseline (no load guard, the E18 shape) is logged with editorLen 0", async () => {
+		const store = await makeStore();
+		const seen: DiagnosticEntry[] = [];
+		const watcher = createEditorWatcher({ store, window, diagnosticLog: (entry) => seen.push(entry) });
+		const state = EditorState.create({
+			doc: "",
+			extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+		});
+		new EditorView({ state, parent: document.body });
+		expect(seen.map((e) => [e.pass, e.outcome, e.editorLen])).toEqual([["baseline", "applied", 0]]);
+	});
+
+	it("restoreSettledChange's no-entry branch logs the baseline it writes, with the disk length from the guard", async () => {
+		const store = await makeStore();
+		const seen: DiagnosticEntry[] = [];
+		const view = new EditorView({
+			state: EditorState.create({ doc: TEXT, extensions: [codeFolding()] }),
+			parent: document.body,
+		});
+		await restoreSettledChange(view, NOTE_PATH, TEXT, { store, getActivePath: () => NOTE_PATH, diagnosticLog: (entry) => seen.push(entry) });
+		expect(store.get(NOTE_PATH)).toEqual({ contentHash: hashText(TEXT), folds: [], dormant: [] });
+		expect(seen).toEqual([
+			{ path: NOTE_PATH, pass: "baseline", editorLen: TEXT.length, diskLen: -1, foldsBefore: 0, dormantBefore: 0, foldsAfter: 0, dormantAfter: 0, outcome: "applied" },
+		]);
+	});
+
+	it("restoreSettledChange's no-entry branch behind the guard logs the real disk length", async () => {
+		vi.useFakeTimers();
+		try {
+			const rig = makeGuardRig();
+			rig.vault.setContent(NOTE_PATH, TEXT);
+			const store = await makeStore();
+			const view = new EditorView({
+				state: EditorState.create({ doc: TEXT, extensions: [codeFolding(), editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))] }),
+				parent: document.body,
+			});
+			await restoreSettledChange(view, NOTE_PATH, TEXT, {
+				store,
+				getActivePath: () => NOTE_PATH,
+				diagnosticLog: rig.watcherDeps.diagnosticLog,
+				loadGuard: {
+					gate: rig.gate,
+					makeIo: () => ({ ...rig.watcherDeps.loadGuard!.makeIo(view, NOTE_PATH), paneFilePath: () => NOTE_PATH }),
+					rerun: () => {},
+				},
+			});
+			const lines = await rig.lines();
+			expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["baseline", "applied"]]);
+			expect(lines[0]).toMatchObject({ editorLen: TEXT.length, diskLen: TEXT.length });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
 describe("first-open baseline behind the load guard (PR-3, E18)", () => {
 	const MARKER_TEXT = "## Tuesday\n- [ ] BASELINE-GUARD-MARKER draft\n  - [ ] Sub task\n";
 
@@ -447,7 +531,10 @@ describe("first-open baseline behind the load guard (PR-3, E18)", () => {
 		await vi.advanceTimersByTimeAsync(0);
 		expect(store.get(NOTE_PATH)).toEqual({ contentHash: hashText(MARKER_TEXT), folds: [], dormant: [] });
 		expect(scheduled).toContain(GRACE_MS);
-		expect(await rig.lines()).toEqual([]); // nothing waited, so nothing to log
+		// Nothing waited, but the baseline is a write to stored data, so it is logged (PR-1 R1).
+		const lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["baseline", "applied"]]);
+		expect(lines[0]).toMatchObject({ path: NOTE_PATH, editorLen: MARKER_TEXT.length, diskLen: MARKER_TEXT.length, foldsBefore: 0, dormantBefore: 0, foldsAfter: 0, dormantAfter: 0 });
 		view.destroy();
 	});
 
@@ -461,6 +548,10 @@ describe("first-open baseline behind the load guard (PR-3, E18)", () => {
 		await vi.advanceTimersByTimeAsync(0);
 		expect(store.get(NOTE_PATH)).toEqual({ contentHash: hashText(""), folds: [], dormant: [] });
 		expect(scheduled).not.toContain(GRACE_MS); // an empty text has nothing to merge against
+		// PR-1 R1: an empty-editor baseline is the E18 failure mode, so this one is always in the log.
+		const lines = await rig.lines();
+		expect(lines.map((l) => [l.pass, l.outcome])).toEqual([["baseline", "applied"]]);
+		expect(lines[0]).toMatchObject({ editorLen: 0, diskLen: 0 });
 		view.destroy();
 	});
 

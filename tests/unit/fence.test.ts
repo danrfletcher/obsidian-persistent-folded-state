@@ -200,6 +200,14 @@ describe("fence: the diagnostic log writer is the only adapter write site and wr
 		const main = readFileSync(join(SRC, "main.ts"), "utf8");
 		expect(main).toMatch(/new DiagnosticLogWriter\(\s*this\.app\.vault\.adapter,\s*this\.manifest\.dir \?\?/);
 	});
+
+	it("main.ts's fallback when manifest.dir is absent is the plugin's own folder under the config folder, nothing else", () => {
+		// `manifest.dir` is optional in Obsidian's typings. The spec said "only manifest.dir plus the
+		// constant"; this one fallback is a deliberate, documented deviation (see the PR description).
+		const main = readFileSync(join(SRC, "main.ts"), "utf8");
+		const call = /new DiagnosticLogWriter\(\s*this\.app\.vault\.adapter,\s*([^;]+?),?\s*\);/.exec(main);
+		expect(call?.[1].trim()).toBe("this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`");
+	});
 });
 
 describe("fence: the diagnostic log adds no dependency, setting or UI (F4, F5, F6)", () => {

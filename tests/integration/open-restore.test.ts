@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EditorState, type Extension } from "@codemirror/state";
+import { EditorState, Transaction, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { codeFolding, foldEffect, foldedRanges, unfoldEffect } from "@codemirror/language";
 import { App, type PluginManifest } from "obsidian";
@@ -31,6 +31,7 @@ import { restoreOnOpen } from "../../src/open-restore";
 import { addDormant, MAX_DORMANT_AGE_MS } from "../../src/dormant";
 import { LOAD_WAIT_GIVE_UP_MS } from "../../src/load-wait";
 import type { FileFoldRecord } from "../../src/types";
+import type { DiagnosticEntry } from "../../src/diagnostic-log";
 
 const NOTE_PATH = "Projects/Quarry/Tasks.md";
 const TEXT_V1 = ["## Tuesday", "Some text under Tuesday.", "## Wednesday", "Some text under Wednesday."].join("\n");
@@ -544,6 +545,65 @@ describe("open-restore via the plugin's file-open handler", () => {
 		10000
 	);
 
+	describe("restoreRefoldedAnchors (PR-3 R4): the guard puts back the anchor a native unfold made the recorder drop", () => {
+		/** Opens TEXT_V3 over a stored TEXT_V1 Tuesday fold with a short guard schedule: Tuesday (lines 3-4) ends up folded. */
+		async function openGuarded() {
+			const app = new App();
+			(app.vault as unknown as MockVault).setExists(NOTE_PATH);
+			const stored = {
+				value: { version: 1, files: { [NOTE_PATH]: { contentHash: hashText(TEXT_V1), folds: [tuesdayAnchorFor(TEXT_V1)], dormant: [] } } },
+			};
+			const plugin = makePlugin(app, stored);
+			plugin.guardDelaysMs = [10, 40];
+			await plugin.onload();
+			const watcher = createEditorWatcher({ store: plugin.store, window });
+			const state = EditorState.create({
+				doc: TEXT_V3,
+				extensions: [codeFolding(), watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))],
+			});
+			const view = new EditorView({ state, parent: document.body });
+			openFile(app, NOTE_PATH, view);
+			await new Promise((resolve) => setTimeout(resolve, 25)); // past the first check, which finds nothing to correct
+			expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+			const tuesday = {
+				from: view.state.doc.line(3).to,
+				to: view.state.doc.line(4).to,
+			};
+			return { plugin, view, tuesday };
+		}
+
+		const foldTexts = (plugin: PersistentFoldedStatePlugin): string[] =>
+			((plugin.store.get(NOTE_PATH)?.folds ?? []) as unknown as { text: string }[]).map((f) => f.text);
+
+		it("native churn unfolds the target while a stale fold appears: the anchor the recorder dropped is stored again, and the target is refolded", async () => {
+			const { plugin, view, tuesday } = await openGuarded();
+			const setSpy = vi.spyOn(plugin.store, "set");
+			view.dispatch({
+				effects: [unfoldEffect.of(tuesday), foldEffect.of({ from: view.state.doc.line(1).to, to: view.state.doc.line(2).to })],
+			});
+			// The recorder has just taken the untagged unfold for the user's own: the anchor is gone.
+			expect(foldTexts(plugin)).not.toContain("tuesday");
+
+			await new Promise((resolve) => setTimeout(resolve, 60)); // past the 40 ms check
+
+			expect(liveFoldedLineRanges(view)).toEqual([{ startLine: 3, endLine: 4 }]);
+			expect(foldTexts(plugin)).toEqual(["tuesday"]); // back in `folds`, and the stale one is not
+			expect(plugin.store.get(NOTE_PATH)?.dormant).toEqual([]);
+			expect(setSpy).toHaveBeenCalled(); // restored through a real store write
+		}, 10000);
+
+		it("a plain user unfold of the target (no stale fold, so no churn) is neither refolded nor put back in the store", async () => {
+			const { plugin, view, tuesday } = await openGuarded();
+			view.dispatch({ effects: unfoldEffect.of(tuesday) }); // untagged, like a gutter click
+			expect(foldTexts(plugin)).not.toContain("tuesday");
+
+			await new Promise((resolve) => setTimeout(resolve, 80)); // past both checks
+
+			expect(liveFoldedLineRanges(view)).toEqual([]);
+			expect(foldTexts(plugin)).toEqual([]);
+		}, 10000);
+	});
+
 	it("G8 hash changed: several stored folds that match nothing all go dormant, leaving the note fully unfolded, without throwing", async () => {
 		const app = new App();
 		(app.vault as unknown as MockVault).setExists(NOTE_PATH);
@@ -792,6 +852,30 @@ describe("diagnostic log: restoreOnOpen logs one `open` line per pass", () => {
 		}
 		await plugin.diagnosticLog?.drain();
 		expect(logLinesOf(vault.adapter.files.get(LOG_PATH))).toHaveLength(3);
+	});
+
+	it("re-match path when the record is removed during the match (Forget note folds): nothing is written, and the line says `applied`, not `rematched`", async () => {
+		const typo = { ...(tuesdayAnchorFor(TEXT_V1) as unknown as Record<string, unknown>), text: "tuesdy" } as unknown as FileFoldRecord["folds"][number];
+		const record = { contentHash: hashText(TEXT_V1), folds: [typo], dormant: [] };
+		const seen: DiagnosticEntry[] = [];
+		const store = new FoldStore({ loadData: async () => ({ version: 1, files: { [NOTE_PATH]: record } }), saveData: async () => {} });
+		await store.load();
+		const setSpy = vi.spyOn(store, "set");
+		let yields = 0;
+		const view = makeView(TEXT_V2);
+		await restoreOnOpen(view, NOTE_PATH, TEXT_V2, {
+			store,
+			diagnosticLog: (entry) => seen.push(entry),
+			diskLen: TEXT_V2.length,
+			// A fuzzy comparison reaches the host yield; "Forget stored folds" runs right there.
+			matcherOptions: { chunkSize: 1, yieldToHost: () => void (yields++ === 0 && store.forgetNote(NOTE_PATH)) },
+		});
+
+		expect(yields).toBeGreaterThan(0); // the match really ran past the removal
+		expect(store.get(NOTE_PATH)).toBeUndefined();
+		expect(setSpy).not.toHaveBeenCalled(); // no write after the removal
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).toMatchObject({ pass: "open", outcome: "applied", foldsBefore: 1, foldsAfter: 0, dormantAfter: 0 });
 	});
 
 	it("the note's text never reaches the log", async () => {
@@ -1088,6 +1172,46 @@ describe("open-restore waits for the real text (warkworth-46 PR-2)", () => {
 		const lines = await logOf(plugin, vault);
 		expect(outcomes(lines)).toEqual(["applied"]);
 		expect(lines[0]).toMatchObject({ editorLen: BIG_LF.length, diskLen: BIG_CRLF.length });
+	});
+
+	it("PR-2 R2: a BOM-prefixed note on disk (the editor shows no BOM) counts as loaded: the folds are restored, not given up on after 30 s", async () => {
+		const record = { contentHash: hashText(BIG_LF), folds: lessonAnchors(BIG_LF), dormant: [] };
+		const { app, vault, plugin, setSpy } = await boot({ [BIG_PATH]: record });
+		const { view } = observedView(BIG_LF); // no BOM in the editor
+		openFile(app, BIG_PATH, view, "\uFEFF" + BIG_LF); // BOM kept by adapter.read
+		await until(() => liveFoldedLineRanges(view).length === 140, 2000); // well inside the 30 s give-up
+		expect(setSpy).not.toHaveBeenCalled();
+		const lines = await logOf(plugin, vault);
+		expect(outcomes(lines)).toEqual(["applied"]);
+		expect(lines[0]).toMatchObject({ editorLen: BIG_LF.length, diskLen: BIG_LF.length + 1 });
+	});
+
+	it("PR-2 R3 (E8): a user edit on a half-loaded pane runs the open pass on that partial text; the unmatched fold is only set aside and comes back when the real text lands", async () => {
+		const record = {
+			contentHash: hashText(THREE),
+			folds: [headingAnchor(THREE, "alpha"), headingAnchor(THREE, "beta"), headingAnchor(THREE, "gamma")],
+			dormant: [],
+		};
+		const { app, plugin } = await boot({ [NOTE_PATH]: record });
+		const prefix = THREE.split("\n").slice(0, 4).join("\n"); // Gamma has not arrived
+		const watcher = createEditorWatcher({ store: plugin.store, window });
+		const { view } = observedView(prefix, [watcher, editorInfoField.init(() => ({ file: { path: NOTE_PATH, extension: "md" } }))]);
+		openFile(app, NOTE_PATH, view, THREE);
+		await pause(40);
+
+		view.dispatch({ changes: { from: view.state.doc.length, insert: "!" }, annotations: Transaction.userEvent.of("input.type") });
+		await until(() => plugin.store.get(NOTE_PATH)?.dormant.length === 1); // the open pass ran on the partial text
+		const during = plugin.store.get(NOTE_PATH);
+		const heading = (f: unknown): string => (f as { text: string }).text;
+		expect((during?.folds ?? []).map(heading).sort()).toEqual(["alpha", "beta"]);
+		expect((during?.dormant ?? []).map((d) => heading(d))).toEqual(["gamma"]); // set aside, not deleted
+
+		land(view, THREE);
+		await until(() => plugin.store.get(NOTE_PATH)?.dormant.length === 0);
+		await pause(400); // past the settle pass on the landed text
+		const after = plugin.store.get(NOTE_PATH);
+		expect((after?.folds ?? []).map(heading).sort()).toEqual(["alpha", "beta", "gamma"]);
+		expect(after?.contentHash).toBe(hashText(THREE));
 	});
 
 	it("E10: 30 s without the text matching: one `gave-up` line, nothing set aside, hash not rewritten, no fold effect dispatched", async () => {
