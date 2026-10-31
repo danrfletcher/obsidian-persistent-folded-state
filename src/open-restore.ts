@@ -719,6 +719,11 @@ export async function restoreOnOpen(view: EditorView, path: string, text: string
 			folds: Array.from(activeFolds.values()),
 			dormant: dormantList,
 		});
+		logPass("rematched");
+		return;
 	}
-	logPass("rematched");
+	// PR-1 R2: the record was removed while the match ran (for example by "Forget note folds"),
+	// so nothing was written and the folds were only put on screen. "rematched" would claim a
+	// data change that did not happen; the pass is still logged, as `applied` like the verbatim one.
+	logPass("applied");
 }

@@ -475,6 +475,68 @@ describe("PR-3: the settled pass waits for the pane to hold the note's real text
 		expect(store.get(NOTE_PATH)?.contentHash).toBe(hashText(FULL));
 	});
 
+	it("PR-3 R2: a pass whose captured path is stale (pane moved on, or the note was renamed) neither waits nor logs: it returns at once", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, FULL);
+		const { store, setSpy } = await seeded();
+		const view = guardedView(rig, store, "");
+		await vi.advanceTimersByTimeAsync(0);
+		const before = structuredClone(store.get(NOTE_PATH));
+
+		for (const activePath of [OTHER_PATH, null]) {
+			const result = await restoreSettledChange(view, NOTE_PATH, "", {
+				store,
+				getActivePath: () => activePath,
+				diagnosticLog: rig.watcherDeps.diagnosticLog,
+				loadGuard: { gate: rig.gate, makeIo: () => rig.watcherDeps.loadGuard!.makeIo(view, NOTE_PATH), rerun: () => {} },
+			});
+			expect(result).toEqual([]);
+		}
+		// A renamed note: the old path can no longer be read, which used to log `read-failed`.
+		rig.vault.failReadsOf(NOTE_PATH);
+		await restoreSettledChange(view, NOTE_PATH, FULL, {
+			store,
+			getActivePath: () => OTHER_PATH,
+			diagnosticLog: rig.watcherDeps.diagnosticLog,
+			loadGuard: { gate: rig.gate, makeIo: () => rig.watcherDeps.loadGuard!.makeIo(view, NOTE_PATH), rerun: () => {} },
+		});
+		await vi.advanceTimersByTimeAsync(31_000);
+
+		expect(await rig.lines()).toEqual([]); // no `waiting`, `gave-up` or `read-failed` noise
+		expect(rig.gate.isHolding(view)).toBe(false);
+		expect(setSpy).not.toHaveBeenCalled();
+		expect(store.get(NOTE_PATH)).toEqual(before);
+	});
+
+	it("PR-3 R3: a wait the user's own edit ended leaves no marker, so a later settled pass for that same text is run, not swallowed", async () => {
+		vi.useFakeTimers();
+		const rig = makeGuardRig();
+		rig.vault.setContent(NOTE_PATH, FULL);
+		const { store } = await seeded();
+		const view = guardedView(rig, store, OLD);
+		await vi.advanceTimersByTimeAsync(0);
+
+		set(view, ""); // a reload empties the pane; the settled pass is refused and waits
+		await vi.advanceTimersByTimeAsync(400);
+		expect((await rig.lines()).map((l) => l.outcome)).toEqual(["refused-empty"]);
+		expect(rig.gate.isHolding(view)).toBe(true);
+
+		// The user types into the half-loaded pane: that ends the wait, and its pass runs on "x".
+		view.dispatch({ changes: { from: 0, insert: "x" }, annotations: Transaction.userEvent.of("input.type") });
+		await vi.advanceTimersByTimeAsync(400);
+		expect(rig.gate.isHolding(view)).toBe(false);
+		const afterUserEdit = (await rig.lines()).length;
+		expect(afterUserEdit).toBeGreaterThan(1); // the released pass ran (and logged)
+
+		// A non-user change sets the pane to the very same "x" (a reload that lands the same partial
+		// text): that settled pass is a genuine one and must run. Here it meets the guard, which logs it.
+		set(view, "x");
+		await vi.advanceTimersByTimeAsync(400);
+		expect((await rig.lines()).length).toBeGreaterThan(afterUserEdit);
+		rig.gate.cancelAll();
+	});
+
 	it("the log holds no note text, heading or anchor text", async () => {
 		vi.useFakeTimers();
 		const rig = makeGuardRig();

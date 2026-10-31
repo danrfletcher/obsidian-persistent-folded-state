@@ -436,6 +436,10 @@ export class EmbedFoldRestorer {
 			} catch {
 				return;
 			}
+			// PR-3 R1: a host that now reads non-empty has loaded, so its streak of unloaded reads ends
+			// here. Left in place, a later empty read of the same host in this session would be
+			// neither logged nor looked at again once the streak had reached MAX_UNLOADED_RECHECKS.
+			if (hostText !== "") this.unloadedStreak.delete(host.file.path);
 			// PR-3 (E19): a host that reads as "" while its file is not empty has not loaded. Its
 			// embeds are not "absent", so nothing is reconciled, matched or rewritten; the host is
 			// looked at again once it has had time to load.

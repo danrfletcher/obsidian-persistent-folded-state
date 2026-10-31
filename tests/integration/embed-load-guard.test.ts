@@ -158,6 +158,36 @@ describe("the embed passes behind the load guard (PR-3, E19)", () => {
 		expect(JSON.stringify(records(r))).toBe(before);
 	});
 
+	it("PR-3 R1: once a host has read non-empty its unloaded streak is over: a later empty read is logged again and looked at again", async () => {
+		const r = rig();
+		const host = await openAndFold(r);
+		r.disk.set(HOST, `${LESSON_8}\n`);
+
+		// A first streak that runs out the bounded rechecks (about the shared wait's 30 s).
+		host.view.data = "";
+		r.w.rerender(host.embeds[0], host.path);
+		await settleRestore(r.w, r.restorer);
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(embedLines(r)).toHaveLength(1);
+		const callsAfterFirstStreak = r.confirmCalls.filter((p) => p === HOST).length;
+		await vi.advanceTimersByTimeAsync(20_000);
+		expect(r.confirmCalls.filter((p) => p === HOST).length).toBe(callsAfterFirstStreak); // the first streak has stopped looking
+
+		// The host loads and renders: the streak ends.
+		host.view.data = `${LESSON_8}\n`;
+		r.w.rerender(host.embeds[0], host.path);
+		await settleRestore(r.w, r.restorer);
+
+		// It reads empty again later in the same session: that is a new streak.
+		host.view.data = "";
+		r.w.rerender(host.embeds[0], host.path);
+		await settleRestore(r.w, r.restorer);
+		expect(embedLines(r).map((l) => l.outcome)).toEqual(["refused-empty", "refused-empty"]); // logged again
+		const callsAtSecondStreak = r.confirmCalls.filter((p) => p === HOST).length;
+		await vi.advanceTimersByTimeAsync(11_000); // past the 10.5 s second look
+		expect(r.confirmCalls.filter((p) => p === HOST).length).toBeGreaterThan(callsAtSecondStreak); // and rechecked
+	});
+
 	it("the log holds no note text", async () => {
 		const r = rig();
 		const host = await openAndFold(r);

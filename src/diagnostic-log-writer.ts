@@ -11,6 +11,11 @@
  * write never throws out of the writer: it is reported once with `console.warn` and the next
  * write starts from a fresh read of the file.
  *
+ * Every writer for the same adapter and file shares one chain (`chainFor`). A plugin disabled and
+ * re-enabled makes a new writer while the old one may still have lines queued; the new writer's
+ * first write waits behind them, so it loads the file only after they have landed and its line
+ * count is right (the 1,000-line cap holds across a re-enable).
+ *
  * The cap counts physical lines and never parses them, so a corrupt or truncated line is kept and
  * copied as it is. The file is read once (to count its lines and trim an over-cap file) and then
  * only appended to, until it reaches the cap, when each append rewrites the newest lines.
@@ -42,6 +47,29 @@ export interface DiagnosticLogWriterOptions {
 	warn?: (message: string, err: unknown) => void;
 	/** Line cap. Defaults to 1,000; only a test passes another. */
 	maxLines?: number;
+	/** The longest `readAll` waits for queued writes before reading the file as it is. Defaults
+	 * to `READ_WAIT_MS`; only a test passes another. */
+	readWaitMs?: number;
+}
+
+/** How long `readAll` waits on a queued write before giving up on it and reading anyway, so
+ * "Copy diagnostic log" always ends in a Notice even if an adapter write never settles. */
+export const READ_WAIT_MS = 3000;
+
+/** The chain every writer for one adapter and file appends to. */
+const chains = new WeakMap<object, Map<string, Promise<void>>>();
+
+function chainFor(adapter: object, path: string): { get(): Promise<void>; set(next: Promise<void>): void } {
+	let byPath = chains.get(adapter);
+	if (!byPath) {
+		byPath = new Map();
+		chains.set(adapter, byPath);
+	}
+	const map = byPath;
+	return {
+		get: () => map.get(path) ?? Promise.resolve(),
+		set: (next) => void map.set(path, next),
+	};
 }
 
 /** What the writer knows about the file between writes. */
@@ -55,12 +83,13 @@ interface FileState {
 export class DiagnosticLogWriter {
 	/** The log file, inside the plugin folder. */
 	readonly path: string;
-	private chain: Promise<void> = Promise.resolve();
+	private readonly sharedChain: { get(): Promise<void>; set(next: Promise<void>): void };
 	private state: FileState | null = null;
 	private warned = false;
 	private readonly now: () => Date;
 	private readonly warn: (message: string, err: unknown) => void;
 	private readonly maxLines: number;
+	private readonly readWaitMs: number;
 
 	constructor(
 		private readonly adapter: DiagnosticLogAdapter,
@@ -71,6 +100,16 @@ export class DiagnosticLogWriter {
 		this.now = options.now ?? (() => new Date());
 		this.warn = options.warn ?? ((message, err) => console.warn(message, err));
 		this.maxLines = options.maxLines ?? DIAGNOSTIC_LOG_MAX_LINES;
+		this.readWaitMs = options.readWaitMs ?? READ_WAIT_MS;
+		this.sharedChain = chainFor(adapter, this.path);
+	}
+
+	private get chain(): Promise<void> {
+		return this.sharedChain.get();
+	}
+
+	private set chain(next: Promise<void>) {
+		this.sharedChain.set(next);
 	}
 
 	/** Queues one line for `entry`. Returns at once and never throws. An invalid entry is dropped. */
@@ -92,9 +131,19 @@ export class DiagnosticLogWriter {
 	}
 
 	/** The whole file as it is on disk once everything queued has been written, or `null` when
-	 * there is no file. Rejects only if the read itself fails. */
+	 * there is no file. Waits at most `readWaitMs` for the queue: a write that never settles
+	 * does not stop the read, which then returns the file as it is. Rejects only if the read
+	 * itself fails. */
 	async readAll(): Promise<string | null> {
-		await this.chain;
+		let timer: number | undefined;
+		const timedOut = new Promise<void>((resolve) => {
+			timer = window.setTimeout(resolve, this.readWaitMs);
+		});
+		try {
+			await Promise.race([this.chain, timedOut]);
+		} finally {
+			window.clearTimeout(timer);
+		}
 		if (!(await this.adapter.exists(this.path))) return null;
 		return this.adapter.read(this.path);
 	}
