@@ -286,6 +286,62 @@ describe("DiagnosticLogWriter: readAll and re-enabling", () => {
 		expect(paths(adapter)).toEqual(["before-unload.md", "after-reenable.md"]);
 	});
 
+	it("re-enable while the old writer still has lines queued: the cap holds and every line lands in order", async () => {
+		const adapter = new MemoryAdapter();
+		adapter.files.set(PATH, [0, 1, 2, 3].map((i) => JSON.stringify({ path: `seed${i}.md` })).join("\n") + "\n");
+		const first = make(adapter, { maxLines: 5 }).writer;
+		first.log(entry({ path: "late1.md" }));
+		first.log(entry({ path: "late2.md" }));
+		first.log(entry({ path: "late3.md" }));
+		// onunload only does `void drain()`; the plugin is enabled again straight away.
+		void first.drain();
+		const second = make(adapter, { maxLines: 5 }).writer;
+		second.log(entry({ path: "new1.md" }));
+		second.log(entry({ path: "new2.md" }));
+		await second.drain();
+		await first.drain();
+		const result = paths(adapter);
+		expect(result).toHaveLength(5);
+		expect(result).toEqual(["late1.md", "late2.md", "late3.md", "new1.md", "new2.md"]);
+	});
+
+	it("readAll with a write that never settles: reads the file as it is after readWaitMs instead of hanging", async () => {
+		vi.useFakeTimers();
+		try {
+			const adapter = new MemoryAdapter();
+			adapter.files.set(PATH, '{"path":"already-there.md"}\n');
+			adapter.hang = true;
+			const { writer } = make(adapter);
+			writer.log(entry({ path: "stuck.md" }));
+			let text: string | null | undefined;
+			const read = writer.readAll().then((t) => {
+				text = t;
+			});
+			await vi.advanceTimersByTimeAsync(2999);
+			expect(text).toBeUndefined(); // still inside the wait
+			await vi.advanceTimersByTimeAsync(1);
+			await read;
+			expect(text).toBe('{"path":"already-there.md"}\n');
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("readAll with a write that never settles and a missing file: null, not a hang", async () => {
+		vi.useFakeTimers();
+		try {
+			const adapter = new MemoryAdapter();
+			adapter.hang = true;
+			const { writer } = make(adapter);
+			writer.log(entry());
+			const read = writer.readAll();
+			await vi.advanceTimersByTimeAsync(3000);
+			await expect(read).resolves.toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("unload with a stuck write: nothing throws", () => {
 		const adapter = new MemoryAdapter();
 		adapter.hang = true;

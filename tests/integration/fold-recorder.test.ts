@@ -15,6 +15,7 @@ import { editorInfoField } from "../../tests/mocks/obsidian";
 import { FoldStore, hashText } from "../../src/fold-store";
 import { createEditorWatcher } from "../../src/editor-watcher";
 import { OWN_FOLD_ANNOTATION } from "../../src/fold-recorder";
+import type { DiagnosticEntry, DiagnosticSink } from "../../src/diagnostic-log";
 import type { FileFoldRecord } from "../../src/types";
 
 const FIXTURE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fixture-note.md");
@@ -34,8 +35,12 @@ function makeStore(): { store: FoldStore; readSaved: () => { files: Record<strin
 	return { store, readSaved: () => stored };
 }
 
-function makeView(store: FoldStore, onSettledNonUserChange?: (path: string, text: string) => void): EditorView {
-	const watcher = createEditorWatcher({ store, onSettledNonUserChange, window });
+function makeView(
+	store: FoldStore,
+	onSettledNonUserChange?: (path: string, text: string) => void,
+	diagnosticLog?: DiagnosticSink,
+): EditorView {
+	const watcher = createEditorWatcher({ store, onSettledNonUserChange, diagnosticLog, window });
 	const state = EditorState.create({
 		doc: FIXTURE_TEXT,
 		// `codeFolding()` mirrors what real Obsidian always has registered in its own editor
@@ -99,14 +104,24 @@ describe("fold recorder integration (real EditorState/EditorView over the fixtur
 
 	it("G1: a note with a record carries a content hash (adopted as baseline, not written by a fold)", () => {
 		const { store } = makeStore();
-		const view = makeView(store);
+		const lines: DiagnosticEntry[] = [];
+		const view = makeView(store, undefined, (entry) => lines.push(entry));
 		const from = lineStart(view, LINES.heading);
+
+		// Before any fold: the hash is already there, written by the baseline path.
+		const adopted = store.get(NOTE_PATH);
+		expect(adopted?.contentHash).toBe(hashText(FIXTURE_TEXT));
+		expect(adopted?.folds).toEqual([]);
+		expect(lines.filter((l) => l.pass === "baseline" && l.outcome === "applied")).toHaveLength(1);
 
 		view.dispatch({ effects: [foldEffect.of({ from, to: from + 1 })] });
 
+		// The fold added its entry and left the hash exactly as the baseline wrote it; it logged
+		// no second baseline write.
 		const record = store.get(NOTE_PATH);
-		expect(record?.contentHash).toBeTypeOf("string");
-		expect(record?.contentHash.length).toBeGreaterThan(0);
+		expect(record?.folds).toHaveLength(1);
+		expect(record?.contentHash).toBe(adopted?.contentHash);
+		expect(lines.filter((l) => l.pass === "baseline")).toHaveLength(1);
 	});
 
 	it("G15: an external write with an empty map dispatches zero fold/unfold effects and leaves folded ranges unchanged", () => {

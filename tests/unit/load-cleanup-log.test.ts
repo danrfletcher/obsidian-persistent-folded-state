@@ -16,9 +16,9 @@ const B = anchor("another-secret heading", 1);
 const C = anchor("third-secret", 2);
 const NOW = 100_000;
 
-function openWith(data: unknown, diagnosticLog: (entry: DiagnosticEntry) => void) {
+function openWith(data: unknown, diagnosticLog: (entry: DiagnosticEntry) => void, now = NOW) {
 	const saveData = vi.fn(async (_data: unknown) => undefined);
-	const store = new FoldStore({ loadData: async () => data, saveData, now: () => NOW, diagnosticLog });
+	const store = new FoldStore({ loadData: async () => data, saveData, now: () => now, diagnosticLog });
 	return { store, saveData };
 }
 
@@ -85,6 +85,34 @@ describe("FoldStore.load: the load-cleanup log line (E14, F4)", () => {
 		expect(lines).toEqual([
 			{ path: "Host.md", pass: "load-cleanup", editorLen: -1, diskLen: -1, foldsBefore: 2, dormantBefore: 1, foldsAfter: 2, dormantAfter: 0, outcome: "cleaned" },
 		]);
+	});
+
+	it("an embed record that is cleaned and then dropped whole by expiry still logs, with after-counts 0/0", async () => {
+		const lines: DiagnosticEntry[] = [];
+		// A load a day after the Gone record was stamped dormant: far past the forget window.
+		const LATER = NOW + 24 * 60 * 60 * 1000;
+		const EXPIRED = NOW;
+		const { store, saveData } = openWith(
+			{
+				version: STORE_VERSION,
+				files: {},
+				embeds: [
+					// Overlap (A in both lists) and a whole-embed dormantSince far past the window.
+					{ host: "Gone.md", target: "Source.md", subpath: "^a", occurrence: 0, contentHash: "h", dormantSince: EXPIRED, folds: [A, B], dormant: [{ ...A, dormantSince: LATER }] },
+					// Overlap, still inside the window: kept, logged with its real after-counts.
+					{ host: "Kept.md", target: "Source.md", subpath: "^b", occurrence: 0, contentHash: "h", folds: [A], dormant: [{ ...A, dormantSince: LATER }] },
+				],
+			},
+			(entry) => lines.push(entry),
+			LATER,
+		);
+		await store.load();
+		expect(store.getEmbed({ host: "Gone.md", target: "Source.md", subpath: "^a", occurrence: 0 })).toBeUndefined();
+		expect(lines).toEqual([
+			{ path: "Gone.md", pass: "load-cleanup", editorLen: -1, diskLen: -1, foldsBefore: 2, dormantBefore: 1, foldsAfter: 0, dormantAfter: 0, outcome: "cleaned" },
+			{ path: "Kept.md", pass: "load-cleanup", editorLen: -1, diskLen: -1, foldsBefore: 1, dormantBefore: 1, foldsAfter: 1, dormantAfter: 0, outcome: "cleaned" },
+		]);
+		expect(saveData).toHaveBeenCalledTimes(1);
 	});
 
 	it("clean data writes no line", async () => {

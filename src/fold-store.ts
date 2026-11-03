@@ -336,9 +336,10 @@ export class FoldStore {
 		if (keptEmbeds.length !== loadedEmbeds.length || keptEmbeds.some((record, i) => record !== loadedEmbeds[i])) {
 			this.scheduleDebouncedFlush();
 		}
-		for (const record of keptEmbeds) {
-			const info = embedCleaned.get(embedMapKey(record));
-			if (info !== undefined) cleaned.push({ path: info.host, before: info.before, after: recordCounts(record) });
+		// Every record the dedupe cleaned is logged, including one expiry then dropped whole: it has
+		// no kept record to count, so its after-counts are 0/0 (the record is gone).
+		for (const [key, info] of embedCleaned) {
+			cleaned.push({ path: info.host, before: info.before, after: recordCounts(this.embeds.get(key)) });
 		}
 		if (cleaned.length === 0) return;
 		// E14: the cleaned data is written back at once, not left to the debounce (which this

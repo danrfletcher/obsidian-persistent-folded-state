@@ -169,8 +169,11 @@ export interface SettledLoadGuard {
 	/** The wait's view of the outside world for this pane and `path`. */
 	makeIo: (path: string) => LoadWaitIo;
 	/** Runs the settled pass again, with the pane's text, once the wait has ended (the caller
-	 * passes `guardCleared`). Called once however many triggers queued while it waited. */
-	rerun: (path: string, text: string) => void;
+	 * passes `guardCleared`). Called once however many triggers queued while it waited.
+	 * `userEdited` is true when the wait ended through the user's own edit rather than because
+	 * the text landed: no settle timer is then pending for `text`, so there is nothing for the
+	 * caller to stand down for. */
+	rerun: (path: string, text: string, userEdited: boolean) => void;
 }
 
 /** T1: delegates to `src/live-folds.ts` so this agrees with `src/baseline.ts` on the same
@@ -368,7 +371,7 @@ async function loadedForSettledPass(view: EditorView, path: string, text: string
 			}
 			// A wait that ended through the user's edit says so: the pane's length differs from the disk's.
 			if (userEdited) log("applied", liveText.length, diskLen);
-			guard.rerun(path, liveText);
+			guard.rerun(path, liveText, userEdited === true);
 		},
 		ended: ({ state, editorLen, diskLen }) => log(state, editorLen, diskLen),
 	});
@@ -389,6 +392,18 @@ export async function restoreSettledChange(
 	text: string,
 	deps: RestoreRunDeps,
 ): Promise<DeferredFoldTarget[]> {
+	// R2 (PR-7) and PR-3 R2: a settle timer captures `path` when it is first triggered
+	// (src/editor-watcher.ts), but by the time it fires the pane may have moved to another file,
+	// or a rename may have landed (real Obsidian mutates a renamed file's own TFile.path in place,
+	// and src/fold-store.ts's `handleRename` has already re-keyed the store entry away from
+	// `path`). Checked before the guard so a stale `path` neither leaves a wait nor writes a
+	// `waiting` / `gave-up` / `read-failed` line that would read as a load failure, and before the
+	// E5/G15 "no entry" branch below so it can never have `buildBaseline` create a brand-new store
+	// entry under a key nothing on disk answers to any more. The later, narrower check further
+	// down (after the possibly-slow match) still applies for the case where the rename arrives
+	// *during* that match.
+	if (deps.getActivePath(view) !== path) return [];
+
 	// Warkworth-46 PR-3 (E1-E5, E18): before anything is read from the store, the pane must show
 	// this note with the text `text` really is. A pane that does not yet (empty, half-loaded, or
 	// still showing another note) leaves a wait with the gate and nothing is matched, set aside
@@ -401,18 +416,6 @@ export async function restoreSettledChange(
 		diskLen = checked;
 	}
 
-	// R2 (PR-7): a settle timer captures `path` when it's first triggered (src/editor-watcher.ts),
-	// but by the time it actually fires, a rename may have already landed (real Obsidian mutates
-	// a renamed file's own TFile.path in place, so the pane's own active path reflects the rename
-	// immediately — src/fold-store.ts's `handleRename` has already re-keyed the store entry away
-	// from `path` too). Checked here, before the E5/G15 "no entry" branch below, so a stale
-	// `path` can never fall into that branch and have `buildBaseline` create a brand-new store
-	// entry under a key nothing on disk answers to any more. The later, narrower check further
-	// down (after the possibly-slow match) still applies for the case where the rename arrives
-	// *during* that match. With the load guard on, a pass for a stale `path` is already stopped
-	// above (the old path cannot be read, so it is a `read-failed` line and nothing else).
-	if (deps.getActivePath(view) !== path) return [];
-
 	const snapshot = deps.store.get(path);
 	if (!snapshot) {
 		// E5/G15: a never-before-seen file — there is nothing to match against, so adopt
@@ -424,6 +427,20 @@ export async function restoreSettledChange(
 			folds: baseline.anchors as unknown as StoredAnchor[],
 			dormant: [],
 		});
+		// PR-1 R1: this write is stored data too (an empty-editor baseline is the E18 failure
+		// mode), so it is logged like every other pass that writes. Counts only.
+		reportDiagnostic(
+			deps.diagnosticLog,
+			diagnosticEntry({
+				path,
+				pass: "baseline",
+				outcome: "applied",
+				editorLen: text.length,
+				diskLen,
+				before: recordCounts(undefined),
+				after: recordCounts(deps.store.get(path)),
+			}),
+		);
 		return [];
 	}
 	if (snapshot.folds.length === 0 && snapshot.dormant.length === 0) return [];

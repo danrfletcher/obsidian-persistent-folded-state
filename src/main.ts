@@ -401,8 +401,9 @@ export default class PersistentFoldedStatePlugin extends Plugin {
 		this.embedRestorer = null;
 		this.dormancy?.dispose();
 		this.dormancy = null;
-		// Warkworth-46 PR-1: lines already queued are still written (drain never rejects); a
-		// re-enabled plugin builds a new writer that keeps appending to the same file.
+		// Warkworth-46 PR-1: lines already queued are still written (drain never rejects). A
+		// re-enabled plugin builds a new writer; both share one chain for the file (see
+		// src/diagnostic-log-writer.ts), so the new writer loads the file only after these land.
 		void this.diagnosticLog?.drain();
 		this.diagnosticLog = null;
 		this.flushAtOnce();

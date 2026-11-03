@@ -192,7 +192,9 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 	const instances = new WeakMap<EditorView, EditorWatcherPlugin>();
 	/** PR-3: the text a settled pass that a wait released has just been run for, per pane. The
 	 * settle timer of the very change that ended the wait would otherwise run the same pass a
-	 * second time; it finds its text here and stands down once. */
+	 * second time; it finds its text here and stands down once. Cleared by the matching timer,
+	 * by a later non-user change with different text, by any user edit of the text, and never
+	 * set for a wait the user's own edit ended. */
 	const releasedFor = new WeakMap<EditorView, string>();
 
 	/** The wait's view of the outside world for `view`: whatever `makeIo` builds, except the pane's
@@ -261,8 +263,10 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 		}
 
 		/** Stores `path`'s first-open baseline from the pane as it is now, unless the store has
-		 * an entry for it by now or the pane has moved to another file. Dispatches nothing. */
-		private adoptBaseline(path: string): void {
+		 * an entry for it by now or the pane has moved to another file. Dispatches nothing.
+		 * PR-1 R1: logs one `baseline` / `applied` line for the write (counts only). `diskLen` is
+		 * the length of the note read from disk for the guard, or -1 when none was read. */
+		private adoptBaseline(path: string, diskLen = -1): void {
 			const view = this.view;
 			if (deps.disposed?.current || deps.store.get(path) || activeMarkdownPath(view) !== path) return;
 			const text = view.state.doc.toString();
@@ -272,6 +276,18 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				folds: baseline.anchors as unknown as StoredAnchor[],
 				dormant: [],
 			});
+			reportDiagnostic(
+				deps.diagnosticLog,
+				diagnosticEntry({
+					path,
+					pass: "baseline",
+					outcome: "applied",
+					editorLen: text.length,
+					diskLen,
+					before: recordCounts(undefined),
+					after: recordCounts(deps.store.get(path)),
+				}),
+			);
 			// T20: when this ViewPlugin instance is created by Obsidian reconfiguring
 			// an *already-open* pane's CM6 extensions (the re-enable-over-an-open-pane
 			// path src/main.ts's T2 fix exists to exercise) rather than by a brand-new
@@ -292,7 +308,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 		/** PR-3 (E18): the guarded first-open baseline. Asks the shared guard whether the pane
 		 * holds `path`'s real text; adopts the baseline if so, otherwise leaves a wait that adopts
 		 * it when the text lands. Logs `pass: "baseline"` for a wait, a refusal, a give-up and a
-		 * failed read, and `applied` for a baseline adopted after a wait. Never throws. */
+		 * failed read, and (in `adoptBaseline`) `applied` for every baseline written. Never throws. */
 		private async adoptBaselineWhenLoaded(path: string): Promise<void> {
 			const view = this.view;
 			const guard = deps.loadGuard;
@@ -310,7 +326,7 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 				// The text can change while the disk is read. A pane that changed under the check is
 				// not adopted from a verdict about text it no longer has: it waits like any other.
 				if (check.verdict.decision === "proceed" && view.state.doc.toString() === textAtCheck) {
-					live.adoptBaseline(path);
+					live.adoptBaseline(path, check.diskLen);
 					return;
 				}
 				if (check.verdict.decision === "read-failed") {
@@ -325,15 +341,8 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 							log("refused-empty", 0, diskLen); // never a baseline from a pane the user emptied before it loaded
 							return;
 						}
-						const before = deps.store.get(path);
-						instances.get(view)?.adoptBaseline(path);
-						if (!before && deps.store.get(path)) {
-							const counts = recordCounts(deps.store.get(path));
-							reportDiagnostic(
-								deps.diagnosticLog,
-								diagnosticEntry({ path, pass: "baseline", outcome: "applied", editorLen: liveText.length, diskLen, before: recordCounts(undefined), after: counts }),
-							);
-						}
+						// `adoptBaseline` logs the `applied` line itself when it writes.
+						instances.get(view)?.adoptBaseline(path, diskLen);
 					},
 					ended: ({ state, editorLen, diskLen }) => log(state, editorLen, diskLen),
 				});
@@ -443,8 +452,12 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 						makeIo: (p) => ioFor(view, p),
 						// E2: the instance that waited may have been replaced by `setState`; the live
 						// one runs the released pass, with the pane's text as it is when the wait ends.
-						rerun: (p, t) => {
-							releasedFor.set(view, t);
+						rerun: (p, t, userEdited) => {
+							// PR-3 R3: only a release by arriving text can have a settle timer pending for `t`;
+							// one the user's own edit ended has none, and a marker left for it would later
+							// swallow one genuine settled pass for that same text.
+							if (userEdited) releasedFor.delete(view);
+							else releasedFor.set(view, t);
 							instances.get(view)?.runRestore(p, t, true);
 						},
 					},
@@ -500,8 +513,13 @@ export function createEditorWatcher(deps: EditorWatcherDeps) {
 						// A different text from the one a wait's release ran for: that marker is stale.
 						if (releasedFor.get(update.view) !== settledText) releasedFor.delete(update.view);
 						this.debouncer.trigger({ path, text: settledText });
-					} else if (tr.docChanged && this.changesSinceSnapshot) {
-						this.changesSinceSnapshot = this.changesSinceSnapshot.compose(tr.changes);
+					} else {
+						// PR-3 R3: the user changed the text after a wait was released, so that release's
+						// marker no longer describes the pane and must not suppress a later pass.
+						if (tr.docChanged) releasedFor.delete(update.view);
+						if (tr.docChanged && this.changesSinceSnapshot) {
+							this.changesSinceSnapshot = this.changesSinceSnapshot.compose(tr.changes);
+						}
 					}
 				} catch (err) {
 					console.error("persistent-folded-state: editor watcher failed", err);
